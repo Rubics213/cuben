@@ -1,69 +1,38 @@
-name: Bug Bounty Workflow
+---
+- name: Install Nuclei
+  run: >
+    # Download the latest release of Nuclei
 
-run-name: Run Nuclei scan for ${{ github.ref }}
+    NUCLEI_URL=$(curl -s https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
+      | grep "browser_download_url.*linux_amd64.zip" \
+      | cut -d : -f 2,3 \
+      | tr -d \" | tr -d '[:space:]') # Trim whitespace
 
-on:
-  push:
-    branches:
-      - master
-      - develop
-  workflow_dispatch:
+    # Output the download URL for debugging
 
-jobs:
-  scan:
-    runs-on: ubuntu-latest
+    echo "Nuclei download URL: $NUCLEI_URL"
 
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.22'
+    # Check if the URL is not empty
 
-      - name: Install Nuclei
-        run: |
-          # Download the latest release of Nuclei
-          NUCLEI_URL=$(curl -s https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
-            | grep "browser_download_url.*linux_amd64.zip" \
-            | cut -d : -f 2,3 \
-            | tr -d \")
+    if [[ -z "$NUCLEI_URL" ]]; then
+      echo "Failed to get the download URL for Nuclei."
+      exit 1
+    fi
 
-          # Output the download URL for debugging
-          echo "Nuclei download URL: $NUCLEI_URL"
 
-          # Check if the URL is not empty
-          if [[ -z "$NUCLEI_URL" ]]; then
-            echo "Failed to get the download URL for Nuclei."
-            exit 1
-          fi
+    # Download the zip file
 
-          # Download the zip file
-          wget "$NUCLEI_URL" -O nuclei-linux_amd64.zip || { echo "Download failed"; exit 1; }
-          
-          # Unzip and move to local bin
-          unzip nuclei-linux_amd64.zip || { echo "Unzip failed"; exit 1; }
-          sudo mv nuclei /usr/local/bin/ || { echo "Move failed"; exit 1; }
-          
-          # Verify installation
-          nuclei -version || { echo "Nuclei installation failed"; exit 1; }
+    wget "$NUCLEI_URL" -O nuclei-linux_amd64.zip || { echo "Download failed"; exit 1; }
 
-      - name: Download Nuclei Templates
-        run: |
-          nuclei -update-templates || { echo "Template update failed"; exit 1; }
 
-      - name: Run Nuclei scan
-        run: |
-          if [[ -f "livelinkdomains.txt" ]]; then
-            nuclei -l livelinkdomains.txt -t cves/ -o nuclei-results.txt || { echo "Nuclei scan failed"; exit 1; }
-          else
-            echo "Subdomains file not found!"
-            exit 1
-          fi
+    # Unzip and move to local bin
 
-      - name: Upload Nuclei scan results
-        uses: actions/upload-artifact@v3
-        with:
-          name: nuclei-scan-results
-          path: nuclei-results.txt
+    unzip nuclei-linux_amd64.zip || { echo "Unzip failed"; exit 1; }
+
+    sudo mv nuclei /usr/local/bin/ || { echo "Move failed"; exit 1; }
+
+
+    # Verify installation
+
+    nuclei -version || { echo "Nuclei installation failed"; exit 1; }

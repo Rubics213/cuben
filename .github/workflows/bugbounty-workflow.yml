@@ -1,9 +1,12 @@
 name: Bug Bounty Workflow
 
+run-name: Run Nuclei scan for ${{ github.ref }}
+
 on:
   push:
     branches:
       - master
+      - develop
   workflow_dispatch:
 
 jobs:

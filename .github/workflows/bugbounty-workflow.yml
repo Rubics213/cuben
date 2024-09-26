@@ -28,16 +28,16 @@ jobs:
           | wget -qi -
           unzip nuclei-linux_amd64.zip
           sudo mv nuclei /usr/local/bin/
-          nuclei -version
+          nuclei -version || exit 1  # Ensure this command succeeds
 
       - name: Download Nuclei Templates
         run: |
-          nuclei -update-templates
+          nuclei -update-templates || exit 1  # Ensure this command succeeds
 
       - name: Run Nuclei scan
         run: |
           if [[ -f "livelinkdomains.txt" ]]; then
-            nuclei -l livelinkdomains.txt -t cves/ -o nuclei-results.txt
+            nuclei -l livelinkdomains.txt -t cves/ -o nuclei-results.txt || exit 1  # Ensure this command succeeds
           else
             echo "Subdomains file not found!"
             exit 1

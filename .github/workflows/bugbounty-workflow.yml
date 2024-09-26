@@ -27,6 +27,9 @@ jobs:
             | cut -d : -f 2,3 \
             | tr -d \")
 
+          # Output the download URL for debugging
+          echo "Nuclei download URL: $NUCLEI_URL"
+
           # Check if the URL is not empty
           if [[ -z "$NUCLEI_URL" ]]; then
             echo "Failed to get the download URL for Nuclei."

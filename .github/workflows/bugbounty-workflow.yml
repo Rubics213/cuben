@@ -33,7 +33,7 @@ jobs:
 
     - name: Run Nuclei scan
       run: |
-        nuclei -l urls.txt -t cves/ -o nuclei-results.txt
+        nuclei -l livelinkdomains.txt -t cves/ -o nuclei-results.txt
 
     - name: Upload Nuclei scan results
       uses: actions/upload-artifact@v3

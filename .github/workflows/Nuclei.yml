@@ -28,10 +28,10 @@ jobs:
       - name: Run Nuclei Vulnerability Scan
         run: |
           # Replace target.com with the domain you are scanning
-          nuclei -u https://target.com -o nuclei-results.txt
+          nuclei -u https://mtn.com -o nuclei-results.txt
 
       - name: Upload Nuclei Scan Results
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3  # Updated to the latest version
         with:
           name: nuclei-results
           path: nuclei-results.txt

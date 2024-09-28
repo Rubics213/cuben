@@ -19,7 +19,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: '1.18'  # Specify the Go version you want to use
+          go-version: '1.18.10'  # Specify the Go version you want to use
 
       - name: Install Nuclei
         run: |

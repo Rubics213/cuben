@@ -1,39 +1,50 @@
-name: Nuclei Vulnerability Scan
+name: Vulnerability Scanning
 
 on:
   push:
     branches:
       - main
-  schedule:
-    - cron: '0 0 * * *'  # Run daily
-  workflow_dispatch:  # Allow manual triggering of the workflow
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Manual trigger
 
 jobs:
-  scan:
+  vulnerability-scan:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-        HEAD
-          go-version: '1.18.10'  # Match your local Go version  
-          go-version: '1.18.10'  # Specify the Go version you want to use
-         9d635c4f72640cafd8e1976e1de624fcb354a66b
-
-      - name: Install Nuclei
+      # Run OWASP ZAP Scan with volume binding to save the report to the runner's filesystem
+      - name: Run OWASP ZAP Baseline Scan
         run: |
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          mkdir -p zap-output # Create a directory for ZAP output
+          docker pull owasp/zap2docker-stable
+          docker run -v $(pwd)/zap-output:/zap/wrk/ -t owasp/zap2docker-stable zap-baseline.py -t https://mtn.com -r zap_report.html
+        continue-on-error: true
 
-      - name: Run Nuclei Vulnerability Scan
-        run: |
-          nuclei -u https://mtn.com -o nuclei-results.txt
-
-      - name: Upload Nuclei Scan Results
-        uses: actions/upload-artifact@v3  # Correct version
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v3
         with:
-          name: nuclei-results
-          path: nuclei-results.txt
+          name: zap-report
+          path: zap-output/zap_report.html # Updated path to where the report should be stored
+
+      # Run Nikto Scan with volume binding to save the report to the runner's filesystem (using alternative image)
+      - name: Run Nikto Scan
+        run: |
+          mkdir -p nikto-output # Create a directory for Nikto output
+          docker pull c0dejump/nikto
+          docker run --rm -v $(pwd)/nikto-output:/tmp c0dejump/nikto -h https://mtn.com -output /tmp/nikto_report.txt
+        continue-on-error: true
+
+      - name: Upload Nikto report
+        uses: actions/upload-artifact@v3
+        with:
+          name: nikto-report
+          path: nikto-output/nikto_report.txt # Updated path to where the report should be stored
+
+      - name: Display Scan Summary
+        run: |
+          echo "OWASP ZAP and Nikto Scans Completed"

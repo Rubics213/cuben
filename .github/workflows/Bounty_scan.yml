@@ -19,7 +19,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.18.10'  # Match your local Go version
+        HEAD
+          go-version: '1.18.10'  # Match your local Go version  
+          go-version: '1.18.10'  # Specify the Go version you want to use
+         9d635c4f72640cafd8e1976e1de624fcb354a66b
 
       - name: Install Nuclei
         run: |

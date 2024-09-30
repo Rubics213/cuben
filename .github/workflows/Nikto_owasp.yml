@@ -1,6 +1,5 @@
 name: Vulnerability Scanning
 
-# Define both push and manual dispatch triggers
 on:
   push:
     branches:
@@ -8,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch: # This allows for manual trigger from GitHub UI
+  workflow_dispatch: # Manual trigger
 
 jobs:
   vulnerability-scan:
@@ -18,33 +17,33 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Run OWASP ZAP Scan
+      # Run OWASP ZAP Scan with volume binding to save the report to the runner's filesystem
       - name: Run OWASP ZAP Baseline Scan
         run: |
+          mkdir -p zap-output # Create a directory for ZAP output
           docker pull owasp/zap2docker-stable
-          docker run -t owasp/zap2docker-stable zap-baseline.py -t https://mtn.com -r zap_report.html
-        continue-on-error: true # Continue even if ZAP fails to find vulnerabilities
-        env:
-          DISPLAY: ':99.0' # If running headless mode (optional)
+          docker run -v $(pwd)/zap-output:/zap/wrk/ -t owasp/zap2docker-stable zap-baseline.py -t https://mtn.com -r zap_report.html
+        continue-on-error: true
 
       - name: Upload ZAP report
         uses: actions/upload-artifact@v3
         with:
           name: zap-report
-          path: zap_report.html
+          path: zap-output/zap_report.html # Updated path to where the report should be stored
 
-      # Run Nikto Scan
+      # Run Nikto Scan with volume binding to save the report to the runner's filesystem (using alternative image)
       - name: Run Nikto Scan
         run: |
-          docker pull sullo/nikto
-          docker run --rm -v $(pwd):/tmp sullo/nikto -h https://mtn.com -output /tmp/nikto_report.txt
-        continue-on-error: true # Continue even if Nikto fails to find vulnerabilities
+          mkdir -p nikto-output # Create a directory for Nikto output
+          docker pull c0dejump/nikto
+          docker run --rm -v $(pwd)/nikto-output:/tmp c0dejump/nikto -h https://mtn.com -output /tmp/nikto_report.txt
+        continue-on-error: true
 
       - name: Upload Nikto report
         uses: actions/upload-artifact@v3
         with:
           name: nikto-report
-          path: nikto_report.txt
+          path: nikto-output/nikto_report.txt # Updated path to where the report should be stored
 
       - name: Display Scan Summary
         run: |

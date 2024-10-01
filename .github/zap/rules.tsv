@@ -1,0 +1,6 @@
+RuleID	Description		RequestMethod	URLPattern	ParameterName
+1		Check for XSS vulnerabilities	GET		/example/path		param1
+2		Validate SQL Injection on login	POST		/login			username
+3		Check for reflected XSS		GET		/search			query
+4		SQL Injection check on products	GET		/products			id
+5		XSS vulnerability in comment form	POST		/comments			comment

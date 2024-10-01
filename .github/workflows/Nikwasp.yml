@@ -1,0 +1,63 @@
+name: Vulnerability Scanning
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Manual trigger
+  schedule:
+    - cron: '0 0 * * *'  # Run every day at midnight UTC
+
+jobs:
+  vulnerability-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4  # Latest version
+
+      # Create a domains file with a list of subdomains (or use an existing one)
+      - name: Create domains file
+        run: |
+          echo "https://mtn.com" > domains.txt
+          echo "https://sub.mtn.com" >> domains.txt
+          echo "https://another.mtn.com" >> domains.txt
+
+      # OWASP ZAP Scan for each domain
+      - name: Run OWASP ZAP Scan for each domain
+        run: |
+          mkdir -p zap-output
+          while read domain; do
+            echo "Scanning $domain with ZAP"
+            docker run -v $(pwd)/zap-output:/zap/wrk/:rw owasp/zap2docker-stable zap-baseline.py -t $domain -r zap-output/owasp-zap-report-${domain##*/}.html
+          done < domains.txt
+        continue-on-error: true
+
+      - name: Upload ZAP reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: zap-output/*.html  # Upload all ZAP reports
+
+      # Nikto Scan for each domain
+      - name: Run Nikto Scan for each domain
+        run: |
+          mkdir -p nikto-output
+          while read domain; do
+            echo "Scanning $domain with Nikto"
+            nikto -h $domain -output nikto-output/nikto_report_${domain##*/}.txt
+          done < domains.txt
+        continue-on-error: true
+
+      - name: Upload Nikto reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: nikto-reports
+          path: nikto-output/*.txt  # Upload all Nikto reports
+
+      - name: Display Scan Summary
+        run: |
+          echo "OWASP ZAP and Nikto Scans Completed"

@@ -38,22 +38,29 @@ jobs:
           # Read domains from the correct path
           while IFS= read -r domain; do
             echo "Finding subdomains for $domain"
-            python3 Sublist3r/sublist3r.py -d $domain -o "subdomain_output/${domain}_subdomains.txt"
-            
-            # Check for new subdomains
-            if [ -f "old_subdomains/${domain}_old_subdomains.txt" ]; then
-              if ! diff "subdomain_output/${domain}_subdomains.txt" "old_subdomains/${domain}_old_subdomains.txt"; then
-                echo "New subdomains detected for $domain"
+            output_file="subdomain_output/${domain//https:\/\//}_subdomains.txt"
+            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file"
+
+            # Check if output file was created
+            if [ -f "$output_file" ]; then
+              echo "Subdomain output file created: $output_file"
+              # Check for new subdomains
+              if [ -f "old_subdomains/${domain//https:\/\//}_old_subdomains.txt" ]; then
+                if ! diff "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"; then
+                  echo "New subdomains detected for $domain"
+                  new_subdomains_detected=true
+                fi
+              else
+                echo "First run for $domain, no old subdomains to compare."
                 new_subdomains_detected=true
               fi
+
+              # Save current subdomains for the next run
+              cp "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"
             else
-              echo "First run for $domain, no old subdomains to compare."
-              new_subdomains_detected=true
+              echo "No subdomains found for $domain. Skipping comparison."
             fi
-            
-            # Save current subdomains for the next run
-            cp "subdomain_output/${domain}_subdomains.txt" "old_subdomains/${domain}_old_subdomains.txt"
-          done < .github/workflows/domains.txt  # <-- Corrected path
+          done < .github/workflows/domains.txt  # Ensure this points to the correct location
 
           # Set output variable for new subdomains detection
           echo "new_subdomains_detected=${new_subdomains_detected}" >> $GITHUB_ENV
@@ -65,7 +72,6 @@ jobs:
         with:
           target: 'https://mtn.com'  # Update with the actual target domain
           rules_file_name: '.github/zap/rules.tsv'  # Optional: Custom rules can be defined here
-        continue-on-error: true
 
       - name: Upload ZAP report
         if: env.new_subdomains_detected == 'true'  # Upload report only if new subdomains detected
@@ -84,7 +90,6 @@ jobs:
         run: |
           mkdir -p nikto-output
           nikto -h https://mtn.com -output nikto-output/nikto_report.txt  # Update with the actual target domain
-          continue-on-error: true
 
       - name: Upload Nikto report
         if: env.new_subdomains_detected == 'true'  # Upload report only if new subdomains detected

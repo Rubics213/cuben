@@ -1,0 +1,117 @@
+name: Vulnerability Scanning & Subdomain Detection
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: '22 22 * * *'  # Randomized time for stealth
+    - cron: '35 3 * * *'  # Another randomized time
+
+jobs:
+  vulnerability-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install Sublist3r
+      - name: Install Sublist3r dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip
+          git clone https://github.com/aboul3la/Sublist3r.git
+          cd Sublist3r
+          pip3 install -r requirements.txt
+
+      # Install Nikto
+      - name: Install Nikto
+        run: |
+          sudo apt-get install -y nikto
+
+      # Detect subdomains with delay and comparison
+      - name: Detect subdomains with delay
+        run: |
+          set -e
+          mkdir -p subdomain_output old_subdomains
+          new_subdomains_detected=false
+
+          while IFS= read -r domain; do
+            echo "Finding subdomains for $domain"
+            output_file="subdomain_output/${domain//https:\/\//}_subdomains.txt"
+            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file"
+            sleep $((RANDOM % 10 + 5))  # Random delay between 5 and 15 seconds
+
+            if [ -f "$output_file" ]; then
+              if [ -f "old_subdomains/${domain//https:\/\//}_old_subdomains.txt" ]; then
+                if ! diff "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"; then
+                  echo "New subdomains detected for $domain"
+                  new_subdomains_detected=true
+                fi
+              else
+                new_subdomains_detected=true
+              fi
+              cp "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"
+            fi
+          done < .github/workflows/domains.txt
+
+          echo "new_subdomains_detected=${new_subdomains_detected}" >> $GITHUB_ENV
+
+      # Run OWASP ZAP Scan with stealth
+      - name: Run OWASP ZAP Scan with stealth
+        if: env.new_subdomains_detected == 'true'
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: 'https://mtn.com'
+          rules_file_name: '.github/zap/rules.tsv'
+          cmd_options: '-config api.addrs.addr.name=.* -config api.addrs.addr.regex=true -config connection.userAgent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+
+      # Run Nikto Scan with stealth
+      - name: Run Nikto Scan with stealth
+        if: env.new_subdomains_detected == 'true'
+        run: |
+          mkdir -p nikto-output
+          nikto -h https://mtn.com -output nikto-output/nikto_report.txt -useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+          sleep $((RANDOM % 10 + 5))  # Random delay between 5 and 15 seconds
+
+      # Install sendmail to send email notifications
+      - name: Install sendmail
+        run: sudo apt-get install -y sendmail
+
+      # Send notification email with scan details
+      - name: Send Email Notification
+        if: env.new_subdomains_detected == 'true'
+        run: |
+          echo "Subject: Scan Completed" > email.txt
+          echo "From: vulnerability-scanner@githubactions.com" >> email.txt
+          echo "To: beetlejuice997@outlook.com" >> email.txt
+          echo "" >> email.txt
+          echo "OWASP ZAP and Nikto scans have been completed. New subdomains were detected and scanned." >> email.txt
+          echo "" >> email.txt
+          echo "OWASP ZAP report and Nikto report have been uploaded to GitHub Actions artifacts." >> email.txt
+          sendmail beetlejuice997@outlook.com < email.txt
+
+      # Upload ZAP report
+      - name: Upload ZAP report
+        if: env.new_subdomains_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: owasp-zap-report.html
+
+      # Upload Nikto report
+      - name: Upload Nikto report
+        if: env.new_subdomains_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nikto-report
+          path: nikto-output/nikto_report.txt
+
+      - name: Display Scan Summary
+        run: |
+          echo "OWASP ZAP and Nikto Scans Completed"

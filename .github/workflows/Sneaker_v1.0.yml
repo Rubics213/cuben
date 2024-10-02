@@ -89,12 +89,12 @@ jobs:
         run: |
           echo "Subject: Scan Completed" > email.txt
           echo "From: vulnerability-scanner@githubactions.com" >> email.txt
-          echo "To: beetlejuice997@outlook.com" >> email.txt
+          echo "To: beetlerecon997@outlook.com" >> email.txt
           echo "" >> email.txt
           echo "OWASP ZAP and Nikto scans have been completed. New subdomains were detected and scanned." >> email.txt
           echo "" >> email.txt
           echo "OWASP ZAP report and Nikto report have been uploaded to GitHub Actions artifacts." >> email.txt
-          sendmail beetlejuice997@outlook.com < email.txt
+          sendmail beetlerecon997@outlook.com < email.txt
 
       # Upload ZAP report
       - name: Upload ZAP report

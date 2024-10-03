@@ -9,7 +9,10 @@ on:
       - main
   workflow_dispatch:  # Manual trigger
   schedule:
-    - cron: '10 1 * * 1'  # Random time: update this to a more random schedule periodically
+    # Randomizing cron schedule for effective scanning
+    - cron: '17 3 * * 2'  # Example: Run at a random time, change weekly
+    - cron: '42 14 * * 6' # Another random time for different days
+    - cron: '33 21 * * 4' # Random evening scan
 
 jobs:
   vulnerability-scan:
@@ -19,7 +22,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Install Sublist3r with Randomized User-Agent
+      # Install Sublist3r
       - name: Install Sublist3r dependencies
         run: |
           sudo apt-get update
@@ -28,28 +31,32 @@ jobs:
           cd Sublist3r
           pip3 install -r requirements.txt
 
-      # Use Sublist3r to detect subdomains (randomized delays and proxy support)
+      # Use Sublist3r to detect subdomains
       - name: Detect subdomains
         run: |
           set -e
           mkdir -p subdomain_output old_subdomains
           new_subdomains_detected=false
 
-          # Read domains from the correct path
+          # Slow down the scan to avoid flagging
+          delay_between_requests=5  # Introduce a 5-second delay
           while IFS= read -r domain; do
             echo "Finding subdomains for $domain"
             output_file="subdomain_output/${domain//https:\/\//}_subdomains.txt"
-            
-            # Randomize delay between scans (between 30 to 90 seconds)
-            sleep $((RANDOM % 60 + 30))
 
-            # Randomize User-Agent to avoid detection
-            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file" --user-agent "Mozilla/5.0 (Windows NT $((RANDOM % 10 + 5)).$((RANDOM % 3)); Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.$((RANDOM % 100 + 100)).$((RANDOM % 100 + 100)) Safari/537.36" 
+            # Use Python's requests module with a custom user-agent
+            python3 -c "
+import requests, time
+url = f'https://api.sublist3r.com/?domain={domain}'
+headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+r = requests.get(url, headers=headers)
+with open('$output_file', 'w') as f:
+    f.write(r.text)
+time.sleep($delay_between_requests)
+"
 
-            # Check if output file was created
+            # Check for new subdomains
             if [ -f "$output_file" ]; then
-              echo "Subdomain output file created: $output_file"
-              # Check for new subdomains
               if [ -f "old_subdomains/${domain//https:\/\//}_old_subdomains.txt" ]; then
                 if ! diff "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"; then
                   echo "New subdomains detected for $domain"
@@ -65,20 +72,18 @@ jobs:
             else
               echo "No subdomains found for $domain. Skipping comparison."
             fi
-          done < .github/workflows/domains.txt  # Ensure this points to the correct location
+          done < .github/workflows/domains.txt
 
           # Set output variable for new subdomains detection
           echo "new_subdomains_detected=${new_subdomains_detected}" >> $GITHUB_ENV
 
-      # Run OWASP ZAP Scan only if new subdomains were detected (randomized delay + rate limit)
+      # Run OWASP ZAP Scan only if new subdomains were detected
       - name: Run OWASP ZAP Scan
         if: env.new_subdomains_detected == 'true'
         uses: zaproxy/action-baseline@v0.10.0
         with:
-          target: 'https://linkedin.com'  # Update with the actual target domain
+          target: 'https://linkedin.com'  # Replace with target domain
           rules_file_name: '.github/zap/rules.tsv'
-        env:
-          ZAP_RATELIMIT: '2'  # Limits the number of requests per second to avoid rate-limiting
 
       - name: Upload ZAP report
         if: env.new_subdomains_detected == 'true'
@@ -87,7 +92,7 @@ jobs:
           name: zap-report
           path: owasp-zap-report.html
 
-      # Install Nikto (with Proxy Support and Randomized Options)
+      # Install Nikto
       - name: Install Nikto
         run: sudo apt-get update && sudo apt-get install -y nikto
 
@@ -96,9 +101,7 @@ jobs:
         if: env.new_subdomains_detected == 'true'
         run: |
           mkdir -p nikto-output
-          # Random delay before running Nikto to mimic natural activity
-          sleep $((RANDOM % 60 + 30))
-          nikto -h https://linkedin.com -output nikto-output/nikto_report.txt -useragent "Mozilla/5.0 (Windows NT $((RANDOM % 10 + 5)); WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$((RANDOM % 100 + 80)).0.$((RANDOM % 100 + 300)).$(($RANDOM % 100 + 200)) Safari/537.36"  # Update with the actual target domain
+          nikto -h https://linkedin.com -output nikto-output/nikto_report.txt
 
       - name: Upload Nikto report
         if: env.new_subdomains_detected == 'true'
@@ -106,25 +109,6 @@ jobs:
         with:
           name: nikto-report
           path: nikto-output/nikto_report.txt
-
-      # Email Notification (if new subdomains detected)
-      - name: Send Email Notification
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          sudo apt-get install -y msmtp
-          echo "account default" > ~/.msmtprc
-          echo "host ${{ secrets.SMTP_SERVER }}" >> ~/.msmtprc
-          echo "port ${{ secrets.SMTP_PORT }}" >> ~/.msmtprc
-          echo "auth on" >> ~/.msmtprc
-          echo "user ${{ secrets.EMAIL_USERNAME }}" >> ~/.msmtprc
-          echo "password ${{ secrets.EMAIL_PASSWORD }}" >> ~/.msmtprc
-          echo "tls on" >> ~/.msmtprc
-          echo "tls_starttls on" >> ~/.msmtprc
-          echo "from ${{ secrets.EMAIL_USERNAME }}" >> ~/.msmtprc
-          echo "logfile ~/.msmtp.log" >> ~/.msmtprc
-
-          echo -e "Subject: Scan Completed: New Subdomains Detected\n\nOWASP ZAP and Nikto scans have been completed. New subdomains were detected and scanned. Reports have been uploaded." \
-          | msmtp beetlerecon997@outlook.com
 
       - name: Display Scan Summary
         run: |

@@ -1,0 +1,133 @@
+name: Vulnerability Scanning & Subdomain Detection
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '3 1 * * *'    
+    - cron: '27 4 * * *'   
+    - cron: '43 11 * * 3'  
+    - cron: '51 16 * * 5'  
+    - cron: '17 23 * * 2'  
+    - cron: '32 9 * * 0'   
+
+jobs:
+  vulnerability-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Introduce Random Delay
+        run: |
+          RANDOM_DELAY=$((RANDOM % 300 + 1))
+          echo "Delaying for $RANDOM_DELAY seconds..."
+          sleep $RANDOM_DELAY
+
+      - name: Install Sublist3r dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip
+          git clone https://github.com/aboul3la/Sublist3r.git
+          cd Sublist3r
+          pip3 install -r requirements.txt
+
+      - name: Detect subdomains using multiple wordlists
+        run: |
+          set -e
+          mkdir -p subdomain_output old_subdomains
+          new_subdomains_detected=false
+          high_value_subdomains_detected=false
+          RANDOM_DELAY_BETWEEN_SCANS=$((RANDOM % 120 + 1))
+          
+          # Define your wordlists here
+          wordlists=( ".github/workflows/n0kovo_subdomains.txt" ".github/workflows/subdomains-top1million-110000.txt")
+          
+          # Define high-priority subdomains
+          priority_subdomains=("vpn" "api" "admin" "test" "dev")
+
+          # Read domains from the correct path
+          while IFS= read -r domain; do
+            echo "Finding subdomains for $domain"
+            combined_output_file="subdomain_output/${domain//https:\/\//}_subdomains_combined.txt"
+            high_value_output_file="subdomain_output/${domain//https:\/\//}_high_value_subdomains.txt"
+
+            # Loop through each wordlist
+            for wordlist in "${wordlists[@]}"; do
+              echo "Using wordlist: $wordlist for $domain"
+              output_file="subdomain_output/${domain//https:\/\//}_subdomains_${wordlist}.txt"
+              
+              # Run Sublist3r with each wordlist
+              python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file" -w "$wordlist"
+              
+              # Combine the output files into one
+              cat "$output_file" >> "$combined_output_file"
+            done
+
+            # Check for high-value subdomains
+            if [ -f "$combined_output_file" ]; then
+              while IFS= read -r subdomain; do
+                for high_value in "${priority_subdomains[@]}"; do
+                  if [[ $subdomain == *"$high_value"* ]]; then
+                    echo "High-value subdomain detected: $subdomain"
+                    high_value_subdomains_detected=true
+                    echo $subdomain >> "$high_value_output_file"
+                  fi
+                done
+              done < "$combined_output_file"
+
+              if [ -f "old_subdomains/${domain//https:\/\//}_old_subdomains.txt" ]; then
+                if ! diff "$combined_output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"; then
+                  new_subdomains_detected=true
+                fi
+              else
+                new_subdomains_detected=true
+              fi
+              cp "$combined_output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"
+            fi
+            sleep $RANDOM_DELAY_BETWEEN_SCANS
+          done < .github/workflows/domains.txt
+
+      - name: Run OWASP ZAP Scan
+        if: env.new_subdomains_detected == 'true' || env.high_value_subdomains_detected == 'true'
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: 'https://linkedin.com'
+          rules_file_name: '.github/zap/rules.tsv'
+
+      - name: Upload ZAP report
+        if: env.new_subdomains_detected == 'true' || env.high_value_subdomains_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: owasp-zap-report.html
+
+      - name: Install Nikto
+        run: sudo apt-get update && sudo apt-get install -y nikto
+
+      - name: Run Nikto Scan
+        if: env.new_subdomains_detected == 'true' || env.high_value_subdomains_detected == 'true'
+        run: |
+          mkdir -p nikto-output
+          random_subdomain=$(shuf -n 1 subdomain_output/${domain//https:\/\//}_subdomains_combined.txt)
+          echo "Running Nikto against $random_subdomain"
+          nikto -h $random_subdomain -output nikto-output/nikto_report.txt
+
+      - name: Upload Nikto report
+        if: env.new_subdomains_detected == 'true' || env.high_value_subdomains_detected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nikto-report
+          path: nikto-output/nikto_report.txt
+
+      - name: Send Email Notification
+        if: env.new_subdomains_detected == 'true' || env.high_value_subdomains_detected == 'true'
+        run: |
+          echo "Sending notification for detected vulnerabilities..."
+          echo "Subject: Vulnerability Detected in Scan" | sendmail -v beetlerecon997@outlook.com

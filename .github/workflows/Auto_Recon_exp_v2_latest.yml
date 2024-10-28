@@ -79,7 +79,7 @@ jobs:
         if: env.new_subdomains_detected == 'true'  # Run ZAP only if new subdomains detected
         uses: zaproxy/action-baseline@v0.10.0
         with:
-          target: 'https://.https://moonpay.com/'  # Update with the actual target domain
+          target: 'https://moonpay.com'  # Update with the actual target domain
           rules_file_name: '.github/zap/rules.tsv'  # Optional: Custom rules can be defined here
 
       - name: Upload ZAP report
@@ -98,7 +98,7 @@ jobs:
         if: env.new_subdomains_detected == 'true'  # Run Nikto only if new subdomains detected
         run: |
           mkdir -p nikto-output
-          nikto -h https://moonpay.com/ -output nikto-output/nikto_report.txt  # Update with the actual target domain
+          nikto -h https://moonpay.com -output nikto-output/nikto_report.txt  # Update with the actual target domain
 
       - name: Upload Nikto report
         if: env.new_subdomains_detected == 'true'  # Upload report only if new subdomains detected

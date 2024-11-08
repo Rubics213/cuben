@@ -79,7 +79,7 @@ jobs:
         if: env.new_subdomains_detected == 'true'  # Run ZAP only if new subdomains detected
         uses: zaproxy/action-baseline@v0.10.0
         with:
-          target: 'https://vodafone.om'  # Update with the actual target domain
+          target: 'https://vodafone.om/'  # Update with the actual target domain
           rules_file_name: '.github/zap/rules.tsv'  # Optional: Custom rules can be defined here
 
       - name: Upload ZAP report

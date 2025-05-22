@@ -26,14 +26,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang
           
-          # Install AssetFinder (more reliable than Sublist3r)
+          # Install AssetFinder
           go install github.com/tomnomnom/assetfinder@latest
           sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
-          # Install Amass
+          # Install Amass (fixed case sensitivity)
           wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
           unzip amass_linux_amd64.zip
-          sudo mv amass_linux_amd64/amass /usr/local/bin/
+          sudo mv amass_Linux_amd64/amass /usr/local/bin/
           
           # Install ZAP standalone
           wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz

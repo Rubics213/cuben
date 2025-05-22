@@ -24,100 +24,135 @@ jobs:
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip docker.io
+          python3 -m pip install --upgrade pip
+          
+          # Install Sublist3r (fixed version)
           git clone https://github.com/aboul3la/Sublist3r.git
           cd Sublist3r
+          # Fix escape sequence warnings
+          sed -i "s/\\\_/_/g" sublist3r.py
+          sed -i "s/\\\//\//g" sublist3r.py
+          sed -i "s/\\\-/-/g" sublist3r.py
           pip3 install -r requirements.txt
           cd ..
-          wget https://github.com/owasp-amass/amass/releases/download/v3.22.0/amass_linux_amd64.zip
+          
+          # Install Amass
+          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
           unzip amass_linux_amd64.zip
           sudo mv amass_linux_amd64/amass /usr/local/bin/
+          
+          # Install httpx for URL probing
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          sudo mv ~/go/bin/httpx /usr/local/bin/
+
+      - name: Verify domains file exists
+        run: |
+          if [ ! -f ".github/workflows/domains.txt" ]; then
+            echo "ERROR: domains.txt file not found at .github/workflows/domains.txt"
+            exit 1
+          fi
+          echo "Domains to scan:"
+          cat .github/workflows/domains.txt
 
       - name: Detect subdomains
+        id: subdomain-detection
         run: |
           set -e
           mkdir -p subdomain_output old_subdomains
           new_subdomains_detected=false
-
+          
           while IFS= read -r domain; do
-            echo "Finding subdomains for $domain"
-            output_file="subdomain_output/${domain//https:\/\//}_subdomains.txt"
-            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file"
-
-            if [ -f "$output_file" ]; then
-              echo "Subdomain output file created: $output_file"
-              if [ -f "old_subdomains/${domain//https:\/\//}_old_subdomains.txt" ]; then
-                if ! diff "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"; then
-                  echo "New subdomains detected for $domain"
+            domain=$(echo "$domain" | tr -d '\r\n') # Clean whitespace
+            echo "Processing domain: $domain"
+            output_file="subdomain_output/${domain//\//_}_subdomains.txt"
+            
+            # Run multiple subdomain discovery tools
+            echo "Running Sublist3r..."
+            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file" || true
+            
+            echo "Running Amass..."
+            /usr/local/bin/amass enum -passive -d "$domain" >> "$output_file" || true
+            
+            # Clean results
+            sort -u "$output_file" -o "$output_file"
+            sed -i '/^$/d' "$output_file"
+            
+            if [ -s "$output_file" ]; then
+              echo "Found subdomains for $domain:"
+              cat "$output_file"
+              
+              if [ -f "old_subdomains/${domain//\//_}_old_subdomains.txt" ]; then
+                echo "Comparing with previous results..."
+                if ! diff -q "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"; then
+                  echo "New subdomains detected!"
                   new_subdomains_detected=true
                 fi
               else
-                echo "First run for $domain, no old subdomains to compare."
+                echo "First run for $domain - considering all subdomains as new"
                 new_subdomains_detected=true
               fi
-              cp "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"
+              
+              # Save current results for next run
+              cp "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"
             else
-              echo "No subdomains found for $domain. Skipping comparison."
+              echo "No subdomains found for $domain"
+              # Create empty file to avoid errors in future runs
+              touch "old_subdomains/${domain//\//_}_old_subdomains.txt"
             fi
           done < .github/workflows/domains.txt
-
-          echo "new_subdomains_detected=${new_subdomains_detected}" >> $GITHUB_ENV
+          
+          echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
+          echo "Subdomain detection complete. New subdomains detected: $new_subdomains_detected"
 
       - name: Notify Slack - New Subdomains Detected
         if: env.new_subdomains_detected == 'true'
         run: |
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"🌐 *New subdomains were detected.*\nStarting automated scans for Shopify.com...\"}" \
+            --data "{\"text\": \"🌐 *New subdomains were detected.*\nStarting automated scans...\"}" \
             ${{ secrets.Slack_Hook }}
 
-      - name: Run OWASP ZAP Scan
-        if: env.new_subdomains_detected == 'true'
-        uses: zaproxy/action-baseline@v0.10.0
-        with:
-          target: 'https://shopify.com'
-          rules_file_name: '.github/zap/rules.tsv'
-          cmd_options: '-x zap-report.html'
+      - name: Run OWASP ZAP Scan (Always Run)
+        run: |
+          mkdir -p zap-reports
+          echo "Running ZAP scan for all domains..."
+          
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "Scanning $domain with ZAP..."
+            
+            docker run -v $(pwd)/zap-reports:/zap/reports:rw \
+              -t owasp/zap2docker-stable zap-baseline.py \
+              -t "https://$domain" \
+              -x "zap-report-${domain//\//_}.html" || true
+          done < .github/workflows/domains.txt
 
-      - name: Upload ZAP report
-        if: env.new_subdomains_detected == 'true'
+      - name: Upload ZAP reports
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
-          path: zap-report.html
+          name: zap-reports
+          path: zap-reports/*.html
 
-      - name: Notify Slack - ZAP Complete
-        if: env.new_subdomains_detected == 'true'
+      - name: Run Nikto Scan (Always Run)
         run: |
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"🕷️ *OWASP ZAP scan completed* for Shopify.com.\n🔗 ZAP report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-            ${{ secrets.Slack_Hook }}
+          mkdir -p nikto-reports
+          echo "Running Nikto scans for all domains..."
+          
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "Scanning $domain with Nikto..."
+            
+            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-report-${domain//\//_}.html" || true
+          done < .github/workflows/domains.txt
 
-      - name: Run Nikto Scan
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          mkdir -p nikto-output
-          nikto -h https://shopify.com -Format htm -output nikto-output/nikto-report.html
-
-      - name: Upload Nikto HTML report
-        if: env.new_subdomains_detected == 'true'
+      - name: Upload Nikto reports
         uses: actions/upload-artifact@v4
         with:
-          name: nikto-report
-          path: nikto-output/nikto-report.html
+          name: nikto-reports
+          path: nikto-reports/*.html
 
-      - name: Notify Slack - Nikto Complete
-        if: env.new_subdomains_detected == 'true'
+      - name: Notify Slack - Scan Complete
         run: |
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"🔍 *Nikto scan completed* for Shopify.com.\n🔗 Nikto report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            --data "{\"text\": \"✅ *All scans completed.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nArtifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
             ${{ secrets.Slack_Hook }}
-
-      - name: Notify Slack - Scan Summary
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"✅ *All scans complete.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\"}" \
-            ${{ secrets.Slack_Hook }}
-
-      - name: Display Scan Summary
-        run: echo "OWASP ZAP and Nikto HTML reports generated and uploaded"

@@ -70,25 +70,36 @@ jobs:
             --data "{\"text\": \"🌐 *New subdomains were detected.*\nStarting automated scans for Shopify.com...\"}" \
             ${{ secrets.Slack_Hook }}
 
-      - name: Run OWASP ZAP Scan
+      - name: Run OWASP ZAP in Docker and Generate Reports
         if: env.new_subdomains_detected == 'true'
-        uses: zaproxy/action-baseline@v0.10.0
-        with:
-          target: 'https://shopify.com'
-          rules_file_name: '.github/zap/rules.tsv'
+        run: |
+          mkdir -p zap-reports
+          touch zap-reports/report_json.json zap-reports/report_md.md zap-reports/report_html.html
+          chmod a+w zap-reports/*
 
-      - name: Upload ZAP report
+          docker pull ghcr.io/zaproxy/zaproxy:stable -q
+          docker run \
+            -v $PWD/zap-reports:/zap/wrk/:rw \
+            --network=host \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t https://shopify.com \
+              -J /zap/wrk/report_json.json \
+              -w /zap/wrk/report_md.md \
+              -r /zap/wrk/report_html.html
+
+      - name: Upload ZAP Reports
         if: env.new_subdomains_detected == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
-          path: owasp-zap-report.html
+          name: zap-reports
+          path: zap-reports
 
       - name: Notify Slack - ZAP Complete
         if: env.new_subdomains_detected == 'true'
         run: |
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"🕷️ *OWASP ZAP scan completed* for Shopify.com.\n🔗 ZAP report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            --data "{\"text\": \"🕷️ *OWASP ZAP scan completed* for Shopify.com.\n🔗 Reports available: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
             ${{ secrets.Slack_Hook }}
 
       - name: Run Nikto Scan
@@ -108,7 +119,7 @@ jobs:
         if: env.new_subdomains_detected == 'true'
         run: |
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"🔍 *Nikto scan completed* for Shopify.com.\n🔗 Nikto report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            --data "{\"text\": \"🔍 *Nikto scan completed* for Shopify.com.\n🔗 Report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
             ${{ secrets.Slack_Hook }}
 
       - name: Notify Slack - Scan Summary

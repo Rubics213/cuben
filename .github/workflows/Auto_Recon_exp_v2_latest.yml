@@ -24,7 +24,7 @@ jobs:
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip docker.io
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget
           python3 -m pip install --upgrade pip
           
           # Install Sublist3r (fixed version)
@@ -42,9 +42,11 @@ jobs:
           unzip amass_linux_amd64.zip
           sudo mv amass_linux_amd64/amass /usr/local/bin/
           
-          # Install httpx for URL probing
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          sudo mv ~/go/bin/httpx /usr/local/bin/
+          # Install ZAP standalone instead of Docker version
+          wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
+          tar -xzf ZAP_2.14.0_Linux.tar.gz
+          sudo mv ZAP_2.14.0 /opt/zaproxy
+          sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap
 
       - name: Verify domains file exists
         run: |
@@ -112,7 +114,7 @@ jobs:
             --data "{\"text\": \"🌐 *New subdomains were detected.*\nStarting automated scans...\"}" \
             ${{ secrets.Slack_Hook }}
 
-      - name: Run OWASP ZAP Scan (Always Run)
+      - name: Run OWASP ZAP Scan (Standalone)
         run: |
           mkdir -p zap-reports
           echo "Running ZAP scan for all domains..."
@@ -121,10 +123,8 @@ jobs:
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "Scanning $domain with ZAP..."
             
-            docker run -v $(pwd)/zap-reports:/zap/reports:rw \
-              -t owasp/zap2docker-stable zap-baseline.py \
-              -t "https://$domain" \
-              -x "zap-report-${domain//\//_}.html" || true
+            /opt/zaproxy/zap.sh -cmd -quickurl "https://$domain" \
+              -quickprogress -quickout "zap-reports/zap-report-${domain//\//_}.html" || true
           done < .github/workflows/domains.txt
 
       - name: Upload ZAP reports
@@ -133,7 +133,7 @@ jobs:
           name: zap-reports
           path: zap-reports/*.html
 
-      - name: Run Nikto Scan (Always Run)
+      - name: Run Nikto Scan
         run: |
           mkdir -p nikto-reports
           echo "Running Nikto scans for all domains..."

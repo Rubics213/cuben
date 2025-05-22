@@ -30,15 +30,16 @@ jobs:
           go install github.com/tomnomnom/assetfinder@latest
           sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
-          # Install Amass (fixed case sensitivity)
+          # Install Amass (fixed path)
           wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
           unzip amass_linux_amd64.zip
           sudo mv amass_Linux_amd64/amass /usr/local/bin/
           
-          # Install ZAP standalone
-          wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
-          tar -xzf ZAP_2.14.0_Linux.tar.gz
-          sudo mv ZAP_2.14.0 /opt/zaproxy
+          # Install latest ZAP (using current stable version)
+          ZAP_VERSION=$(curl -s https://raw.githubusercontent.com/zaproxy/zaproxy/main/version.txt)
+          wget https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_VERSION}/ZAP_${ZAP_VERSION}_Linux.tar.gz
+          tar -xzf ZAP_${ZAP_VERSION}_Linux.tar.gz
+          sudo mv ZAP_${ZAP_VERSION} /opt/zaproxy
           sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap
 
       - name: Verify domains file exists
@@ -107,7 +108,7 @@ jobs:
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "Scanning $domain with ZAP..."
             
-            /opt/zaproxy/zap.sh -cmd -quickurl "https://$domain" \
+            zap.sh -cmd -quickurl "https://$domain" \
               -quickprogress -quickout "zap-reports/zap-report-${domain//\//_}.html" || true
           done < .github/workflows/domains.txt
 

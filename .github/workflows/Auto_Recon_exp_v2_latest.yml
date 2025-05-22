@@ -48,30 +48,6 @@ jobs:
             echo "Failed to install Amass"
             exit 1
           }
-          
-          # Install ZAP 2.13.0 (confirmed working version)
-          echo "Downloading ZAP..."
-          wget https://github.com/zaproxy/zaproxy/releases/download/v2.13.0/ZAP_2.13.0_Linux.tar.gz || {
-            echo "Failed to download ZAP"
-            exit 1
-          }
-          
-          echo "Extracting ZAP..."
-          tar -xzf ZAP_2.13.0_Linux.tar.gz || {
-            echo "Failed to extract ZAP"
-            exit 1
-          }
-          
-          echo "Installing ZAP..."
-          sudo mv ZAP_2.13.0 /opt/zaproxy || {
-            echo "Failed to install ZAP"
-            exit 1
-          }
-          
-          sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap || {
-            echo "Failed to create ZAP symlink"
-            exit 1
-          }
 
       - name: Verify domains file exists
         run: |
@@ -130,27 +106,14 @@ jobs:
           echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
           echo "Subdomain detection complete. New subdomains detected: $new_subdomains_detected"
 
-      - name: Run OWASP ZAP Scan
-        run: |
-          mkdir -p zap-reports
-          echo "Running ZAP scan for all domains..."
-          
-          while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '\r\n')
-            echo "Scanning $domain with ZAP..."
-            
-            zap.sh -cmd -quickurl "https://$domain" \
-              -quickprogress -quickout "zap-reports/zap-report-${domain//\//_}.html" || \
-              echo "ZAP scan failed for $domain"
-          done < .github/workflows/domains.txt
-
-      - name: Upload ZAP reports
-        uses: actions/upload-artifact@v4
+      - name: ZAP Scan
+        uses: zaproxy/action-af@v0.2.0
         with:
-          name: zap-reports
-          path: zap-reports/*.html
+          plan: '.github/workflows/zap/plan.yml'
+        if: env.new_subdomains_detected == 'true'
 
       - name: Run Nikto Scan
+        if: env.new_subdomains_detected == 'true'
         run: |
           mkdir -p nikto-reports
           echo "Running Nikto scans for all domains..."
@@ -168,6 +131,7 @@ jobs:
         with:
           name: nikto-reports
           path: nikto-reports/*.html
+        if: env.new_subdomains_detected == 'true'
 
       - name: Notify Slack - Scan Complete
         if: always()

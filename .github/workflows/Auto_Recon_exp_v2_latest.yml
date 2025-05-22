@@ -24,16 +24,11 @@ jobs:
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang
           
-          # Use --user flag for pip installations
-          python3 -m pip install --user --upgrade pip
-          
-          # Install Sublist3r from a reliable mirror (using HTTPS with no auth required)
-          git clone https://github.com/Anon-Exploiter/Sublist3r.git --depth 1
-          cd Sublist3r
-          pip3 install --user -r requirements.txt
-          cd ..
+          # Install AssetFinder (more reliable than Sublist3r)
+          go install github.com/tomnomnom/assetfinder@latest
+          sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
           # Install Amass
           wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
@@ -45,9 +40,6 @@ jobs:
           tar -xzf ZAP_2.14.0_Linux.tar.gz
           sudo mv ZAP_2.14.0 /opt/zaproxy
           sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap
-          
-          # Add Python user binaries to PATH
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Verify domains file exists
         run: |
@@ -66,17 +58,16 @@ jobs:
           new_subdomains_detected=false
           
           while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '\r\n') # Clean whitespace
+            domain=$(echo "$domain" | tr -d '\r\n')
             echo "Processing domain: $domain"
             output_file="subdomain_output/${domain//\//_}_subdomains.txt"
             
             # Run multiple subdomain discovery tools
-            echo "Running Amass (primary)..."
-            /usr/local/bin/amass enum -passive -d "$domain" -o "$output_file" || true
+            echo "Running AssetFinder..."
+            assetfinder --subs-only $domain > "$output_file" || true
             
-            echo "Running Sublist3r (secondary)..."
-            python3 Sublist3r/sublist3r.py -d "$domain" -o temp_sublist3r.txt || true
-            [ -f temp_sublist3r.txt ] && cat temp_sublist3r.txt >> "$output_file" && rm temp_sublist3r.txt
+            echo "Running Amass..."
+            amass enum -passive -d "$domain" >> "$output_file" || true
             
             # Clean results
             sort -u "$output_file" -o "$output_file"
@@ -97,11 +88,9 @@ jobs:
                 new_subdomains_detected=true
               fi
               
-              # Save current results for next run
               cp "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"
             else
               echo "No subdomains found for $domain"
-              # Create empty file to avoid errors in future runs
               touch "old_subdomains/${domain//\//_}_old_subdomains.txt"
             fi
           done < .github/workflows/domains.txt
@@ -147,7 +136,8 @@ jobs:
           path: nikto-reports/*.html
 
       - name: Notify Slack - Scan Complete
+        if: always()
         run: |
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"✅ *All scans completed.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nArtifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            --data "{\"text\": \"✅ *Scan completed.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nArtifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
             ${{ secrets.Slack_Hook }}

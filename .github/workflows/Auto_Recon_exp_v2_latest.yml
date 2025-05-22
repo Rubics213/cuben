@@ -30,48 +30,48 @@ jobs:
           go install github.com/tomnomnom/assetfinder@latest
           sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
-          # Install Amass (with verification)
+          # Install Amass
           echo "Downloading Amass..."
-          if ! wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip; then
+          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip || {
             echo "Failed to download Amass"
             exit 1
-          fi
+          }
           
           echo "Unzipping Amass..."
-          if ! unzip amass_linux_amd64.zip; then
+          unzip amass_linux_amd64.zip || {
             echo "Failed to unzip Amass"
             exit 1
-          fi
+          }
           
           echo "Installing Amass..."
-          if ! sudo mv amass_Linux_amd64/amass /usr/local/bin/; then
+          sudo mv amass_Linux_amd64/amass /usr/local/bin/ || {
             echo "Failed to install Amass"
             exit 1
-          fi
+          }
           
-          # Install ZAP (using known working version)
+          # Install ZAP 2.13.0 (confirmed working version)
           echo "Downloading ZAP..."
-          if ! wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz; then
+          wget https://github.com/zaproxy/zaproxy/releases/download/v2.13.0/ZAP_2.13.0_Linux.tar.gz || {
             echo "Failed to download ZAP"
             exit 1
-          fi
+          }
           
           echo "Extracting ZAP..."
-          if ! tar -xzf ZAP_2.14.0_Linux.tar.gz; then
+          tar -xzf ZAP_2.13.0_Linux.tar.gz || {
             echo "Failed to extract ZAP"
             exit 1
-          fi
+          }
           
           echo "Installing ZAP..."
-          if ! sudo mv ZAP_2.14.0 /opt/zaproxy; then
+          sudo mv ZAP_2.13.0 /opt/zaproxy || {
             echo "Failed to install ZAP"
             exit 1
-          fi
+          }
           
-          if ! sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap; then
+          sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap || {
             echo "Failed to create ZAP symlink"
             exit 1
-          fi
+          }
 
       - name: Verify domains file exists
         run: |

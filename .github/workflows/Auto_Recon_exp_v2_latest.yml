@@ -30,17 +30,48 @@ jobs:
           go install github.com/tomnomnom/assetfinder@latest
           sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
-          # Install Amass (fixed path)
-          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
-          unzip amass_linux_amd64.zip
-          sudo mv amass_Linux_amd64/amass /usr/local/bin/
+          # Install Amass (with verification)
+          echo "Downloading Amass..."
+          if ! wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip; then
+            echo "Failed to download Amass"
+            exit 1
+          fi
           
-          # Install latest ZAP (using current stable version)
-          ZAP_VERSION=$(curl -s https://raw.githubusercontent.com/zaproxy/zaproxy/main/version.txt)
-          wget https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_VERSION}/ZAP_${ZAP_VERSION}_Linux.tar.gz
-          tar -xzf ZAP_${ZAP_VERSION}_Linux.tar.gz
-          sudo mv ZAP_${ZAP_VERSION} /opt/zaproxy
-          sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap
+          echo "Unzipping Amass..."
+          if ! unzip amass_linux_amd64.zip; then
+            echo "Failed to unzip Amass"
+            exit 1
+          fi
+          
+          echo "Installing Amass..."
+          if ! sudo mv amass_Linux_amd64/amass /usr/local/bin/; then
+            echo "Failed to install Amass"
+            exit 1
+          fi
+          
+          # Install ZAP (using known working version)
+          echo "Downloading ZAP..."
+          if ! wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz; then
+            echo "Failed to download ZAP"
+            exit 1
+          fi
+          
+          echo "Extracting ZAP..."
+          if ! tar -xzf ZAP_2.14.0_Linux.tar.gz; then
+            echo "Failed to extract ZAP"
+            exit 1
+          fi
+          
+          echo "Installing ZAP..."
+          if ! sudo mv ZAP_2.14.0 /opt/zaproxy; then
+            echo "Failed to install ZAP"
+            exit 1
+          fi
+          
+          if ! sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap; then
+            echo "Failed to create ZAP symlink"
+            exit 1
+          fi
 
       - name: Verify domains file exists
         run: |
@@ -109,7 +140,8 @@ jobs:
             echo "Scanning $domain with ZAP..."
             
             zap.sh -cmd -quickurl "https://$domain" \
-              -quickprogress -quickout "zap-reports/zap-report-${domain//\//_}.html" || true
+              -quickprogress -quickout "zap-reports/zap-report-${domain//\//_}.html" || \
+              echo "ZAP scan failed for $domain"
           done < .github/workflows/domains.txt
 
       - name: Upload ZAP reports
@@ -127,7 +159,8 @@ jobs:
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "Scanning $domain with Nikto..."
             
-            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-report-${domain//\//_}.html" || true
+            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-report-${domain//\//_}.html" || \
+              echo "Nikto scan failed for $domain"
           done < .github/workflows/domains.txt
 
       - name: Upload Nikto reports

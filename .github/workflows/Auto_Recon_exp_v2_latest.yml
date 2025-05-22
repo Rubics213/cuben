@@ -29,8 +29,8 @@ jobs:
           # Use --user flag for pip installations
           python3 -m pip install --user --upgrade pip
           
-          # Install a maintained fork of Sublist3r
-          git clone https://github.com/Anon-Exploiter/Sublist3r.git
+          # Install Sublist3r from a reliable mirror (using HTTPS with no auth required)
+          git clone https://github.com/Anon-Exploiter/Sublist3r.git --depth 1
           cd Sublist3r
           pip3 install --user -r requirements.txt
           cd ..
@@ -71,11 +71,12 @@ jobs:
             output_file="subdomain_output/${domain//\//_}_subdomains.txt"
             
             # Run multiple subdomain discovery tools
-            echo "Running Sublist3r..."
-            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file" || true
+            echo "Running Amass (primary)..."
+            /usr/local/bin/amass enum -passive -d "$domain" -o "$output_file" || true
             
-            echo "Running Amass..."
-            /usr/local/bin/amass enum -passive -d "$domain" >> "$output_file" || true
+            echo "Running Sublist3r (secondary)..."
+            python3 Sublist3r/sublist3r.py -d "$domain" -o temp_sublist3r.txt || true
+            [ -f temp_sublist3r.txt ] && cat temp_sublist3r.txt >> "$output_file" && rm temp_sublist3r.txt
             
             # Clean results
             sort -u "$output_file" -o "$output_file"

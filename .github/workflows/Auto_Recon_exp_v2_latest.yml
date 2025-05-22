@@ -2,11 +2,9 @@ name: Vulnerability Scanning & Subdomain Detection
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: '13 1 * * *'
@@ -22,20 +20,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Notify Slack - Workflow Started
-        run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
-            --data '{
-              "channel": "#git-actions",
-              "text": "🚀 Vulnerability scanning workflow started."
-            }' \
-            "${{ secrets.Slack_Hook }}")
-          echo "Slack webhook response code: $response"
-          if [[ "$response" != "200" ]]; then
-            echo "Failed to send Slack notification"
-            exit 1
-          fi
 
       - name: Install scanning dependencies
         run: |
@@ -82,17 +66,9 @@ jobs:
       - name: Notify Slack - New Subdomains Detected
         if: env.new_subdomains_detected == 'true'
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
-            --data '{
-              "channel": "#git-actions",
-              "text": "🌐 *New subdomains were detected for Shopify.com.*\nStarting automated scans..."
-            }' \
-            "${{ secrets.Slack_Hook }}")
-          echo "Slack webhook response code: $response"
-          if [[ "$response" != "200" ]]; then
-            echo "Failed to send Slack notification"
-            exit 1
-          fi
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"🌐 *New subdomains were detected.*\nStarting automated scans for Shopify.com...\"}" \
+            ${{ secrets.Slack_Hook }}
 
       - name: Run OWASP ZAP Scan
         if: env.new_subdomains_detected == 'true'
@@ -111,74 +87,36 @@ jobs:
       - name: Notify Slack - ZAP Complete
         if: env.new_subdomains_detected == 'true'
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
-            --data '{
-              "channel": "#git-actions",
-              "text": "🕷️ *OWASP ZAP scan completed* for Shopify.com.\nReport: zap-report.html"
-            }' \
-            "${{ secrets.Slack_Hook }}")
-          echo "Slack webhook response code: $response"
-          if [[ "$response" != "200" ]]; then
-            echo "Failed to send Slack notification"
-            exit 1
-          fi
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"🕷️ *OWASP ZAP scan completed* for Shopify.com.\n🔗 ZAP report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            ${{ secrets.Slack_Hook }}
 
       - name: Run Nikto Scan
         if: env.new_subdomains_detected == 'true'
         run: |
           mkdir -p nikto-output
-          nikto -h https://shopify.com -output nikto-output/niktoreport.txt
+          nikto -h https://shopify.com -Format htm -output nikto-output/nikto-report.html
 
-      - name: Upload Nikto report
+      - name: Upload Nikto HTML report
         if: env.new_subdomains_detected == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: nikto-report
-          path: nikto-output/niktoreport.txt
+          path: nikto-output/nikto-report.html
 
       - name: Notify Slack - Nikto Complete
         if: env.new_subdomains_detected == 'true'
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
-            --data '{
-              "channel": "#git-actions",
-              "text": "🔍 *Nikto scan completed* for Shopify.com.\nReport: niktoreport.txt"
-            }' \
-            "${{ secrets.Slack_Hook }}")
-          echo "Slack webhook response code: $response"
-          if [[ "$response" != "200" ]]; then
-            echo "Failed to send Slack notification"
-            exit 1
-          fi
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"🔍 *Nikto scan completed* for Shopify.com.\n🔗 Nikto report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            ${{ secrets.Slack_Hook }}
 
       - name: Notify Slack - Scan Summary
         if: env.new_subdomains_detected == 'true'
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
-            --data '{
-              "channel": "#git-actions",
-              "text": "✅ *All scans complete.* Reports have been uploaded.\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
-            }' \
-            "${{ secrets.Slack_Hook }}")
-          echo "Slack webhook response code: $response"
-          if [[ "$response" != "200" ]]; then
-            echo "Failed to send Slack notification"
-            exit 1
-          fi
-
-      - name: Notify Slack - Workflow Finished
-        run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
-            --data '{
-              "channel": "#git-actions",
-              "text": "✅ Vulnerability scanning workflow finished."
-            }' \
-            "${{ secrets.Slack_Hook }}")
-          echo "Slack webhook response code: $response"
-          if [[ "$response" != "200" ]]; then
-            echo "Failed to send Slack notification"
-            exit 1
-          fi
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"✅ *All scans complete.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\"}" \
+            ${{ secrets.Slack_Hook }}
 
       - name: Display Scan Summary
-        run: echo "OWASP ZAP and Nikto Scans Completed"
+        run: echo "OWASP ZAP and Nikto HTML reports generated and uploaded"

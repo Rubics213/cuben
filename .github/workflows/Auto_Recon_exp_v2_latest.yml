@@ -25,16 +25,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget
-          python3 -m pip install --upgrade pip
           
-          # Install Sublist3r (fixed version)
-          git clone https://github.com/aboul3la/Sublist3r.git
+          # Use --user flag for pip installations
+          python3 -m pip install --user --upgrade pip
+          
+          # Install a maintained fork of Sublist3r
+          git clone https://github.com/Anon-Exploiter/Sublist3r.git
           cd Sublist3r
-          # Fix escape sequence warnings
-          sed -i "s/\\\_/_/g" sublist3r.py
-          sed -i "s/\\\//\//g" sublist3r.py
-          sed -i "s/\\\-/-/g" sublist3r.py
-          pip3 install -r requirements.txt
+          pip3 install --user -r requirements.txt
           cd ..
           
           # Install Amass
@@ -42,11 +40,14 @@ jobs:
           unzip amass_linux_amd64.zip
           sudo mv amass_linux_amd64/amass /usr/local/bin/
           
-          # Install ZAP standalone instead of Docker version
+          # Install ZAP standalone
           wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
           tar -xzf ZAP_2.14.0_Linux.tar.gz
           sudo mv ZAP_2.14.0 /opt/zaproxy
           sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap
+          
+          # Add Python user binaries to PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Verify domains file exists
         run: |
@@ -107,14 +108,7 @@ jobs:
           echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
           echo "Subdomain detection complete. New subdomains detected: $new_subdomains_detected"
 
-      - name: Notify Slack - New Subdomains Detected
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"🌐 *New subdomains were detected.*\nStarting automated scans...\"}" \
-            ${{ secrets.Slack_Hook }}
-
-      - name: Run OWASP ZAP Scan (Standalone)
+      - name: Run OWASP ZAP Scan
         run: |
           mkdir -p zap-reports
           echo "Running ZAP scan for all domains..."

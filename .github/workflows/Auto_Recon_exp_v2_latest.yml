@@ -23,16 +23,76 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ... (your installation and subdomain detection steps unchanged) ...
+      - name: Notify Slack - Workflow Started
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
+            --data '{
+              "channel": "#git-actions",
+              "text": "🚀 Vulnerability scanning workflow started."
+            }' \
+            "${{ secrets.Slack_Hook }}")
+          echo "Slack webhook response code: $response"
+          if [[ "$response" != "200" ]]; then
+            echo "Failed to send Slack notification"
+            exit 1
+          fi
+
+      - name: Install scanning dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip
+          git clone https://github.com/aboul3la/Sublist3r.git
+          cd Sublist3r
+          pip3 install -r requirements.txt
+          cd ..
+          wget https://github.com/owasp-amass/amass/releases/download/v3.22.0/amass_linux_amd64.zip
+          unzip amass_linux_amd64.zip
+          sudo mv amass_linux_amd64/amass /usr/local/bin/
+
+      - name: Detect subdomains
+        run: |
+          set -e
+          mkdir -p subdomain_output old_subdomains
+          new_subdomains_detected=false
+
+          while IFS= read -r domain; do
+            echo "Finding subdomains for $domain"
+            output_file="subdomain_output/${domain//https:\/\//}_subdomains.txt"
+            python3 Sublist3r/sublist3r.py -d "$domain" -o "$output_file"
+
+            if [ -f "$output_file" ]; then
+              echo "Subdomain output file created: $output_file"
+              if [ -f "old_subdomains/${domain//https:\/\//}_old_subdomains.txt" ]; then
+                if ! diff "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"; then
+                  echo "New subdomains detected for $domain"
+                  new_subdomains_detected=true
+                fi
+              else
+                echo "First run for $domain, no old subdomains to compare."
+                new_subdomains_detected=true
+              fi
+              cp "$output_file" "old_subdomains/${domain//https:\/\//}_old_subdomains.txt"
+            else
+              echo "No subdomains found for $domain. Skipping comparison."
+            fi
+          done < .github/workflows/domains.txt
+
+          echo "new_subdomains_detected=${new_subdomains_detected}" >> $GITHUB_ENV
 
       - name: Notify Slack - New Subdomains Detected
         if: env.new_subdomains_detected == 'true'
         run: |
-          curl -X POST -H 'Content-type: application/json' \
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
             --data '{
+              "channel": "#git-actions",
               "text": "🌐 *New subdomains were detected for Shopify.com.*\nStarting automated scans..."
             }' \
-            "${{ secrets.Slack_Hook }}"
+            "${{ secrets.Slack_Hook }}")
+          echo "Slack webhook response code: $response"
+          if [[ "$response" != "200" ]]; then
+            echo "Failed to send Slack notification"
+            exit 1
+          fi
 
       - name: Run OWASP ZAP Scan
         if: env.new_subdomains_detected == 'true'
@@ -51,11 +111,17 @@ jobs:
       - name: Notify Slack - ZAP Complete
         if: env.new_subdomains_detected == 'true'
         run: |
-          curl -X POST -H 'Content-type: application/json' \
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
             --data '{
+              "channel": "#git-actions",
               "text": "🕷️ *OWASP ZAP scan completed* for Shopify.com.\nReport: zap-report.html"
             }' \
-            "${{ secrets.Slack_Hook }}"
+            "${{ secrets.Slack_Hook }}")
+          echo "Slack webhook response code: $response"
+          if [[ "$response" != "200" ]]; then
+            echo "Failed to send Slack notification"
+            exit 1
+          fi
 
       - name: Run Nikto Scan
         if: env.new_subdomains_detected == 'true'
@@ -73,20 +139,46 @@ jobs:
       - name: Notify Slack - Nikto Complete
         if: env.new_subdomains_detected == 'true'
         run: |
-          curl -X POST -H 'Content-type: application/json' \
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
             --data '{
+              "channel": "#git-actions",
               "text": "🔍 *Nikto scan completed* for Shopify.com.\nReport: niktoreport.txt"
             }' \
-            "${{ secrets.Slack_Hook }}"
+            "${{ secrets.Slack_Hook }}")
+          echo "Slack webhook response code: $response"
+          if [[ "$response" != "200" ]]; then
+            echo "Failed to send Slack notification"
+            exit 1
+          fi
 
       - name: Notify Slack - Scan Summary
         if: env.new_subdomains_detected == 'true'
         run: |
-          curl -X POST -H 'Content-type: application/json' \
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
             --data '{
+              "channel": "#git-actions",
               "text": "✅ *All scans complete.* Reports have been uploaded.\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
             }' \
-            "${{ secrets.Slack_Hook }}"
+            "${{ secrets.Slack_Hook }}")
+          echo "Slack webhook response code: $response"
+          if [[ "$response" != "200" ]]; then
+            echo "Failed to send Slack notification"
+            exit 1
+          fi
+
+      - name: Notify Slack - Workflow Finished
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' \
+            --data '{
+              "channel": "#git-actions",
+              "text": "✅ Vulnerability scanning workflow finished."
+            }' \
+            "${{ secrets.Slack_Hook }}")
+          echo "Slack webhook response code: $response"
+          if [[ "$response" != "200" ]]; then
+            echo "Failed to send Slack notification"
+            exit 1
+          fi
 
       - name: Display Scan Summary
         run: echo "OWASP ZAP and Nikto Scans Completed"

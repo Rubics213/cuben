@@ -7,135 +7,130 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '13 1 * * *'
-    #- cron: '47 5 * * *'
-    #- cron: '29 9 * * *'
-    #- cron: '53 14 * * *'
-    #- cron: '11 18 * * *'
+    - cron: '13 1 * * *'  # Runs once daily at 1:13 AM UTC
 
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 180  # Failsafe to prevent 6-hour runs
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install scanning dependencies
+      - name: Cache Subdomain Tools
+        uses: actions/cache@v3
+        id: cache-tools
+        with:
+          path: |
+            ~/go/bin/assetfinder
+            /usr/local/bin/amass
+          key: ${{ runner.os }}-subdomain-tools-${{ hashFiles('.github/workflows/domains.txt') }}
+
+      - name: Install Dependencies (Fast)
+        if: steps.cache-tools.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends git python3 python3-pip wget unzip
           
-          # Install AssetFinder
+          # Install only essential tools
           go install github.com/tomnomnom/assetfinder@latest
           sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
-          # Install Amass
-          echo "Downloading Amass..."
-          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip || {
-            echo "Failed to download Amass"
-            exit 1
-          }
-          
-          echo "Unzipping Amass..."
-          unzip amass_linux_amd64.zip || {
-            echo "Failed to unzip Amass"
-            exit 1
-          }
-          
-          echo "Installing Amass..."
-          sudo mv amass_Linux_amd64/amass /usr/local/bin/ || {
-            echo "Failed to install Amass"
-            exit 1
-          }
+          # Lightweight Amass install
+          wget -q https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
+          unzip -q amass_linux_amd64.zip
+          sudo mv amass_linux_amd64/amass /usr/local/bin/
 
-      - name: Verify domains file exists
-        run: |
-          if [ ! -f ".github/workflows/domains.txt" ]; then
-            echo "ERROR: domains.txt file not found at .github/workflows/domains.txt"
-            exit 1
-          fi
-          echo "Domains to scan:"
-          cat .github/workflows/domains.txt
-
-      - name: Detect subdomains
-        id: subdomain-detection
+      - name: Fast Subdomain Detection
+        id: subdomains
         run: |
           set -e
-          mkdir -p subdomain_output old_subdomains
-          new_subdomains_detected=false
+          mkdir -p subdomain_output
           
-          while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '\r\n')
-            echo "Processing domain: $domain"
+          # Parallel execution with GNU parallel
+          echo "Installing parallel for faster scans..."
+          sudo apt-get install -y parallel
+          
+          cat .github/workflows/domains.txt | parallel -j 4 '
+            domain={}
             output_file="subdomain_output/${domain//\//_}_subdomains.txt"
             
-            # Run multiple subdomain discovery tools
-            echo "Running AssetFinder..."
-            assetfinder --subs-only $domain > "$output_file" || true
+            # Run tools in parallel
+            assetfinder --subs-only $domain > $output_file &
+            amass enum -passive -d $domain >> $output_file &
+            wait
             
-            echo "Running Amass..."
-            amass enum -passive -d "$domain" >> "$output_file" || true
+            # Deduplicate results
+            sort -u $output_file -o $output_file
+            sed -i "/^$/d" $output_file
             
-            # Clean results
-            sort -u "$output_file" -o "$output_file"
-            sed -i '/^$/d' "$output_file"
-            
-            if [ -s "$output_file" ]; then
-              echo "Found subdomains for $domain:"
-              cat "$output_file"
-              
-              if [ -f "old_subdomains/${domain//\//_}_old_subdomains.txt" ]; then
-                echo "Comparing with previous results..."
-                if ! diff -q "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"; then
-                  echo "New subdomains detected!"
-                  new_subdomains_detected=true
-                fi
-              else
-                echo "First run for $domain - considering all subdomains as new"
-                new_subdomains_detected=true
-              fi
-              
-              cp "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"
-            else
-              echo "No subdomains found for $domain"
-              touch "old_subdomains/${domain//\//_}_old_subdomains.txt"
-            fi
-          done < .github/workflows/domains.txt
+            echo "Found $(wc -l < $output_file) subdomains for $domain"
+          '
           
-          echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
-          echo "Subdomain detection complete. New subdomains detected: $new_subdomains_detected"
+          # Check for new subdomains (simplified diff logic)
+          if [ -d "old_subdomains" ]; then
+            new_subdomains=$(find subdomain_output -type f -exec bash -c \
+              'diff -q {} old_subdomains/$(basename {}) >/dev/null || echo 1' \; | wc -l)
+          else
+            new_subdomains=1
+          fi
+          
+          echo "new_subdomains_detected=$([ $new_subdomains -gt 0 ] && echo true || echo false)" >> $GITHUB_ENV
+          mkdir -p old_subdomains && cp subdomain_output/* old_subdomains/ || true
 
-      - name: ZAP Scan
-        uses: zaproxy/action-af@v0.2.0
-        with:
-          plan: '.github/workflows/zap/plan.yml'
-        if: env.new_subdomains_detected == 'true'
-
-      - name: Run Nikto Scan
+      - name: Lightweight Vulnerability Scan
         if: env.new_subdomains_detected == 'true'
         run: |
-          mkdir -p nikto-reports
-          echo "Running Nikto scans for all domains..."
+          mkdir -p scans
           
-          while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '\r\n')
-            echo "Scanning $domain with Nikto..."
-            
-            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-report-${domain//\//_}.html" || \
-              echo "Nikto scan failed for $domain"
-          done < .github/workflows/domains.txt
+          # Fast nmap scan for critical ports only
+          cat .github/workflows/domains.txt | parallel -j 2 '
+            nmap -T4 --top-ports 100 -oN scans/nmap-{}.txt {}
+          '
+          
+          # Nikto scan only on HTTP/HTTPS ports found
+          grep -hE "80/open|443/open" scans/nmap-*.txt | awk "{print \$2}" | parallel -j 2 '
+            nikto -h {} -timeout 3 -nointeractive -Format htm -output scans/nikto-{}.html
+          '
 
-      - name: Upload Nikto reports
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: nikto-reports
-          path: nikto-reports/*.html
-        if: env.new_subdomains_detected == 'true'
+          name: security-scans-${{ github.run_id }}
+          path: |
+            subdomain_output/*
+            scans/*
 
-      - name: Notify Slack - Scan Complete
+      - name: Slack Notification
         if: always()
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"✅ *Scan completed.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nArtifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-            ${{ secrets.Slack_Hook }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚀 Scan completed in ${{ job.status }} state",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*${{ github.workflow }}* completed for ${{ github.repository }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:* ${{ job.status }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Duration:* ${{ job.steps.*.conclusion }} minutes"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

@@ -1,4 +1,4 @@
-name: Vulnerability Scanning & Subdomain Detection
+name: Optimized Vulnerability Scan
 
 on:
   push:
@@ -7,130 +7,112 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '13 1 * * *'  # Runs once daily at 1:13 AM UTC
+    - cron: '13 1 * * *'
 
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # Failsafe to prevent 6-hour runs
+    timeout-minutes: 120  # Hard limit to prevent 6-hour runs
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Cache Subdomain Tools
-        uses: actions/cache@v3
-        id: cache-tools
-        with:
-          path: |
-            ~/go/bin/assetfinder
-            /usr/local/bin/amass
-          key: ${{ runner.os }}-subdomain-tools-${{ hashFiles('.github/workflows/domains.txt') }}
-
-      - name: Install Dependencies (Fast)
-        if: steps.cache-tools.outputs.cache-hit != 'true'
+      - name: Install scanning dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends git python3 python3-pip wget unzip
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang parallel
           
-          # Install only essential tools
+          # Install AssetFinder
           go install github.com/tomnomnom/assetfinder@latest
           sudo mv ~/go/bin/assetfinder /usr/local/bin/
           
-          # Lightweight Amass install
+          # Install Amass (optimized)
           wget -q https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
           unzip -q amass_linux_amd64.zip
           sudo mv amass_linux_amd64/amass /usr/local/bin/
 
-      - name: Fast Subdomain Detection
-        id: subdomains
+      - name: Verify domains file exists
+        run: |
+          if [ ! -f ".github/workflows/domains.txt" ]; then
+            echo "ERROR: domains.txt file not found at .github/workflows/domains.txt"
+            exit 1
+          fi
+
+      - name: Parallel Subdomain Detection
+        id: subdomain-detection
         run: |
           set -e
-          mkdir -p subdomain_output
+          mkdir -p subdomain_output old_subdomains
           
-          # Parallel execution with GNU parallel
-          echo "Installing parallel for faster scans..."
-          sudo apt-get install -y parallel
-          
-          cat .github/workflows/domains.txt | parallel -j 4 '
+          # Process domains in parallel
+          cat .github/workflows/domains.txt | parallel -j 4 --lb '
             domain={}
             output_file="subdomain_output/${domain//\//_}_subdomains.txt"
             
-            # Run tools in parallel
-            assetfinder --subs-only $domain > $output_file &
-            amass enum -passive -d $domain >> $output_file &
-            wait
+            echo "Processing $domain"
+            
+            # Run tools with timeouts
+            timeout 30 assetfinder --subs-only $domain > $output_file
+            timeout 60 amass enum -passive -d $domain >> $output_file 2>/dev/null
             
             # Deduplicate results
             sort -u $output_file -o $output_file
             sed -i "/^$/d" $output_file
             
-            echo "Found $(wc -l < $output_file) subdomains for $domain"
+            # Compare with previous results
+            if [ -f "old_subdomains/${domain//\//_}_old_subdomains.txt" ]; then
+              if ! diff -q $output_file "old_subdomains/${domain//\//_}_old_subdomains.txt"; then
+                echo "new_subdomain_detected=true" >> $GITHUB_ENV
+              fi
+            else
+              echo "new_subdomain_detected=true" >> $GITHUB_ENV
+            fi
+            
+            # Save results for next run
+            cp $output_file "old_subdomains/${domain//\//_}_old_subdomains.txt"
           '
           
-          # Check for new subdomains (simplified diff logic)
-          if [ -d "old_subdomains" ]; then
-            new_subdomains=$(find subdomain_output -type f -exec bash -c \
-              'diff -q {} old_subdomains/$(basename {}) >/dev/null || echo 1' \; | wc -l)
+          # Set final flag if any new subdomains were found
+          if [ "$(grep -c "new_subdomain_detected=true" $GITHUB_ENV)" -gt 0 ]; then
+            echo "new_subdomains_detected=true" >> $GITHUB_ENV
           else
-            new_subdomains=1
+            echo "new_subdomains_detected=false" >> $GITHUB_ENV
           fi
-          
-          echo "new_subdomains_detected=$([ $new_subdomains -gt 0 ] && echo true || echo false)" >> $GITHUB_ENV
-          mkdir -p old_subdomains && cp subdomain_output/* old_subdomains/ || true
 
-      - name: Lightweight Vulnerability Scan
+      - name: Optimized ZAP Scan
+        if: env.new_subdomains_detected == 'true'
+        uses: zaproxy/action-af@v0.2.0
+        with:
+          plan: '.github/workflows/zap/plan.yml'
+          cmd_options: '-config scan.maxDuration=60 -t 5'  # Limit to 1 hour, 5 threads
+
+      - name: Fast Nikto Scans
         if: env.new_subdomains_detected == 'true'
         run: |
-          mkdir -p scans
-          
-          # Fast nmap scan for critical ports only
-          cat .github/workflows/domains.txt | parallel -j 2 '
-            nmap -T4 --top-ports 100 -oN scans/nmap-{}.txt {}
-          '
-          
-          # Nikto scan only on HTTP/HTTPS ports found
-          grep -hE "80/open|443/open" scans/nmap-*.txt | awk "{print \$2}" | parallel -j 2 '
-            nikto -h {} -timeout 3 -nointeractive -Format htm -output scans/nikto-{}.html
+          mkdir -p nikto-reports
+          cat .github/workflows/domains.txt | parallel -j 3 '
+            domain={}
+            echo "Scanning $domain with Nikto (timeout 15m)"
+            timeout 15m nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-report-${domain//\//_}.html" -Tuning x 6
           '
 
-      - name: Upload Results
+      - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
-          name: security-scans-${{ github.run_id }}
+          name: security-reports
           path: |
             subdomain_output/*
-            scans/*
+            nikto-reports/*.html
 
       - name: Slack Notification
         if: always()
-        uses: slackapi/slack-github-action@v1
+        uses: slackapi/slack-github-action@v1.24.0
         with:
-          payload: |
-            {
-              "text": "🚀 Scan completed in ${{ job.status }} state",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*${{ github.workflow }}* completed for ${{ github.repository }}"
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Status:* ${{ job.status }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Duration:* ${{ job.steps.*.conclusion }} minutes"
-                    }
-                  ]
-                }
-              ]
-            }
+          slack-message: |
+            :shield: *Scan Completed* (${{ job.status }})
+            • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>
+            • Duration: ${{ job.steps.*.outcome }}
+            • New Subdomains: ${{ env.new_subdomains_detected == 'true' && 'Yes' || 'No' }}
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_URL: ${{ secrets.Slack_Hook }}

@@ -8,10 +8,10 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '13 1 * * *'
-    - cron: '47 5 * * *'
-    - cron: '29 9 * * *'
-    - cron: '53 14 * * *'
-    - cron: '11 18 * * *'
+    #- cron: '47 5 * * *'
+    #- cron: '29 9 * * *'
+    #- cron: '53 14 * * *'
+    #- cron: '11 18 * * *'
 
 jobs:
   vulnerability-scan:

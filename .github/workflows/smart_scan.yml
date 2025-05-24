@@ -53,7 +53,7 @@ jobs:
             assetfinder --subs-only "$domain" > "$output_file" || true
 
             echo "[*] Amass for $domain"
-            amass enum -passive -timeout 5m -d "$domain" >> "$output_file" || true
+            amass enum -passive -d "$domain" >> "$output_file" || true
 
             sort -u "$output_file" -o "$output_file"
             sed -i '/^$/d' "$output_file"

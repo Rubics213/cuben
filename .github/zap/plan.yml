@@ -1,10 +1,10 @@
 - name: "Standard Vulnerability Scan"
   parameters:
-    target: "https://example.com"  # REPLACE WITH YOUR TARGET DOMAIN
+    target: "https://shopify.com"  # REPLACE WITH YOUR TARGET DOMAIN
     context:
       name: "scan-context"
       urls:
-        - "https://example.com*"   # REPLACE WITH YOUR DOMAIN PATTERN
+        - "https://.shopify.com*"   # REPLACE WITH YOUR DOMAIN PATTERN
   jobs:
     - name: spider
       type: spider

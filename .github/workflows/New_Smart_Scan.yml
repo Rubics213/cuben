@@ -12,7 +12,7 @@ on:
 
 env:
   NUCLEI_TEMPLATES_DIR: /tmp/nuclei-templates
-  MAX_SCAN_TIME: 7200  # 2 hours timeout
+  MAX_SCAN_TIME: 7200
 
 jobs:
   reconnaissance:
@@ -43,14 +43,16 @@ jobs:
           done
           echo "count=$(find targets -type f -name "*.json" | wc -l)" >> $GITHUB_OUTPUT
 
-  scanning:
+  prepare-targets:
     needs: reconnaissance
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: ${{ fromJson(format('[{0}]', join(',', steps.get-targets.outputs.targets)) }}
+    outputs:
+      targets: ${{ steps.get-targets.outputs.targets }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore Recon Data
+        run: mkdir -p targets && cp -r targets/* targets/ || true
 
       - name: Get Scan Targets
         id: get-targets
@@ -58,41 +60,80 @@ jobs:
           targets=$(jq -r '.url' targets/*.json | tr '\n' ',' | sed 's/,$//')
           echo "targets=[$targets]" >> $GITHUB_OUTPUT
 
-      - name: Install Scanning Tools
+  split-targets:
+    needs: prepare-targets
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shard.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Targets
+        run: mkdir -p targets && cp -r targets/* targets/ || true
+
+      - name: Split Targets into Chunks
+        id: shard
+        run: |
+          mkdir split
+          shard_size=5
+          count=0
+          index=0
+          for url in $(jq -r '.url' targets/*.json); do
+            echo "$url" >> split/chunk_$index.txt
+            count=$((count+1))
+            if [ "$count" -eq "$shard_size" ]; then
+              index=$((index+1))
+              count=0
+            fi
+          done
+
+          files=$(ls split/chunk_*.txt | jq -R -s -c 'split("\n")[:-1]')
+          echo "shards=$files" >> $GITHUB_OUTPUT
+
+      - name: Upload Shards
+        uses: actions/upload-artifact@v3
+        with:
+          name: target-shards
+          path: split/
+
+  scanning:
+    needs: split-targets
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: ${{ fromJson(needs.split-targets.outputs.shards) }}
+      max-parallel: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Target Shard
+        uses: actions/download-artifact@v3
+        with:
+          name: target-shards
+          path: shards/
+
+      - name: Install Tools
         run: |
           go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
           nuclei -update-templates
           sudo mv ~/go/bin/nuclei /usr/local/bin/
-          docker pull wpscanteam/wpscan
 
-      - name: Run Nuclei Deep Scan
-        timeout-minutes: 120
+      - name: Run Nuclei on Shard
         run: |
           mkdir -p scan_results
-          nuclei -u "${{ matrix.target }}" \
+          input_file="shards/${{ matrix.shard }}"
+          nuclei -l "$input_file" \
             -t ~/nuclei-templates/ \
-            -severity low,medium,high,critical \
-            -retries 2 \
-            -rate-limit 50 \
-            -timeout 30 \
-            -si 100 \
-            -j -o "scan_results/nuclei_${GITHUB_RUN_ID}.json" \
-            -stats -metrics
+            -severity high,critical \
+            -rate-limit 200 \
+            -timeout 15 \
+            -j -silent -o "scan_results/nuclei_${{ matrix.shard }}.json"
 
-      - name: Run Specialized Scans
-        run: |
-          # WordPress Scanning
-          if echo "${{ matrix.target }}" | grep -q "wordpress"; then
-            docker run --rm wpscanteam/wpscan \
-              --url "${{ matrix.target }}" \
-              --format json \
-              --output "scan_results/wpscan_${GITHUB_RUN_ID}.json"
-          fi
-
-          # XSS Scanning
-          dalfox url "${{ matrix.target }}" \
-            --output "scan_results/xss_${GITHUB_RUN_ID}.json" \
-            --format json
+      - name: Upload Scan Result
+        uses: actions/upload-artifact@v3
+        with:
+          name: nuclei-results-${{ matrix.shard }}
+          path: scan_results/
 
   post_processing:
     needs: scanning
@@ -100,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Artifacts
+      - name: Download All Results
         uses: actions/download-artifact@v3
         with:
           path: scan_results
@@ -108,9 +149,8 @@ jobs:
       - name: Generate Consolidated Report
         run: |
           mkdir -p reports
-          jq -s 'flatten' scan_results/*.json > reports/combined_results.json
-          
-          # Create executive summary
+          jq -s 'flatten' scan_results/**/*.json > reports/combined_results.json
+
           echo "# Security Scan Report" > reports/executive_summary.md
           echo "Generated: $(date)" >> reports/executive_summary.md
           echo "## Findings Overview" >> reports/executive_summary.md
@@ -140,7 +180,7 @@ jobs:
         run: |
           critical=$(jq '[.[] | select(.info.severity == "critical")] | length' reports/combined_results.json)
           high=$(jq '[.[] | select(.info.severity == "high")] | length' reports/combined_results.json)
-          
+
           if [ "$critical" -gt 0 ]; then
             color="#ff0000"
             priority="URGENT"

@@ -114,11 +114,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run ZAP scan
-        uses: zaproxy/action-af@v0.2.0
+        uses: zaproxy/action-baseline@v0.10.0
         with:
-          plan: '.github/zap/plan.yml'
+          target: 'https://${{ matrix.domain }}'
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rules_file_name: '.github/zap/rules.tsv'
           cmd_options: '-config global.timeoutInSecs=1800'
-
+          
   nikto-scan:
     needs: subdomain-discovery
     if: needs.subdomain-discovery.outputs.new_subdomains_detected == 'true'

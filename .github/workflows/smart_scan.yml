@@ -1,0 +1,124 @@
+name: Vulnerability Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '13 1 * * *'
+
+jobs:
+  subdomain-discovery:
+    runs-on: ubuntu-latest
+    outputs:
+      new_subdomains_detected: ${{ steps.setflag.outputs.new_detected }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip unzip wget golang
+          go install github.com/tomnomnom/assetfinder@latest
+          sudo mv ~/go/bin/assetfinder /usr/local/bin/
+
+          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
+          unzip amass_linux_amd64.zip
+          sudo mv amass_linux_amd64/amass /usr/local/bin/
+
+      - name: Verify domains file exists
+        run: |
+          if [ ! -f ".github/workflows/domains.txt" ]; then
+            echo "ERROR: domains.txt file not found"
+            exit 1
+          fi
+          echo "Domains to scan:"
+          cat .github/workflows/domains.txt
+
+      - name: Detect subdomains
+        id: setflag
+        run: |
+          set -e
+          mkdir -p subdomain_output old_subdomains
+          new_detected=false
+
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            output_file="subdomain_output/${domain//\//_}_subdomains.txt"
+
+            echo "[*] AssetFinder for $domain"
+            assetfinder --subs-only "$domain" > "$output_file" || true
+
+            echo "[*] Amass for $domain"
+            amass enum -passive -timeout 5m -d "$domain" >> "$output_file" || true
+
+            sort -u "$output_file" -o "$output_file"
+            sed -i '/^$/d' "$output_file"
+
+            if [ -s "$output_file" ]; then
+              if [ -f "old_subdomains/${domain//\//_}_old_subdomains.txt" ]; then
+                if ! diff -q "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"; then
+                  new_detected=true
+                fi
+              else
+                new_detected=true
+              fi
+              cp "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"
+            fi
+          done < .github/workflows/domains.txt
+
+          echo "new_detected=$new_detected" >> $GITHUB_OUTPUT
+
+  zap-scan:
+    needs: subdomain-discovery
+    if: needs.subdomain-discovery.outputs.new_subdomains_detected == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ZAP scan
+        uses: zaproxy/action-af@v0.2.0
+        with:
+          plan: '.github/workflows/zap/plan.yml'
+
+  nikto-scan:
+    needs: subdomain-discovery
+    if: needs.subdomain-discovery.outputs.new_subdomains_detected == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nikto
+        run: sudo apt-get update && sudo apt-get install -y nikto
+
+      - name: Run Nikto scan
+        run: |
+          mkdir -p nikto-reports
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "[*] Scanning $domain with Nikto"
+            nikto -h "https://$domain" -maxtime 1800 -Tuning 123 -Format htm \
+              -output "nikto-reports/nikto-report-${domain//\//_}.html" || echo "Nikto failed"
+          done < .github/workflows/domains.txt
+
+      - name: Upload Nikto reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: nikto-reports
+          path: nikto-reports/*.html
+
+  notify:
+    needs: [zap-scan, nikto-scan]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack - Scan Complete
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"✅ *Scan completed.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nArtifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            ${{ secrets.Slack_Hook }}

@@ -1,24 +1,18 @@
-- name: "Standard Vulnerability Scan"
+- name: "Quick Scan"
   parameters:
-    target: "https://shopify.com"  # REPLACE WITH YOUR TARGET DOMAIN
-    context:
-      name: "scan-context"
-      urls:
-        - "https://.shopify.com*"   # REPLACE WITH YOUR DOMAIN PATTERN
-  jobs:
-    - name: spider
-      type: spider
-      parameters:
-        maxDuration: 30  # Minutes
-        
-    - name: ajax-spider
-      type: ajaxSpider
-      parameters:
-        maxDuration: 30  # Minutes
-        
-    - name: active-scan
-      type: activeScan
-      parameters:
-        scanPolicyName: "Default Policy"
-        strength: "MEDIUM"
-        threshold: "MEDIUM"
+    context: 
+      name: "Default Context"
+      url: "https://shopify.com"
+    target:
+      url: "https://shopify.com"
+    rules:
+      name: "Default Rule Set"
+    policy:
+      name: "Default Policy"
+    spider:
+      maxDuration: 10
+    ajaxSpider:
+      enabled: false
+    activeScan:
+      enabled: true
+      policy: "Default Policy"

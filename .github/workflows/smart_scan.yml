@@ -1,10 +1,16 @@
-name: Vulnerability Scan
+name: Optimized Vulnerability Scan
 
 on:
   push:
     branches: [main]
+    paths:
+      - '.github/workflows/domains.txt'
+      - '.github/workflows/vulnerability-scan.yml'
   pull_request:
     branches: [main]
+    paths:
+      - '.github/workflows/domains.txt'
+      - '.github/workflows/vulnerability-scan.yml'
   workflow_dispatch:
   schedule:
     - cron: '13 1 * * *'
@@ -18,16 +24,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip unzip wget golang
-          go install github.com/tomnomnom/assetfinder@latest
-          sudo mv ~/go/bin/assetfinder /usr/local/bin/
-
-          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
-          unzip amass_linux_amd64.zip
-          sudo mv amass_Linux_amd64/amass /usr/local/bin/
+          sudo apt-get install -y git python3 python3-pip unzip wget golang parallel
+          
+          # Install assetfinder if not cached
+          if ! command -v assetfinder &> /dev/null; then
+            go install github.com/tomnomnom/assetfinder@latest
+            sudo mv ~/go/bin/assetfinder /usr/local/bin/
+          fi
+          
+          # Install amass if not cached
+          if ! command -v amass &> /dev/null; then
+            wget -q https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
+            unzip -q amass_linux_amd64.zip
+            sudo mv amass_Linux_amd64/amass /usr/local/bin/
+          fi
 
       - name: Verify domains file exists
         run: |
@@ -44,32 +65,44 @@ jobs:
           set -e
           mkdir -p subdomain_output old_subdomains
           new_detected=false
-
-          while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '\r\n')
-            output_file="subdomain_output/${domain//\//_}_subdomains.txt"
-
-            echo "[*] AssetFinder for $domain"
-            assetfinder --subs-only "$domain" > "$output_file" || true
-
-            echo "[*] Amass for $domain"
-            amass enum -passive -d "$domain" >> "$output_file" || true
-
+          
+          # Function to process a single domain
+          process_domain() {
+            domain=$1
+            domain_clean=$(echo "$domain" | tr -d '\r\n')
+            output_file="subdomain_output/${domain_clean//\//_}_subdomains.txt"
+            
+            echo "[*] Processing $domain_clean"
+            timeout 300 assetfinder --subs-only "$domain_clean" > "$output_file" || true
+            timeout 600 amass enum -passive -d "$domain_clean" -timeout 30 -noalts -nocolor >> "$output_file" || true
+            
             sort -u "$output_file" -o "$output_file"
             sed -i '/^$/d' "$output_file"
-
+            
             if [ -s "$output_file" ]; then
-              if [ -f "old_subdomains/${domain//\//_}_old_subdomains.txt" ]; then
-                if ! diff -q "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"; then
-                  new_detected=true
+              if [ -f "old_subdomains/${domain_clean//\//_}_old_subdomains.txt" ]; then
+                if ! diff -q "$output_file" "old_subdomains/${domain_clean//\//_}_old_subdomains.txt"; then
+                  echo "true" > new_detected.flag
                 fi
               else
-                new_detected=true
+                echo "true" > new_detected.flag
               fi
-              cp "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"
+              cp "$output_file" "old_subdomains/${domain_clean//\//_}_old_subdomains.txt"
             fi
-          done < .github/workflows/domains.txt
-
+          }
+          
+          # Export function for parallel
+          export -f process_domain
+          
+          # Run in parallel (4 domains at a time)
+          parallel -j 4 process_domain ::: $(cat .github/workflows/domains.txt)
+          
+          # Check if any new domains were detected
+          if [ -f new_detected.flag ]; then
+            new_detected=true
+            rm new_detected.flag
+          fi
+          
           echo "new_detected=$new_detected" >> $GITHUB_OUTPUT
 
   zap-scan:
@@ -84,6 +117,7 @@ jobs:
         uses: zaproxy/action-af@v0.2.0
         with:
           plan: '.github/zap/plan.yml'
+          cmd_options: '-config global.timeoutInSecs=1800'
 
   nikto-scan:
     needs: subdomain-discovery
@@ -102,8 +136,8 @@ jobs:
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "[*] Scanning $domain with Nikto"
-            nikto -h "https://$domain" -maxtime 1800 -Tuning 123 -Format htm \
-              -output "nikto-reports/nikto-report-${domain//\//_}.html" || echo "Nikto failed"
+            timeout 1800 nikto -h "https://$domain" -maxtime 1800 -Tuning 123 -Format htm \
+              -output "nikto-reports/nikto-report-${domain//\//_}.html" || echo "Nikto scan timed out"
           done < .github/workflows/domains.txt
 
       - name: Upload Nikto reports
@@ -119,6 +153,16 @@ jobs:
     steps:
       - name: Notify Slack - Scan Complete
         run: |
+          if [[ '${{ needs.subdomain-discovery.outputs.new_subdomains_detected }}' == 'true' ]]; then
+            message="✅ *Vulnerability scan completed with findings*\n"
+            message+="Workflow: '${{ github.workflow }}'\n"
+            message+="Branch: '${{ github.ref }}'\n"
+            message+="Commit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\n"
+            message+="Artifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            message="ℹ️ *Vulnerability scan completed - no new findings*"
+          fi
+          
           curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": \"✅ *Scan completed.*\nWorkflow: '${{ github.workflow }}'\nBranch: '${{ github.ref }}'\nCommit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nArtifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            --data "{\"text\": \"$message\"}" \
             ${{ secrets.Slack_Hook }}

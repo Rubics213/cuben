@@ -1,0 +1,41 @@
+- name: "Comprehensive Security Scan"
+  parameters:
+    target: "https://yourdomain.com"
+    context:
+      name: "auth-context"
+      urls:
+        - "https://yourdomain.com*"
+      authentication:
+        type: "form"
+        loginUrl: "https://yourdomain.com/login"
+        loginRequestData: "username={%username%}&password={%password%}"
+  jobs:
+    - name: spider
+      type: spider
+      parameters:
+        maxDuration: 45
+        maxChildren: 100
+        
+    - name: ajax-spider
+      type: ajaxSpider
+      parameters:
+        maxDuration: 60
+        
+    - name: passive-scan-wait
+      type: passiveScan-wait
+      parameters:
+        maxDuration: 10
+        
+    - name: active-scan
+      type: activeScan
+      parameters:
+        scanPolicyName: "API-scan"
+        strength: "HIGH"
+        threshold: "LOW"
+        
+    - name: report
+      type: report
+      parameters:
+        template: "traditional-html"
+        reportDir: "/zap/wrk/reports"
+        reportFile: "zap-report.html"

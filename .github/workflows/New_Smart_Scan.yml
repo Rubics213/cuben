@@ -1,249 +1,237 @@
-name: Advanced Vulnerability Scan Suite
+name: Advanced Bug Bounty Scanner
 
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  schedule:
-    - cron: '0 3 * * *'  # Daily at 3 AM
+  pull_request:
+    branches: [main]
   workflow_dispatch:
-
-env:
-  NUCLEI_TEMPLATES_DIR: /tmp/nuclei-templates
-  MAX_SCAN_TIME: 7200
+  schedule:
+    - cron: '13 1 * * *'
+    - cron: '47 5 * * *'
+    - cron: '29 9 * * *'
+    - cron: '53 14 * * *'
+    - cron: '11 18 * * *'
 
 jobs:
-  reconnaissance:
+  vulnerability-scan:
     runs-on: ubuntu-latest
-    outputs:
-      target_count: ${{ steps.targets.outputs.count }}
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 120
 
-      - name: Install Recon Tools
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq python3-pip
-          pip install --upgrade pip
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl
+          
+          # Set up Go path
+          echo "GOPATH=$HOME/go" >> $GITHUB_ENV
+          echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
+          
+          # Install recon tools
           go install github.com/tomnomnom/assetfinder@latest
-          go install github.com/lc/gau/v2/cmd/gau@latest
-          sudo mv ~/go/bin/* /usr/local/bin/
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
+          
+          # Install Findomain
+          curl -LO https://github.com/findomain/findomain/releases/latest/download/findomain-linux
+          chmod +x findomain-linux
+          sudo mv findomain-linux /usr/local/bin/findomain
+          
+          # Update Nuclei templates
+          nuclei -update-templates -silent
+          
+          # Skip Nikto update
+          mkdir -p ~/nikto/program
+          touch ~/nikto/program/plugins/__latest__
 
-      - name: Run Comprehensive Discovery
-        id: targets
+      - name: Verify domains file exists
         run: |
-          mkdir -p targets
-          cat .github/workflows/domains.txt | while read -r domain; do
-            subfinder -d "$domain" -silent | httpx -silent -status-code -title -tech-detect -json -o "targets/${domain//./_}.json"
-            gau "$domain" --subs | httpx -silent >> "targets/${domain//./_}.txt"
-          done
-          echo "count=$(find targets -type f -name "*.json" | wc -l)" >> $GITHUB_OUTPUT
+          if [ ! -f ".github/workflows/domains.txt" ]; then
+            echo "ERROR: domains.txt file not found!"
+            exit 1
+          fi
+          echo "Target domains:"
+          cat .github/workflows/domains.txt
 
-  prepare-targets:
-    needs: reconnaissance
-    runs-on: ubuntu-latest
-    outputs:
-      targets: ${{ steps.get-targets.outputs.targets }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Restore Recon Data
-        run: mkdir -p targets && cp -r targets/* targets/ || true
-
-      - name: Get Scan Targets
-        id: get-targets
+      - name: Detect subdomains
+        id: subdomain-detection
         run: |
-          targets=$(jq -r '.url' targets/*.json | tr '\n' ',' | sed 's/,$//')
-          echo "targets=[$targets]" >> $GITHUB_OUTPUT
-
-  split-targets:
-    needs: prepare-targets
-    runs-on: ubuntu-latest
-    outputs:
-      shards: ${{ steps.shard.outputs.shards }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Load Targets
-        run: mkdir -p targets && cp -r targets/* targets/ || true
-
-      - name: Split Targets into Chunks
-        id: shard
-        run: |
-          mkdir split
-          shard_size=5
-          count=0
-          index=0
-          for url in $(jq -r '.url' targets/*.json); do
-            echo "$url" >> split/chunk_$index.txt
-            count=$((count+1))
-            if [ "$count" -eq "$shard_size" ]; then
-              index=$((index+1))
-              count=0
+          set -e
+          mkdir -p subdomain_output old_subdomains
+          new_subdomains_detected=false
+          
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "🛠️ Processing $domain"
+            output_file="subdomain_output/${domain//./_}_subdomains.txt"
+            
+            # Triple-threat discovery
+            assetfinder --subs-only $domain | httpx -silent > "$output_file" || true
+            subfinder -d "$domain" -silent >> "$output_file" || true
+            findomain -t "$domain" --quiet >> "$output_file" || true
+            
+            # Clean and deduplicate
+            sort -u "$output_file" -o "$output_file"
+            sed -i '/^$/d' "$output_file"
+            
+            if [ -s "$output_file" ]; then
+              echo "✅ Found $(wc -l < "$output_file") subdomains"
+              
+              if [ -f "old_subdomains/${domain//./_}_old_subdomains.txt" ]; then
+                if ! diff -q "$output_file" "old_subdomains/${domain//./_}_old_subdomains.txt"; then
+                  new_subdomains_detected=true
+                  echo "🔥 New subdomains found!"
+                fi
+              else
+                new_subdomains_detected=true
+                echo "🌟 First run - all subdomains are new"
+              fi
+              
+              cp "$output_file" "old_subdomains/${domain//./_}_old_subdomains.txt"
+            else
+              echo "❌ No subdomains found"
+              touch "old_subdomains/${domain//./_}_old_subdomains.txt"
             fi
-          done
+          done < .github/workflows/domains.txt
+          
+          echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
 
-          files=$(ls split/chunk_*.txt | jq -R -s -c 'split("\n")[:-1]')
-          echo "shards=$files" >> $GITHUB_OUTPUT
-
-      - name: Upload Shards
-        uses: actions/upload-artifact@v3
-        with:
-          name: target-shards
-          path: split/
-
-  scanning:
-    needs: split-targets
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        shard: ${{ fromJson(needs.split-targets.outputs.shards) }}
-      max-parallel: 4
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Target Shard
-        uses: actions/download-artifact@v3
-        with:
-          name: target-shards
-          path: shards/
-
-      - name: Install Tools
+      - name: Prepare ZAP plan
         run: |
-          go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-          nuclei -update-templates
-          sudo mv ~/go/bin/nuclei /usr/local/bin/
+          mkdir -p .github/zap
+          if [ ! -f ".github/zap/plan.yml" ]; then
+            cat > .github/zap/plan.yml <<EOL
+- name: "Default Scan"
+  parameters:
+    target: "https://TARGET_DOMAIN"
+    rules: 
+      - "scan_rules/automatic"
+    context: 
+      name: "Default Context"
+      includePaths:
+        - "https://TARGET_DOMAIN/.*"
+EOL
+          fi
+          echo "ZAP plan file ready."
 
-      - name: Run Nuclei on Shard
+      - name: Run ZAP Scan (Dynamic Target)
+        if: env.new_subdomains_detected == 'true'
         run: |
-          mkdir -p scan_results
-          input_file="shards/${{ matrix.shard }}"
-          nuclei -l "$input_file" \
-            -t ~/nuclei-templates/ \
-            -severity high,critical \
-            -rate-limit 200 \
-            -timeout 15 \
-            -j -silent -o "scan_results/nuclei_${{ matrix.shard }}.json"
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "🔍 Running ZAP scan for $domain"
+            
+            # Replace TARGET_DOMAIN in plan.yml
+            sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
+            
+            # Run ZAP scan
+            docker run --rm \
+              -v $(pwd):/zap/wrk \
+              -t ghcr.io/zaproxy/action-full-scan:latest \
+              -c .github/zap/plan.yml || \
+              echo "ZAP scan completed (some errors may be non-critical)"
+            
+            # Revert plan.yml changes
+            sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
+          done < .github/workflows/domains.txt
 
-      - name: Upload Scan Result
-        uses: actions/upload-artifact@v3
-        with:
-          name: nuclei-results-${{ matrix.shard }}
-          path: scan_results/
-
-  post_processing:
-    needs: scanning
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download All Results
-        uses: actions/download-artifact@v3
-        with:
-          path: scan_results
-
-      - name: Generate Consolidated Report
+      - name: Run Nikto Scan
+        if: env.new_subdomains_detected == 'true'
         run: |
-          mkdir -p reports
-          jq -s 'flatten' scan_results/**/*.json > reports/combined_results.json
+          mkdir -p nikto-reports
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "🔍 Nikto scanning $domain (update check skipped)"
+            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || \
+            echo "Nikto scan completed (ignoring update errors)"
+          done < .github/workflows/domains.txt
 
-          echo "# Security Scan Report" > reports/executive_summary.md
-          echo "Generated: $(date)" >> reports/executive_summary.md
-          echo "## Findings Overview" >> reports/executive_summary.md
-          echo "Total Vulnerabilities: $(jq 'length' reports/combined_results.json)" >> reports/executive_summary.md
-          echo "Critical: $(jq '[.[] | select(.info.severity == "critical")] | length' reports/combined_results.json)" >> reports/executive_summary.md
-          echo "High: $(jq '[.[] | select(.info.severity == "high")] | length' reports/combined_results.json)" >> reports/executive_summary.md
+      - name: Run Nuclei Scan
+        if: env.new_subdomains_detected == 'true'
+        run: |
+          mkdir -p nuclei-reports
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
+            echo "💣 Nuclei scanning $domain"
+            nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//./_}.json" \
+              -exclude-templates "miscellaneous/old-copyright.yaml" \
+              -timeout 30 -silent || \
+            echo "Nuclei scan completed (some errors may be non-critical)"
+          done < .github/workflows/domains.txt
 
       - name: Upload Reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: security-reports
-          path: reports/
+          name: security-reports-${{ github.run_id }}
+          path: |
+            nikto-reports/*.html
+            nuclei-reports/*.json
+          retention-days: 7
+        if: env.new_subdomains_detected == 'true'
 
-  notification:
-    needs: post_processing
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Report
-        uses: actions/download-artifact@v3
-        with:
-          name: security-reports
-          path: reports/
-
-      - name: Send Smart Notification
+      - name: Notify Slack
+        if: always()
         env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_HOOK: ${{ secrets.SLACK_HOOK }}
         run: |
-          critical=$(jq '[.[] | select(.info.severity == "critical")] | length' reports/combined_results.json)
-          high=$(jq '[.[] | select(.info.severity == "high")] | length' reports/combined_results.json)
-
-          if [ "$critical" -gt 0 ]; then
-            color="#ff0000"
-            priority="URGENT"
-            icon=":fire:"
-          elif [ "$high" -gt 0 ]; then
-            color="#ff9900"
-            priority="High"
-            icon=":warning:"
-          else
-            color="#36a64f"
-            priority="Normal"
-            icon=":white_check_mark:"
+          # Initialize variables
+          SEVERITY="ℹ️ INFO"
+          COLOR="#36a64f"
+          MESSAGE="Scan completed for ${{ github.repository }}"
+          
+          # Check for critical findings
+          if [ -d "nuclei-reports" ]; then
+            CRITICAL_COUNT=$(grep -l '"severity":"critical"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            HIGH_COUNT=$(grep -l '"severity":"high"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              SEVERITY="🚨 CRITICAL ($CRITICAL_COUNT)"
+              COLOR="#ff0000"
+              MESSAGE="Critical vulnerabilities found in ${{ github.repository }}"
+            elif [ "$HIGH_COUNT" -gt 0 ]; then
+              SEVERITY="⚠️ HIGH ($HIGH_COUNT)"
+              COLOR="#ffcc00"
+              MESSAGE="High severity vulnerabilities found in ${{ github.repository }}"
+            fi
           fi
-
-          payload=$(jq -n \
-            --arg text "$icon Security Scan Completed ($priority)" \
-            --arg color "$color" \
-            --arg critical "$critical" \
-            --arg high "$high" \
-            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{
-              "attachments": [
-                {
-                  "color": $color,
-                  "blocks": [
-                    {
-                      "type": "section",
-                      "text": {
-                        "type": "mrkdwn",
-                        "text": "*\($text)*"
+          
+          # Check if new subdomains were detected
+          if [ "${{ env.new_subdomains_detected }}" = "true" ]; then
+            NEW_SUBDOMAINS_MESSAGE="New subdomains were detected"
+          else
+            NEW_SUBDOMAINS_MESSAGE="No new subdomains detected"
+          fi
+          
+          # Only send notification if webhook URL is set
+          if [ -n "$SLACK_HOOK" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\":\"$SEVERITY: $MESSAGE\",
+                \"attachments\":[
+                  {
+                    \"color\":\"$COLOR\",
+                    \"fields\":[
+                      {
+                        \"title\":\"View Results\",
+                        \"value\":\"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions>\",
+                        \"short\":true
+                      },
+                      {
+                        \"title\":\"Scan Summary\",
+                        \"value\":\"$NEW_SUBDOMAINS_MESSAGE\nCritical: $CRITICAL_COUNT | High: $HIGH_COUNT\",
+                        \"short\":true
                       }
-                    },
-                    {
-                      "type": "section",
-                      "fields": [
-                        {
-                          "type": "mrkdwn",
-                          "text": "*Critical Findings*\n\($critical)"
-                        },
-                        {
-                          "type": "mrkdwn",
-                          "text": "*High Findings*\n\($high)"
-                        }
-                      ]
-                    },
-                    {
-                      "type": "actions",
-                      "elements": [
-                        {
-                          "type": "button",
-                          "text": {
-                            "type": "plain_text",
-                            "text": "View Full Report"
-                          },
-                          "url": $run_url
-                        }
-                      ]
-                    }
-                  ]
-                }
-              ]
-            }')
-
-          curl -X POST $SLACK_WEBHOOK \
-            -H "Content-type: application/json" \
-            --data "$payload"
+                    ]
+                  }
+                ]
+              }" \
+              "$SLACK_HOOK" || echo "Failed to send Slack notification"
+          else
+            echo "SLACK_HOOK not set, skipping notification"
+          fi

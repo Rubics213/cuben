@@ -1,18 +1,9 @@
-- name: "Quick Scan"
+- name: "Default Scan"
   parameters:
+    target: "https://example.com"  # Will be dynamically replaced
+    rules: 
+      - "scan_rules/automatic"
     context: 
       name: "Default Context"
-      url: "https://shopify.com"
-    target:
-      url: "https://shopify.com"
-    rules:
-      name: "Default Rule Set"
-    policy:
-      name: "Default Policy"
-    spider:
-      maxDuration: 10
-    ajaxSpider:
-      enabled: false
-    activeScan:
-      enabled: true
-      policy: "Default Policy"
+      includePaths:
+        - "https://example.com/.*"  # Will be dynamically replaced

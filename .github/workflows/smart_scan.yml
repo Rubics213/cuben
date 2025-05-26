@@ -7,7 +7,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '13 1 * * *'  # 5x daily scans
+    - cron: '13 1 * * *'
     - cron: '47 5 * * *'
     - cron: '29 9 * * *'
     - cron: '53 14 * * *'
@@ -16,42 +16,39 @@ on:
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # Prevent long-running jobs
+    timeout-minutes: 120
 
     steps:
-      # Checkout code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Install dependencies with improved error handling
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl
+          
+          # Set up Go path
+          echo "GOPATH=$HOME/go" >> $GITHUB_ENV
+          echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
           
           # Install recon tools
-          echo "Installing Go tools..."
-          export PATH=$PATH:/usr/local/go/bin:/home/runner/go/bin
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx} /usr/local/bin/
           
-          # Install Amass
+          # Install Amass (fixed installation)
           echo "Installing Amass..."
-          wget -q https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
-          unzip -q amass_linux_amd64.zip
-          sudo mv amass_linux_amd64/amass /usr/local/bin/
-          rm -rf amass_linux_amd64*
+          latest_amass=$(curl -s https://api.github.com/repos/owasp-amass/amass/releases/latest | grep browser_download_url | grep linux_amd64 | cut -d '"' -f 4)
+          wget -q $latest_amass -O amass.zip
+          unzip -q amass.zip
+          sudo mv amass /usr/local/bin/
+          rm amass.zip
           
           # Update vulnerability databases
-          echo "Updating Nuclei templates..."
           nuclei -update-templates
-          
-          echo "Attempting Nikto update (may fail due to server issues)..."
-          nikto -update || echo "Nikto update failed (expected for some servers), continuing with existing database..."
+          nikto -update || echo "Nikto update failed, continuing with existing database..."
 
-      # Domain verification
       - name: Verify domains file exists
         run: |
           if [ ! -f ".github/workflows/domains.txt" ]; then
@@ -61,7 +58,6 @@ jobs:
           echo "Target domains:"
           cat .github/workflows/domains.txt
 
-      # Enhanced subdomain detection with better error handling
       - name: Detect subdomains
         id: subdomain-detection
         run: |
@@ -72,9 +68,9 @@ jobs:
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "🛠️ Processing $domain"
-            output_file="subdomain_output/${domain//\//_}_subdomains.txt"
+            output_file="subdomain_output/${domain//./_}_subdomains.txt"
             
-            # Triple-threat discovery with error handling
+            # Triple-threat discovery
             assetfinder --subs-only $domain | httpx -silent > "$output_file" || true
             amass enum -passive -d "$domain" >> "$output_file" 2>/dev/null || true
             
@@ -85,8 +81,8 @@ jobs:
             if [ -s "$output_file" ]; then
               echo "✅ Found $(wc -l < "$output_file") subdomains"
               
-              if [ -f "old_subdomains/${domain//\//_}_old_subdomains.txt" ]; then
-                if ! diff -q "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"; then
+              if [ -f "old_subdomains/${domain//./_}_old_subdomains.txt" ]; then
+                if ! diff -q "$output_file" "old_subdomains/${domain//./_}_old_subdomains.txt"; then
                   new_subdomains_detected=true
                   echo "🔥 New subdomains found!"
                 fi
@@ -95,16 +91,15 @@ jobs:
                 echo "🌟 First run - all subdomains are new"
               fi
               
-              cp "$output_file" "old_subdomains/${domain//\//_}_old_subdomains.txt"
+              cp "$output_file" "old_subdomains/${domain//./_}_old_subdomains.txt"
             else
               echo "❌ No subdomains found"
-              touch "old_subdomains/${domain//\//_}_old_subdomains.txt"
+              touch "old_subdomains/${domain//./_}_old_subdomains.txt"
             fi
           done < .github/workflows/domains.txt
           
           echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
 
-      # ZAP scan with timeout handling
       - name: ZAP Scan
         uses: zaproxy/action-af@v0.2.0
         with:
@@ -113,7 +108,6 @@ jobs:
         if: env.new_subdomains_detected == 'true'
         timeout-minutes: 30
 
-      # Nikto scan with retry logic
       - name: Run Nikto Scan
         if: env.new_subdomains_detected == 'true'
         run: |
@@ -121,17 +115,10 @@ jobs:
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "🔍 Nikto scanning $domain"
-            for i in {1..3}; do
-              if nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//\//_}.html"; then
-                break
-              else
-                echo "Attempt $i failed, retrying..."
-                sleep 5
-              fi
-            done
+            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" || \
+            echo "Nikto scan failed for $domain, continuing..."
           done < .github/workflows/domains.txt
 
-      # Nuclei scan with template selection
       - name: Run Nuclei Scan
         if: env.new_subdomains_detected == 'true'
         run: |
@@ -139,12 +126,12 @@ jobs:
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "💣 Nuclei scanning $domain"
-            nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//\//_}.json" \
+            nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//./_}.json" \
               -exclude-templates "miscellaneous/old-copyright.yaml" \
-              -timeout 30
+              -timeout 30 || \
+            echo "Nuclei scan failed for $domain, continuing..."
           done < .github/workflows/domains.txt
 
-      # Artifact uploads with retention
       - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
@@ -155,9 +142,10 @@ jobs:
           retention-days: 7
         if: env.new_subdomains_detected == 'true'
 
-      # Enhanced Slack notifications with scan summary
       - name: Notify Slack
         if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           # Initialize variables
           SEVERITY="ℹ️ INFO"
@@ -166,8 +154,8 @@ jobs:
           
           # Check for critical findings
           if [ -d "nuclei-reports" ]; then
-            CRITICAL_COUNT=$(grep -l '"severity":"critical"' nuclei-reports/*.json | wc -l || echo 0)
-            HIGH_COUNT=$(grep -l '"severity":"high"' nuclei-reports/*.json | wc -l || echo 0)
+            CRITICAL_COUNT=$(grep -l '"severity":"critical"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            HIGH_COUNT=$(grep -l '"severity":"high"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
             
             if [ "$CRITICAL_COUNT" -gt 0 ]; then
               SEVERITY="🚨 CRITICAL ($CRITICAL_COUNT)"
@@ -187,26 +175,30 @@ jobs:
             NEW_SUBDOMAINS_MESSAGE="No new subdomains detected"
           fi
           
-          # Send notification
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{
-              \"text\":\"$SEVERITY: $MESSAGE\",
-              \"attachments\":[
-                {
-                  \"color\":\"$COLOR\",
-                  \"fields\":[
-                    {
-                      \"title\":\"View Results\",
-                      \"value\":\"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions>\",
-                      \"short\":true
-                    },
-                    {
-                      \"title\":\"Scan Summary\",
-                      \"value\":\"$NEW_SUBDOMAINS_MESSAGE\nCritical: $CRITICAL_COUNT | High: $HIGH_COUNT\",
-                      \"short\":true
-                    }
-                  ]
-                }
-              ]
-            }" \
-            ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Only send notification if webhook URL is set
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\":\"$SEVERITY: $MESSAGE\",
+                \"attachments\":[
+                  {
+                    \"color\":\"$COLOR\",
+                    \"fields\":[
+                      {
+                        \"title\":\"View Results\",
+                        \"value\":\"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions>\",
+                        \"short\":true
+                      },
+                      {
+                        \"title\":\"Scan Summary\",
+                        \"value\":\"$NEW_SUBDOMAINS_MESSAGE\nCritical: $CRITICAL_COUNT | High: $HIGH_COUNT\",
+                        \"short\":true
+                      }
+                    ]
+                  }
+                ]
+              }" \
+              "$SLACK_WEBHOOK_URL"
+          else
+            echo "SLACK_WEBHOOK_URL not set, skipping notification"
+          fi

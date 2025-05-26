@@ -19,31 +19,39 @@ jobs:
     timeout-minutes: 120  # Prevent long-running jobs
 
     steps:
-      # Existing working steps (unchanged)
+      # Checkout code
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Install dependencies with improved error handling
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq
           
           # Install recon tools
+          echo "Installing Go tools..."
+          export PATH=$PATH:/usr/local/go/bin:/home/runner/go/bin
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx} /usr/local/bin/
           
-          # Install Amass (existing working version)
-          wget https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
-          unzip amass_linux_amd64.zip
-          sudo mv amass_Linux_amd64/amass /usr/local/bin/
+          # Install Amass
+          echo "Installing Amass..."
+          wget -q https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_linux_amd64.zip
+          unzip -q amass_linux_amd64.zip
+          sudo mv amass_linux_amd64/amass /usr/local/bin/
+          rm -rf amass_linux_amd64*
           
           # Update vulnerability databases
+          echo "Updating Nuclei templates..."
           nuclei -update-templates
-          nikto -update
+          
+          echo "Attempting Nikto update (may fail due to server issues)..."
+          nikto -update || echo "Nikto update failed (expected for some servers), continuing with existing database..."
 
-      # Existing domain verification
+      # Domain verification
       - name: Verify domains file exists
         run: |
           if [ ! -f ".github/workflows/domains.txt" ]; then
@@ -53,7 +61,7 @@ jobs:
           echo "Target domains:"
           cat .github/workflows/domains.txt
 
-      # Enhanced subdomain detection
+      # Enhanced subdomain detection with better error handling
       - name: Detect subdomains
         id: subdomain-detection
         run: |
@@ -66,9 +74,9 @@ jobs:
             echo "🛠️ Processing $domain"
             output_file="subdomain_output/${domain//\//_}_subdomains.txt"
             
-            # Triple-threat discovery
-            assetfinder --subs-only $domain | httpx -silent > "$output_file"
-            amass enum -passive -d "$domain" >> "$output_file"
+            # Triple-threat discovery with error handling
+            assetfinder --subs-only $domain | httpx -silent > "$output_file" || true
+            amass enum -passive -d "$domain" >> "$output_file" 2>/dev/null || true
             
             # Clean and deduplicate
             sort -u "$output_file" -o "$output_file"
@@ -96,14 +104,16 @@ jobs:
           
           echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
 
-      # Existing ZAP scan (unchanged)
+      # ZAP scan with timeout handling
       - name: ZAP Scan
         uses: zaproxy/action-af@v0.2.0
         with:
           plan: '.github/workflows/zap/plan.yml'
+          cmd_options: '-config connection.timeoutInSecs=60'
         if: env.new_subdomains_detected == 'true'
+        timeout-minutes: 30
 
-      # Enhanced Nikto scan with screenshots
+      # Nikto scan with retry logic
       - name: Run Nikto Scan
         if: env.new_subdomains_detected == 'true'
         run: |
@@ -111,10 +121,17 @@ jobs:
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "🔍 Nikto scanning $domain"
-            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//\//_}.html"
+            for i in {1..3}; do
+              if nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//\//_}.html"; then
+                break
+              else
+                echo "Attempt $i failed, retrying..."
+                sleep 5
+              fi
+            done
           done < .github/workflows/domains.txt
 
-      # New Nuclei scan for critical vulnerabilities
+      # Nuclei scan with template selection
       - name: Run Nuclei Scan
         if: env.new_subdomains_detected == 'true'
         run: |
@@ -122,10 +139,12 @@ jobs:
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "💣 Nuclei scanning $domain"
-            nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//\//_}.json"
+            nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//\//_}.json" \
+              -exclude-templates "miscellaneous/old-copyright.yaml" \
+              -timeout 30
           done < .github/workflows/domains.txt
 
-      # Enhanced artifact uploads
+      # Artifact uploads with retention
       - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
@@ -133,31 +152,61 @@ jobs:
           path: |
             nikto-reports/*.html
             nuclei-reports/*.json
+          retention-days: 7
         if: env.new_subdomains_detected == 'true'
 
-      # Smart notifications
+      # Enhanced Slack notifications with scan summary
       - name: Notify Slack
         if: always()
         run: |
-          # Critical findings check
-          if [ -d "nuclei-reports" ] && grep -q '"severity":"critical"' nuclei-reports/*.json; then
-            SEVERITY="🚨 CRITICAL"
-          elif [ -d "nuclei-reports" ] && grep -q '"severity":"high"' nuclei-reports/*.json; then
-            SEVERITY="⚠️ HIGH"
-          else
-            SEVERITY="ℹ️ INFO"
+          # Initialize variables
+          SEVERITY="ℹ️ INFO"
+          COLOR="#36a64f"
+          MESSAGE="Scan completed for ${{ github.repository }}"
+          
+          # Check for critical findings
+          if [ -d "nuclei-reports" ]; then
+            CRITICAL_COUNT=$(grep -l '"severity":"critical"' nuclei-reports/*.json | wc -l || echo 0)
+            HIGH_COUNT=$(grep -l '"severity":"high"' nuclei-reports/*.json | wc -l || echo 0)
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              SEVERITY="🚨 CRITICAL ($CRITICAL_COUNT)"
+              COLOR="#ff0000"
+              MESSAGE="Critical vulnerabilities found in ${{ github.repository }}"
+            elif [ "$HIGH_COUNT" -gt 0 ]; then
+              SEVERITY="⚠️ HIGH ($HIGH_COUNT)"
+              COLOR="#ffcc00"
+              MESSAGE="High severity vulnerabilities found in ${{ github.repository }}"
+            fi
           fi
           
+          # Check if new subdomains were detected
+          if [ "${{ env.new_subdomains_detected }}" = "true" ]; then
+            NEW_SUBDOMAINS_MESSAGE="New subdomains were detected"
+          else
+            NEW_SUBDOMAINS_MESSAGE="No new subdomains detected"
+          fi
+          
+          # Send notification
           curl -X POST -H 'Content-type: application/json' \
             --data "{
-              \"text\":\"$SEVERITY: Scan completed for ${{ github.repository }}\",
-              \"attachments\":[{
-                \"color\":\"#36a64f\",
-                \"fields\":[{
-                  \"title\":\"View Results\",
-                  \"value\":\"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions>\",
-                  \"short\":true
-                }]
-              }]
+              \"text\":\"$SEVERITY: $MESSAGE\",
+              \"attachments\":[
+                {
+                  \"color\":\"$COLOR\",
+                  \"fields\":[
+                    {
+                      \"title\":\"View Results\",
+                      \"value\":\"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions>\",
+                      \"short\":true
+                    },
+                    {
+                      \"title\":\"Scan Summary\",
+                      \"value\":\"$NEW_SUBDOMAINS_MESSAGE\nCritical: $CRITICAL_COUNT | High: $HIGH_COUNT\",
+                      \"short\":true
+                    }
+                  ]
+                }
+              ]
             }" \
-            ${{ secrets.Slack_Hook }}
+            ${{ secrets.SLACK_WEBHOOK_URL }}

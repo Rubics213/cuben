@@ -103,7 +103,7 @@ jobs:
       - name: ZAP Scan
         uses: zaproxy/action-af@v0.2.0
         with:
-          plan: '.github/workflows/zap/plan.yml'
+          plan: '.github/zap/plan.yml'
           cmd_options: '-config connection.timeoutInSecs=60'
         if: env.new_subdomains_detected == 'true'
         timeout-minutes: 30

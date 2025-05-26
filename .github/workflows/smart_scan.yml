@@ -38,7 +38,7 @@ jobs:
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
           
-          # Install Findomain (alternative to Amass)
+          # Install Findomain
           curl -LO https://github.com/findomain/findomain/releases/latest/download/findomain-linux
           chmod +x findomain-linux
           sudo mv findomain-linux /usr/local/bin/findomain
@@ -46,7 +46,7 @@ jobs:
           # Update Nuclei templates
           nuclei -update-templates -silent
           
-          # Skip Nikto update (known issue)
+          # Skip Nikto update
           mkdir -p ~/nikto/program
           touch ~/nikto/program/plugins/__latest__
 
@@ -131,7 +131,8 @@ EOL
             sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
             
             # Run ZAP scan
-            docker run --rm -v $(pwd):/zap/wrk \
+            docker run --rm \
+              -v $(pwd):/zap/wrk \
               -t ghcr.io/zaproxy/action-full-scan:latest \
               -c .github/zap/plan.yml || \
               echo "ZAP scan completed (some errors may be non-critical)"

@@ -159,4 +159,78 @@ EOL
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "💣 Nuclei scanning $domain"
             nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//./_}.json" \
-              -exclude-templates "miscellaneous/
+              -exclude-templates "miscellaneous/old-copyright.yaml" \
+              -timeout 30 -silent || \
+            echo "Nuclei scan completed (some errors may be non-critical)"
+          done < .github/workflows/domains.txt
+
+      - name: Upload Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: |
+            nikto-reports/*.html
+            nuclei-reports/*.json
+          retention-days: 7
+        if: env.new_subdomains_detected == 'true'
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_HOOK: ${{ secrets.SLACK_HOOK }}
+        run: |
+          # Initialize variables
+          SEVERITY="ℹ️ INFO"
+          COLOR="#36a64f"
+          MESSAGE="Scan completed for ${{ github.repository }}"
+          
+          # Check for critical findings
+          if [ -d "nuclei-reports" ]; then
+            CRITICAL_COUNT=$(grep -l '"severity":"critical"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            HIGH_COUNT=$(grep -l '"severity":"high"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              SEVERITY="🚨 CRITICAL ($CRITICAL_COUNT)"
+              COLOR="#ff0000"
+              MESSAGE="Critical vulnerabilities found in ${{ github.repository }}"
+            elif [ "$HIGH_COUNT" -gt 0 ]; then
+              SEVERITY="⚠️ HIGH ($HIGH_COUNT)"
+              COLOR="#ffcc00"
+              MESSAGE="High severity vulnerabilities found in ${{ github.repository }}"
+            fi
+          fi
+          
+          # Check if new subdomains were detected
+          if [ "${{ env.new_subdomains_detected }}" = "true" ]; then
+            NEW_SUBDOMAINS_MESSAGE="New subdomains were detected"
+          else
+            NEW_SUBDOMAINS_MESSAGE="No new subdomains detected"
+          fi
+          
+          # Only send notification if webhook URL is set
+          if [ -n "$SLACK_HOOK" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\":\"$SEVERITY: $MESSAGE\",
+                \"attachments\":[
+                  {
+                    \"color\":\"$COLOR\",
+                    \"fields\":[
+                      {
+                        \"title\":\"View Results\",
+                        \"value\":\"<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|GitHub Actions>\",
+                        \"short\":true
+                      },
+                      {
+                        \"title\":\"Scan Summary\",
+                        \"value\":\"$NEW_SUBDOMAINS_MESSAGE\nCritical: $CRITICAL_COUNT | High: $HIGH_COUNT\",
+                        \"short\":true
+                      }
+                    ]
+                  }
+                ]
+              }" \
+              "$SLACK_HOOK" || echo "Failed to send Slack notification"
+          else
+            echo "SLACK_HOOK not set, skipping notification"
+          fi

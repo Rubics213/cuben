@@ -37,13 +37,13 @@ jobs:
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx} /usr/local/bin/
           
-          # Install Amass (fixed installation with proper URL)
+          # Install Amass using direct binary download (more reliable)
           echo "Installing Amass..."
-          AMASS_VERSION="4.2.0"  # Using fixed version to ensure stability
-          wget -q "https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_linux_amd64.zip" -O amass.zip
+          AMASS_VERSION="4.2.0"
+          wget -q "https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_Linux_amd64.zip" -O amass.zip
           unzip -q amass.zip
-          sudo mv amass_linux_amd64/amass /usr/local/bin/
-          rm -rf amass.zip amass_linux_amd64
+          sudo mv amass /usr/local/bin/
+          rm amass.zip
           
           # Update vulnerability databases
           nuclei -update-templates
@@ -198,7 +198,7 @@ jobs:
                   }
                 ]
               }" \
-              "$SLACK_HOOK"
+              "$SLACK_HOOK" || echo "Failed to send Slack notification"
           else
             echo "SLACK_HOOK not set, skipping notification"
           fi

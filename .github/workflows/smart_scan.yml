@@ -35,15 +35,14 @@ jobs:
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          sudo mv ~/go/bin/{assetfinder,nuclei,httpx} /usr/local/bin/
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
           
-          # Install Amass using direct binary download (more reliable)
-          echo "Installing Amass..."
-          AMASS_VERSION="4.2.0"
-          wget -q "https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_Linux_amd64.zip" -O amass.zip
-          unzip -q amass.zip
-          sudo mv amass /usr/local/bin/
-          rm amass.zip
+          # Install Findomain (alternative to Amass)
+          echo "Installing Findomain..."
+          curl -LO https://github.com/findomain/findomain/releases/latest/download/findomain-linux
+          chmod +x findomain-linux
+          sudo mv findomain-linux /usr/local/bin/findomain
           
           # Update vulnerability databases
           nuclei -update-templates
@@ -70,9 +69,10 @@ jobs:
             echo "🛠️ Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
             
-            # Triple-threat discovery
+            # Triple-threat discovery (using subfinder and findomain instead of Amass)
             assetfinder --subs-only $domain | httpx -silent > "$output_file" || true
-            amass enum -passive -d "$domain" >> "$output_file" 2>/dev/null || true
+            subfinder -d "$domain" -silent >> "$output_file" || true
+            findomain -t "$domain" --quiet >> "$output_file" || true
             
             # Clean and deduplicate
             sort -u "$output_file" -o "$output_file"

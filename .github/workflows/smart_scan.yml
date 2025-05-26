@@ -26,22 +26,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl
-          
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
-          
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
-          
           curl -LO https://github.com/findomain/findomain/releases/latest/download/findomain-linux
           chmod +x findomain-linux
           sudo mv findomain-linux /usr/local/bin/findomain
-          
           nuclei -update-templates -silent
-          
           mkdir -p ~/nikto/program
           touch ~/nikto/program/plugins/__latest__
 
@@ -60,22 +55,17 @@ jobs:
           set -e
           mkdir -p subdomain_output old_subdomains
           new_subdomains_detected=false
-          
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "🛠️ Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
-            
             assetfinder --subs-only $domain | httpx -silent > "$output_file" || true
             subfinder -d "$domain" -silent >> "$output_file" || true
             findomain -t "$domain" --quiet >> "$output_file" || true
-            
             sort -u "$output_file" -o "$output_file"
             sed -i '/^$/d' "$output_file"
-            
             if [ -s "$output_file" ]; then
               echo "✅ Found $(wc -l < "$output_file") subdomains"
-              
               if [ -f "old_subdomains/${domain//./_}_old_subdomains.txt" ]; then
                 if ! diff -q "$output_file" "old_subdomains/${domain//./_}_old_subdomains.txt"; then
                   new_subdomains_detected=true
@@ -85,32 +75,30 @@ jobs:
                 new_subdomains_detected=true
                 echo "🌟 First run - all subdomains are new"
               fi
-              
               cp "$output_file" "old_subdomains/${domain//./_}_old_subdomains.txt"
             else
               echo "❌ No subdomains found"
               touch "old_subdomains/${domain//./_}_old_subdomains.txt"
             fi
           done < .github/workflows/domains.txt
-          
           echo "new_subdomains_detected=$new_subdomains_detected" >> $GITHUB_ENV
 
       - name: Prepare ZAP plan
         run: |
           mkdir -p .github/zap
           if [ ! -f ".github/zap/plan.yml" ]; then
-            cat > .github/zap/plan.yml <<EOL
-plans:
-  - name: "Default Scan"
-    parameters:
-      target: "https://TARGET_DOMAIN"
-      rules: 
-        - "scan_rules/automatic"
-      context: 
-        name: "Default Context"
-        includePaths:
-          - "https://TARGET_DOMAIN/.*"
-EOL
+            printf "%s\n" \
+              "plans:" \
+              "  - name: \"Default Scan\"" \
+              "    parameters:" \
+              "      target: \"https://TARGET_DOMAIN\"" \
+              "      rules:" \
+              "        - \"scan_rules/automatic\"" \
+              "    context:" \
+              "      name: \"Default Context\"" \
+              "      includePaths:" \
+              "        - \"https://TARGET_DOMAIN/.*\"" \
+              > .github/zap/plan.yml
           fi
           echo "ZAP plan file ready."
 
@@ -120,15 +108,11 @@ EOL
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "🔍 Running ZAP scan for $domain"
-            
             sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
-            
             docker run --rm \
               -v $(pwd):/zap/wrk \
               -t ghcr.io/zaproxy/action-full-scan:latest \
-              -c .github/zap/plan.yml || \
-              echo "ZAP scan completed (some errors may be non-critical)"
-            
+              -c .github/zap/plan.yml || echo "ZAP scan completed (some errors may be non-critical)"
             sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
           done < .github/workflows/domains.txt
 
@@ -138,7 +122,7 @@ EOL
           mkdir -p nikto-reports
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
-            echo "🔍 Nikto scanning $domain (update check skipped)"
+            echo "🔍 Nikto scanning $domain"
             nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || \
             echo "Nikto scan completed (ignoring update errors)"
           done < .github/workflows/domains.txt
@@ -153,7 +137,6 @@ EOL
             nuclei -u "https://$domain" \
               -severity critical,high,medium,low,info \
               -j -o "nuclei-reports/nuclei-${domain//./_}.json" \
-              -exclude-templates "miscellaneous/old-copyright.yaml" \
               -timeout 30 -silent || \
             echo "Nuclei scan completed (some errors may be non-critical)"
           done < .github/workflows/domains.txt
@@ -165,7 +148,6 @@ EOL
           path: |
             nikto-reports/*.html
             nuclei-reports/*.json
-          retention-days: 7
         if: env.new_subdomains_detected == 'true'
 
       - name: Notify Slack

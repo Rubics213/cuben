@@ -27,26 +27,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl
           
-          # Set up Go path
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
           
-          # Install recon tools
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
           
-          # Install Findomain
           curl -LO https://github.com/findomain/findomain/releases/latest/download/findomain-linux
           chmod +x findomain-linux
           sudo mv findomain-linux /usr/local/bin/findomain
           
-          # Update Nuclei templates
           nuclei -update-templates -silent
           
-          # Skip Nikto update
           mkdir -p ~/nikto/program
           touch ~/nikto/program/plugins/__latest__
 
@@ -71,12 +66,10 @@ jobs:
             echo "🛠️ Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
             
-            # Triple-threat discovery
             assetfinder --subs-only $domain | httpx -silent > "$output_file" || true
             subfinder -d "$domain" -silent >> "$output_file" || true
             findomain -t "$domain" --quiet >> "$output_file" || true
             
-            # Clean and deduplicate
             sort -u "$output_file" -o "$output_file"
             sed -i '/^$/d' "$output_file"
             
@@ -107,15 +100,16 @@ jobs:
           mkdir -p .github/zap
           if [ ! -f ".github/zap/plan.yml" ]; then
             cat > .github/zap/plan.yml <<EOL
-- name: "Default Scan"
-  parameters:
-    target: "https://TARGET_DOMAIN"
-    rules: 
-      - "scan_rules/automatic"
-    context: 
-      name: "Default Context"
-      includePaths:
-        - "https://TARGET_DOMAIN/.*"
+plans:
+  - name: "Default Scan"
+    parameters:
+      target: "https://TARGET_DOMAIN"
+      rules: 
+        - "scan_rules/automatic"
+      context: 
+        name: "Default Context"
+        includePaths:
+          - "https://TARGET_DOMAIN/.*"
 EOL
           fi
           echo "ZAP plan file ready."
@@ -127,17 +121,14 @@ EOL
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "🔍 Running ZAP scan for $domain"
             
-            # Replace TARGET_DOMAIN in plan.yml
             sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
             
-            # Run ZAP scan
             docker run --rm \
               -v $(pwd):/zap/wrk \
               -t ghcr.io/zaproxy/action-full-scan:latest \
               -c .github/zap/plan.yml || \
               echo "ZAP scan completed (some errors may be non-critical)"
             
-            # Revert plan.yml changes
             sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
           done < .github/workflows/domains.txt
 
@@ -159,7 +150,9 @@ EOL
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             echo "💣 Nuclei scanning $domain"
-            nuclei -u "https://$domain" -severity critical,high -j -o "nuclei-reports/nuclei-${domain//./_}.json" \
+            nuclei -u "https://$domain" \
+              -severity critical,high,medium,low,info \
+              -j -o "nuclei-reports/nuclei-${domain//./_}.json" \
               -exclude-templates "miscellaneous/old-copyright.yaml" \
               -timeout 30 -silent || \
             echo "Nuclei scan completed (some errors may be non-critical)"
@@ -180,16 +173,22 @@ EOL
         env:
           SLACK_HOOK: ${{ secrets.SLACK_HOOK }}
         run: |
-          # Initialize variables
           SEVERITY="ℹ️ INFO"
           COLOR="#36a64f"
           MESSAGE="Scan completed for ${{ github.repository }}"
-          
-          # Check for critical findings
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          MEDIUM_COUNT=0
+          LOW_COUNT=0
+          INFO_COUNT=0
+
           if [ -d "nuclei-reports" ]; then
             CRITICAL_COUNT=$(grep -l '"severity":"critical"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
             HIGH_COUNT=$(grep -l '"severity":"high"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
-            
+            MEDIUM_COUNT=$(grep -l '"severity":"medium"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            LOW_COUNT=$(grep -l '"severity":"low"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+            INFO_COUNT=$(grep -l '"severity":"info"' nuclei-reports/*.json 2>/dev/null | wc -l || echo 0)
+
             if [ "$CRITICAL_COUNT" -gt 0 ]; then
               SEVERITY="🚨 CRITICAL ($CRITICAL_COUNT)"
               COLOR="#ff0000"
@@ -200,15 +199,15 @@ EOL
               MESSAGE="High severity vulnerabilities found in ${{ github.repository }}"
             fi
           fi
-          
-          # Check if new subdomains were detected
+
           if [ "${{ env.new_subdomains_detected }}" = "true" ]; then
-            NEW_SUBDOMAINS_MESSAGE="New subdomains were detected"
+            NEW_SUBDOMAINS_MESSAGE="✅ New subdomains were detected"
           else
-            NEW_SUBDOMAINS_MESSAGE="No new subdomains detected"
+            NEW_SUBDOMAINS_MESSAGE="🧹 No new subdomains detected"
           fi
-          
-          # Only send notification if webhook URL is set
+
+          SUMMARY="Critical: $CRITICAL_COUNT | High: $HIGH_COUNT | Medium: $MEDIUM_COUNT | Low: $LOW_COUNT | Info: $INFO_COUNT"
+
           if [ -n "$SLACK_HOOK" ]; then
             curl -X POST -H 'Content-type: application/json' \
               --data "{
@@ -224,14 +223,14 @@ EOL
                       },
                       {
                         \"title\":\"Scan Summary\",
-                        \"value\":\"$NEW_SUBDOMAINS_MESSAGE\nCritical: $CRITICAL_COUNT | High: $HIGH_COUNT\",
-                        \"short\":true
+                        \"value\":\"$NEW_SUBDOMAINS_MESSAGE\n$SUMMARY\",
+                        \"short\":false
                       }
                     ]
                   }
                 ]
               }" \
-              "$SLACK_HOOK" || echo "Failed to send Slack notification"
+              "$SLACK_HOOK" || echo "⚠️ Failed to send Slack notification"
           else
             echo "SLACK_HOOK not set, skipping notification"
           fi

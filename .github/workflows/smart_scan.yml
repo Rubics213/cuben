@@ -37,8 +37,6 @@ jobs:
           chmod +x findomain-linux
           sudo mv findomain-linux /usr/local/bin/findomain
           nuclei -update-templates -silent
-          mkdir -p ~/nikto/program
-          touch ~/nikto/program/plugins/__latest__
 
       - name: Verify domains file exists
         run: |

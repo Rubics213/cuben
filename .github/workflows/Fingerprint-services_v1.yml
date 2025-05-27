@@ -18,7 +18,7 @@ jobs:
     - name: Install Tools
       run: |
         sudo apt update && sudo apt install -y whatweb curl jq unzip chromium-browser xvfb libnss3-dev libatk-bridge2.0-0 libgtk-3-0 libxss1 python3-pip
-        pip install playwright jq
+        pip install playwright
         playwright install chromium
 
         echo "Installing Go tools..."
@@ -55,7 +55,7 @@ jobs:
         while IFS= read -r domain; do
           echo "🔐 Attempting login to $domain"
 
-          cat > login_script.py <<EOF
+          cat > login_script.py << 'EOF'
 import sys
 import json
 from playwright.sync_api import sync_playwright
@@ -75,7 +75,6 @@ with sync_playwright() as p:
         page.fill('input[name="password"]', password)
         page.click('button[type="submit"]')
         page.wait_for_load_state("networkidle")
-
         cookies = context.cookies()
         with open(f"auth_cookies/{domain.replace('.', '_')}_cookies.json", "w") as f:
             json.dump(cookies, f, indent=2)
@@ -103,7 +102,6 @@ EOF
 
           echo "https://$domain" | nuclei -silent -tags "tech" -H "User-Agent: $USER_AGENT" -o "fingerprint_results/${domain//./_}_nuclei_tech.txt" || true
 
-          # Auth-aware curl
           if [ -f "auth_cookies/${domain//./_}_cookies.json" ]; then
             cookie_str=$(jq -r '[.[] | "\(.name)=\(.value)"] | join("; ")' "auth_cookies/${domain//./_}_cookies.json")
             curl -s -A "$USER_AGENT" -H "Cookie: $cookie_str" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "⚠️ curl failed (auth) for $domain"

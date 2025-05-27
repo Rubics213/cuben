@@ -72,8 +72,8 @@ jobs:
       if: always()
       run: |
         curl -X POST -H 'Content-type: application/json' \
-          --data "{\n            \"text\": \"Recon Complete ✅ - Check findings in the GitHub Action artifacts.\"\n          }" \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          --data "{\"text\": \"Recon Complete ✅ - Check findings in the GitHub Action artifacts.\"}" \
+          "${{ secrets.SLACK_WEBHOOK_URL }}"
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4

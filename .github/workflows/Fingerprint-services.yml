@@ -1,0 +1,95 @@
+name: Fingerprint Services
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 3 * * *'
+    - cron: '45 12 * * *'
+
+jobs:
+  fingerprint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Fingerprinting Tools
+      run: |
+        sudo apt update && sudo apt install -y whatweb curl jq unzip chromium-browser
+        go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+        go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+        git clone https://github.com/rverton/webanalyze.git && cd webanalyze && go build .
+        sudo mv webanalyze/webanalyze /usr/local/bin/
+        nuclei -update-templates -silent
+
+    - name: Verify domains file
+      run: |
+        if [ ! -f ".github/workflows/domains.txt" ]; then
+          echo "Missing domains.txt"
+          exit 1
+        fi
+        cat .github/workflows/domains.txt
+
+    - name: Fingerprint Targets
+      run: |
+        mkdir -p fingerprint_results
+        while IFS= read -r domain; do
+          echo "🔍 Probing $domain"
+
+          echo "$domain" | httpx -tech-detect -status-code -title -web-server -json > "fingerprint_results/${domain//./_}_httpx.json"
+
+          whatweb --log-verbose="fingerprint_results/${domain//./_}_whatweb.txt" "https://$domain" || true
+
+          webanalyze -host "$domain" -apps /usr/local/bin/webanalyze/apps.json -crawl -output "fingerprint_results/${domain//./_}_webanalyze.json" || true
+
+          echo "https://$domain" | nuclei -silent -tags "tech" -o "fingerprint_results/${domain//./_}_nuclei_tech.txt" || true
+
+          curl -s "https://$domain" > "fingerprint_results/${domain//./_}_page.html"
+
+          echo "Auth hints for $domain:" > "fingerprint_results/${domain//./_}_auth.txt"
+          grep -iE '<form[^>]+(login|signin|password)' "fingerprint_results/${domain//./_}_page.html" >> "fingerprint_results/${domain//./_}_auth.txt" || true
+          grep -iE 'oauth|authorize\?client_id' "fingerprint_results/${domain//./_}_page.html" >> "fingerprint_results/${domain//./_}_auth.txt" || true
+          grep -oE 'eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+' "fingerprint_results/${domain//./_}_page.html" >> "fingerprint_results/${domain//./_}_auth.txt" || true
+
+        done < .github/workflows/domains.txt
+
+    - name: Upload Fingerprint Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: fingerprint-results-${{ github.run_id }}
+        path: fingerprint_results/
+
+    - name: Notify Slack - Fingerprint Summary
+      if: always()
+      run: |
+        domain_count=$(wc -l < .github/workflows/domains.txt)
+        login_count=0
+        oauth_count=0
+        jwt_count=0
+        summary=""
+
+        for file in fingerprint_results/*_auth.txt; do
+          domain=$(basename "$file" | sed 's/_auth.txt//' | tr '_' '.')
+          found_login=$(grep -iE '<form[^>]+(login|signin|password)' "$file" | wc -l)
+          found_oauth=$(grep -iE 'oauth|authorize\?client_id' "$file" | wc -l)
+          found_jwt=$(grep -oE 'eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+' "$file" | wc -l)
+
+          [ "$found_login" -gt 0 ] && ((login_count++))
+          [ "$found_oauth" -gt 0 ] && ((oauth_count++))
+          [ "$found_jwt" -gt 0 ] && ((jwt_count++))
+
+          summary+="- *$domain* → "
+          [ "$found_login" -gt 0 ] && summary+="Login Form "
+          [ "$found_oauth" -gt 0 ] && summary+="OAuth "
+          [ "$found_jwt" -gt 0 ] && summary+="JWT "
+          [ "$found_login" -eq 0 ] && [ "$found_oauth" -eq 0 ] && [ "$found_jwt" -eq 0 ] && summary+="No auth hints"
+          summary+="\n"
+        done
+
+        curl -X POST -H 'Content-type: application/json' \
+        --data "{
+          \"text\": \"🧠 *Fingerprinting completed!*\nScanned: $domain_count domains\n🔐 Login Forms: $login_count | 🪪 OAuth: $oauth_count | 🔑 JWT: $jwt_count\n\n$summary\n📦 Artifacts available in GitHub Actions\n🔗 Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+        }" \
+        ${{ secrets.SLACK_HOOK }}

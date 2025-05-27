@@ -40,6 +40,38 @@ jobs:
           fi
           cat .github/workflows/domains.txt
 
+      - name: Create login script
+        run: |
+          cat > login_script.py << 'PYTHON_EOF'
+          import sys
+          import json
+          from playwright.sync_api import sync_playwright
+
+          domain = sys.argv[1]
+          username = sys.argv[2]
+          password = sys.argv[3]
+
+          login_url = f"https://{domain}/admin/auth/login"
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context()
+              page = context.new_page()
+              try:
+                  page.goto(login_url, timeout=15000)
+                  page.fill('input[name="username"]', username)
+                  page.fill('input[name="password"]', password)
+                  page.click('button[type="submit"]')
+                  page.wait_for_load_state("networkidle")
+                  cookies = context.cookies()
+                  with open(f"auth_cookies/{domain.replace('.', '_')}_cookies.json", "w") as f:
+                      json.dump(cookies, f, indent=2)
+              except Exception as e:
+                  print(f"Login failed for {domain}: {e}")
+              finally:
+                  browser.close()
+          PYTHON_EOF
+
       - name: Parse Credentials and Perform Auth
         env:
           SHOPIFY_LOGIN: ${{ secrets.SHOPIFY_LOGIN }}
@@ -65,23 +97,4 @@ jobs:
             webanalyze -host "$domain" -apps /usr/local/bin/webanalyze/apps.json -crawl -output "fingerprint_results/${domain//./_}_webanalyze.json" || true
             echo "https://$domain" | nuclei -silent -tags "tech" -H "User-Agent: $USER_AGENT" -o "fingerprint_results/${domain//./_}_nuclei_tech.txt" || true
             if [ -f "auth_cookies/${domain//./_}_cookies.json" ]; then
-              cookie_str=$(jq -r '[.[] | "\(.name)=\(.value)"] | join("; ")' "auth_cookies/${domain//./_}_cookies.json")
-              curl -s -A "$USER_AGENT" -H "Cookie: $cookie_str" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "curl failed (auth) for $domain"
-            else
-              curl -s -A "$USER_AGENT" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "curl fallback (no auth) failed for $domain"
-            fi
-          done < .github/workflows/domains.txt
-
-      - name: Upload Fingerprint Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: fingerprint-results-${{ github.run_id }}
-          path: fingerprint_results/
-
-      - name: Notify Slack - Fingerprint Summary
-        if: always()
-        run: |
-          domain_count=$(wc -l < .github/workflows/domains.txt)
-          login_count=0
-          oauth_count=0
-          jwt_count=0
+              cookie_str

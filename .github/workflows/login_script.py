@@ -14,8 +14,8 @@ with sync_playwright() as p:
     page = context.new_page()
     try:
         page.goto(login_url, timeout=15000)
-        page.fill('input[name="username"]', username)
-        page.fill('input[name="password"]', password)
+        page.fill('input[name="username"]', tabomokoena997@gmail.com)
+        page.fill('input[name="password"]', B33tl3j92@)
         page.click('button[type="submit"]')
         page.wait_for_load_state("networkidle")
         cookies = context.cookies()

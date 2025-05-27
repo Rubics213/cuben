@@ -142,7 +142,7 @@ jobs:
           mkdir -p summaries
           echo "domain,severity,name,url" > summaries/nuclei-findings.csv
           for file in nuclei-reports/*.json; do
-            jq -r '[.host, .info.severity, .info.name, .matched-at] | @csv' "$file" >> summaries/nuclei-findings.csv
+            jq -r '[.host, .info.severity, .info.name, .matched] | @csv' "$file" >> summaries/nuclei-findings.csv
           done
           echo "<html><body><h1>Scan Summary</h1><table border='1'><tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th></tr>" > summaries/nuclei-summary.html
           tail -n +2 summaries/nuclei-findings.csv | while IFS=',' read -r domain severity name url; do
@@ -168,7 +168,7 @@ jobs:
           for file in nuclei-reports/*.json; do
             jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
               title=$(echo "$vuln" | jq -r '.info.name')
-              url=$(echo "$vuln" | jq -r '.matched-at')
+              url=$(echo "$vuln" | jq -r '.matched')
               severity=$(echo "$vuln" | jq -r '.info.severity')
               body="**Severity**: $severity%0A**URL**: $url%0A**Template**: $(echo "$vuln" | jq -r '.template')"
               gh issue create --title "$title [$severity]" --body "$body" --label "bug,bounty,auto-created"
@@ -182,7 +182,7 @@ jobs:
             jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
               domain=$(basename "$file" | sed 's/nuclei-\(.*\)\.json/\1/' | tr '_' '.')
               title=$(echo "$vuln" | jq -r '.info.name')
-              url=$(echo "$vuln" | jq -r '.matched-at')
+              url=$(echo "$vuln" | jq -r '.matched')
               severity=$(echo "$vuln" | jq -r '.info.severity')
               curl -X POST -H 'Content-type: application/json' \
                 --data "{\"text\":\"⚠️ *Critical/High vulnerability detected!*\n*Domain:* $domain\n*Severity:* $severity\n*Name:* $title\n*URL:* $url\"}" \

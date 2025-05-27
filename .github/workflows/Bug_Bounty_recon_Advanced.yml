@@ -19,7 +19,7 @@ jobs:
 
     - name: Install Tools
       run: |
-        sudo apt update && sudo apt install -y nmap git curl jq python3-pip cargo
+        sudo apt update && sudo apt install -y nmap git curl jq python3-pip cargo libpcap-dev
         go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
         go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
         go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
@@ -62,9 +62,12 @@ jobs:
 
         done < "$DOMAINS_FILE"
 
-        echo "[+] Global diff check"
+        echo "[+] Multi-domain diff check"
         if [ -f old_subs.txt ]; then
-          comm -13 <(sort old_subs.txt) <(cat results/*.subs.txt | sort -u) > results/new_subdomains.txt
+          cat results/*.subs.txt | sort -u > current_subs.txt
+          comm -13 <(sort old_subs.txt) current_subs.txt > results/new_subdomains.txt
+        else
+          cat results/*.subs.txt | sort -u > results/new_subdomains.txt
         fi
         cat results/*.subs.txt | sort -u > old_subs.txt
 

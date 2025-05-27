@@ -22,13 +22,14 @@ jobs:
         export PATH=$PATH:$(go env GOPATH)/bin
         go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
         go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+        sudo cp "$(go env GOPATH)/bin/nuclei" /usr/local/bin/
+        sudo cp "$(go env GOPATH)/bin/httpx" /usr/local/bin/
 
         git clone https://github.com/rverton/webanalyze.git
         cd webanalyze
         go build -o webanalyze
         sudo mv webanalyze /usr/local/bin/
         cd ..
-        export PATH=$PATH:$(go env GOPATH)/bin
         nuclei -update-templates -silent
 
     - name: Verify domains file

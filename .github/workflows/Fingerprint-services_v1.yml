@@ -81,4 +81,7 @@ jobs:
       - name: Notify Slack - Fingerprint Summary
         if: always()
         run: |
-          domain_count=$(
+          domain_count=$(wc -l < .github/workflows/domains.txt)
+          login_count=0
+          oauth_count=0
+          jwt_count=0

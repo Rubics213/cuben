@@ -10,153 +10,75 @@ jobs:
   fingerprint:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Install Tools
-      run: |
-        sudo apt update && sudo apt install -y whatweb curl jq unzip chromium-browser xvfb libnss3-dev libatk-bridge2.0-0 libgtk-3-0 libxss1 python3-pip
-        pip install playwright
-        playwright install chromium
+      - name: Install Tools
+        run: |
+          sudo apt update && sudo apt install -y whatweb curl jq unzip chromium-browser xvfb libnss3-dev libatk-bridge2.0-0 libgtk-3-0 libxss1 python3-pip
+          pip install playwright
+          playwright install chromium
+          echo "Installing Go tools..."
+          export PATH=$PATH:$(go env GOPATH)/bin
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          sudo cp "$(go env GOPATH)/bin/nuclei" /usr/local/bin/
+          sudo cp "$(go env GOPATH)/bin/httpx" /usr/local/bin/
+          git clone https://github.com/rverton/webanalyze.git
+          cd webanalyze
+          go build -o webanalyze
+          sudo mv webanalyze /usr/local/bin/
+          cd ..
+          nuclei -update-templates -silent
 
-        echo "Installing Go tools..."
-        export PATH=$PATH:$(go env GOPATH)/bin
-        go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-        go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-        sudo cp "$(go env GOPATH)/bin/nuclei" /usr/local/bin/
-        sudo cp "$(go env GOPATH)/bin/httpx" /usr/local/bin/
-
-        git clone https://github.com/rverton/webanalyze.git
-        cd webanalyze
-        go build -o webanalyze
-        sudo mv webanalyze /usr/local/bin/
-        cd ..
-        nuclei -update-templates -silent
-
-    - name: Verify domains file
-      run: |
-        if [ ! -f ".github/workflows/domains.txt" ]; then
-          echo "Missing domains.txt"
-          exit 1
-        fi
-        cat .github/workflows/domains.txt
-
-    - name: Parse Credentials and Perform Auth
-      env:
-        SHOPIFY_LOGIN: ${{ secrets.SHOPIFY_LOGIN }}
-      run: |
-        mkdir -p auth_cookies
-        echo "$SHOPIFY_LOGIN" > login.json
-        username=$(jq -r .username login.json)
-        password=$(jq -r .password login.json)
-
-        while IFS= read -r domain; do
-          echo "🔐 Attempting login to $domain"
-
-          cat > login_script.py << 'EOF'
-import sys
-import json
-from playwright.sync_api import sync_playwright
-
-domain = sys.argv[1]
-username = sys.argv[2]
-password = sys.argv[3]
-login_url = f"https://{domain}/admin/auth/login"
-
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    context = browser.new_context()
-    page = context.new_page()
-    try:
-        page.goto(login_url, timeout=15000)
-        page.fill('input[name="username"]', username)
-        page.fill('input[name="password"]', password)
-        page.click('button[type="submit"]')
-        page.wait_for_load_state("networkidle")
-        cookies = context.cookies()
-        with open(f"auth_cookies/{domain.replace('.', '_')}_cookies.json", "w") as f:
-            json.dump(cookies, f, indent=2)
-    except Exception as e:
-        print(f"Login failed for {domain}: {e}")
-    browser.close()
-EOF
-
-          python3 login_script.py "$domain" "$username" "$password" || echo "❌ Login failed for $domain"
-        done < .github/workflows/domains.txt
-
-    - name: Fingerprint Targets
-      env:
-        USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-      run: |
-        mkdir -p fingerprint_results
-        while IFS= read -r domain; do
-          echo "🔍 Probing $domain"
-
-          echo "$domain" | httpx -tech-detect -status-code -title -web-server -json -H "User-Agent: $USER_AGENT" > "fingerprint_results/${domain//./_}_httpx.json"
-
-          whatweb --log-verbose="fingerprint_results/${domain//./_}_whatweb.txt" --user-agent="$USER_AGENT" "https://$domain" || true
-
-          webanalyze -host "$domain" -apps /usr/local/bin/webanalyze/apps.json -crawl -output "fingerprint_results/${domain//./_}_webanalyze.json" || true
-
-          echo "https://$domain" | nuclei -silent -tags "tech" -H "User-Agent: $USER_AGENT" -o "fingerprint_results/${domain//./_}_nuclei_tech.txt" || true
-
-          if [ -f "auth_cookies/${domain//./_}_cookies.json" ]; then
-            cookie_str=$(jq -r '[.[] | "\(.name)=\(.value)"] | join("; ")' "auth_cookies/${domain//./_}_cookies.json")
-            curl -s -A "$USER_AGENT" -H "Cookie: $cookie_str" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "⚠️ curl failed (auth) for $domain"
-          else
-            curl -s -A "$USER_AGENT" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "⚠️ curl fallback (no auth) failed for $domain"
+      - name: Verify domains file
+        run: |
+          if [ ! -f ".github/workflows/domains.txt" ]; then
+            echo "Missing domains.txt"
+            exit 1
           fi
+          cat .github/workflows/domains.txt
 
-          echo "Auth hints for $domain:" > "fingerprint_results/${domain//./_}_auth.txt"
-          grep -iE '<form[^>]+(login|signin|password)' "fingerprint_results/${domain//./_}_page.html" >> "fingerprint_results/${domain//./_}_auth.txt" || true
-          grep -iE 'oauth|authorize\?client_id' "fingerprint_results/${domain//./_}_page.html" >> "fingerprint_results/${domain//./_}_auth.txt" || true
-          grep -oE 'eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+' "fingerprint_results/${domain//./_}_page.html" >> "fingerprint_results/${domain//./_}_auth.txt" || true
+      - name: Parse Credentials and Perform Auth
+        env:
+          SHOPIFY_LOGIN: ${{ secrets.SHOPIFY_LOGIN }}
+        run: |
+          mkdir -p auth_cookies
+          echo "$SHOPIFY_LOGIN" > login.json
+          username=$(jq -r .username login.json)
+          password=$(jq -r .password login.json)
+          while IFS= read -r domain; do
+            echo "Attempting login to $domain"
+            python3 login_script.py "$domain" "$username" "$password" || echo "Login failed for $domain"
+          done < .github/workflows/domains.txt
 
-        done < .github/workflows/domains.txt
+      - name: Fingerprint Targets
+        env:
+          USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        run: |
+          mkdir -p fingerprint_results
+          while IFS= read -r domain; do
+            echo "Probing $domain"
+            echo "$domain" | httpx -tech-detect -status-code -title -web-server -json -H "User-Agent: $USER_AGENT" > "fingerprint_results/${domain//./_}_httpx.json"
+            whatweb --log-verbose="fingerprint_results/${domain//./_}_whatweb.txt" --user-agent="$USER_AGENT" "https://$domain" || true
+            webanalyze -host "$domain" -apps /usr/local/bin/webanalyze/apps.json -crawl -output "fingerprint_results/${domain//./_}_webanalyze.json" || true
+            echo "https://$domain" | nuclei -silent -tags "tech" -H "User-Agent: $USER_AGENT" -o "fingerprint_results/${domain//./_}_nuclei_tech.txt" || true
+            if [ -f "auth_cookies/${domain//./_}_cookies.json" ]; then
+              cookie_str=$(jq -r '[.[] | "\(.name)=\(.value)"] | join("; ")' "auth_cookies/${domain//./_}_cookies.json")
+              curl -s -A "$USER_AGENT" -H "Cookie: $cookie_str" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "curl failed (auth) for $domain"
+            else
+              curl -s -A "$USER_AGENT" "https://$domain" -o "fingerprint_results/${domain//./_}_page.html" || echo "curl fallback (no auth) failed for $domain"
+            fi
+          done < .github/workflows/domains.txt
 
-    - name: Upload Fingerprint Results
-      uses: actions/upload-artifact@v4
-      with:
-        name: fingerprint-results-${{ github.run_id }}
-        path: fingerprint_results/
+      - name: Upload Fingerprint Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint-results-${{ github.run_id }}
+          path: fingerprint_results/
 
-    - name: Notify Slack - Fingerprint Summary
-      if: always()
-      run: |
-        domain_count=$(wc -l < .github/workflows/domains.txt)
-        login_count=0
-        oauth_count=0
-        jwt_count=0
-        summary=""
-
-        shopt -s nullglob
-        files=(fingerprint_results/*_auth.txt)
-        if [ ${#files[@]} -eq 0 ]; then
-          summary="No auth hints extracted. Possibly all targets failed to curl or had empty responses."
-        else
-          for file in "${files[@]}"; do
-            domain=$(basename "$file" | sed 's/_auth.txt//' | tr '_' '.')
-            found_login=$(grep -iE '<form[^>]+(login|signin|password)' "$file" | wc -l)
-            found_oauth=$(grep -iE 'oauth|authorize\?client_id' "$file" | wc -l)
-            found_jwt=$(grep -oE 'eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+' "$file" | wc -l)
-
-            [ "$found_login" -gt 0 ] && ((login_count++))
-            [ "$found_oauth" -gt 0 ] && ((oauth_count++))
-            [ "$found_jwt" -gt 0 ] && ((jwt_count++))
-
-            summary+="- *$domain* → "
-            [ "$found_login" -gt 0 ] && summary+="Login Form "
-            [ "$found_oauth" -gt 0 ] && summary+="OAuth "
-            [ "$found_jwt" -gt 0 ] && summary+="JWT "
-            [ "$found_login" -eq 0 ] && [ "$found_oauth" -eq 0 ] && [ "$found_jwt" -eq 0 ] && summary+="No auth hints"
-            summary+="\n"
-          done
-        fi
-
-        curl -X POST -H 'Content-type: application/json' \
-        --data "{
-          \"text\": \"🧠 *Fingerprinting completed!*\nScanned: $domain_count domains\n🔐 Login Forms: $login_count | 🪪 OAuth: $oauth_count | 🔑 JWT: $jwt_count\n\n$summary\n📦 Artifacts: GitHub Actions > Fingerprint Results\n🔗 Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
-        }" \
-        ${{ secrets.SLACK_HOOK }}
+      - name: Notify Slack - Fingerprint Summary
+        if: always()
+        run: |
+          domain_count=$(

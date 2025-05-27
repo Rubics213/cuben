@@ -25,7 +25,7 @@ jobs:
         go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
         go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
         go install -v github.com/hakluke/hakrawler@latest
-        go install -v github.com/lc/gauzip@latest
+        GO111MODULE=on go install -v github.com/ggicci/gau@latest
         go install -v github.com/tomnomnom/assetfinder@latest
         go install -v github.com/lc/subjs@latest
         pip install git+https://github.com/owasp-amass/amass.git
@@ -54,7 +54,7 @@ jobs:
 
           echo "[+] Crawling and URL fetching for $domain"
           cat results/$domain.live.txt | cut -d ' ' -f1 | hakrawler > results/$domain.hakrawler.txt
-          gauzip $domain > results/$domain.gau.txt
+          gau $domain > results/$domain.gau.txt
 
           echo "[+] Running nuclei on $domain"
           nuclei -l results/$domain.live.txt -severity critical,high,medium -c 50 -silent -o results/$domain.nuclei.txt
@@ -75,7 +75,7 @@ jobs:
       run: |
         curl -X POST -H 'Content-type: application/json' \
           --data '{"text": "Recon Complete ✅ - Check findings in the GitHub Action artifacts."}' \
-          ${{ secrets.SLACK_WEBHOOK_URL }}
+          "${{ secrets.SLACK_WEBHOOK_URL }}"
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4

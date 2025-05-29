@@ -36,8 +36,7 @@ jobs:
 
       - name: Run Login Script
         env:
-          SHOPIFY_USERNAME: ${{ secrets.SHOPIFY_USERNAME }}
-          SHOPIFY_PASSWORD: ${{ secrets.SHOPIFY_PASSWORD }}
+          SHOPIFY_LOGIN: ${{ secrets.SHOPIFY_LOGIN }}
         run: |
           set -e
           python3 .github/workflows/login_script.py
@@ -108,3 +107,4 @@ jobs:
                 {
                   "type": "section",
                   "text": {
+                    "type": "mrkdwn

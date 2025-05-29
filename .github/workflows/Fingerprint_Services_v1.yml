@@ -1,0 +1,109 @@
+name: Fingerprint Targets
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 3 * * *'
+    - cron: '45 12 * * *'
+
+jobs:
+  fingerprint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          set -e
+          sudo apt update && sudo apt install -y whatweb curl jq unzip python3-pip
+          pip3 install requests
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          sudo cp "$(go env GOPATH)/bin/nuclei" /usr/local/bin/
+          sudo cp "$(go env GOPATH)/bin/httpx" /usr/local/bin/
+          nuclei -update-templates -silent
+
+      - name: Verify domains file
+        run: |
+          set -e
+          if [ ! -f ".github/workflows/domains.txt" ]; then
+            echo "Missing domains.txt"
+            exit 1
+          fi
+          cat .github/workflows/domains.txt
+
+      - name: Run Login Script
+        env:
+          SHOPIFY_USERNAME: ${{ secrets.SHOPIFY_USERNAME }}
+          SHOPIFY_PASSWORD: ${{ secrets.SHOPIFY_PASSWORD }}
+        run: |
+          set -e
+          python3 .github/workflows/login_script.py
+
+      - name: Fingerprint Targets
+        env:
+          USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        run: |
+          set -e
+          mkdir -p fingerprint_results
+          while IFS= read -r domain; do
+            echo "Probing $domain"
+            echo "$domain" | httpx -tech-detect -status-code -title -web-server -json -H "User-Agent: $USER_AGENT" > "fingerprint_results/${domain//./_}_httpx.json" || echo "Httpx failed for $domain"
+            whatweb --log-verbose="fingerprint_results/${domain//./_}_whatweb.txt" --user-agent="$USER_AGENT" "https://$domain" || echo "Whatweb failed for $domain"
+            echo "https://$domain" | nuclei -silent -tags "tech" -H "User-Agent: $USER_AGENT" -o "fingerprint_results/${domain//./_}_nuclei_tech.txt" || echo "Nuclei failed for $domain"
+          done < .github/workflows/domains.txt
+
+      - name: Upload Fingerprint Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint-results-${{ github.run_id }}
+          path: fingerprint_results/
+
+      - name: Notify Slack on Login Attempt
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload_url: ${{ secrets.SLACK_HOOK }}
+          payload: |
+            {
+              "text": "Login attempt for ${GITHUB_REF}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Login Attempt* \n*Repository:* ${GITHUB_REPOSITORY} \n*Branch:* ${GITHUB_REF} \n*Commit:* ${GITHUB_SHA}"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack on Success
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload_url: ${{ secrets.SLACK_HOOK }}
+          payload: |
+            {
+              "text": "Fingerprint scan completed for ${GITHUB_REF}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Fingerprint Scan Results* \n*Repository:* ${GITHUB_REPOSITORY} \n*Branch:* ${GITHUB_REF} \n*Commit:* ${GITHUB_SHA} \n*Scan Results:* fingerprint-results-${{ github.run_id }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Scan Details:* \n*Targets:* ${{ job.status }} \n*Tools:* httpx, whatweb, nuclei \n*Results:* Uploaded to artifact: fingerprint-results-${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: slackapi/s

@@ -61,30 +61,13 @@ jobs:
           name: fingerprint-results-${{ github.run_id }}
           path: fingerprint_results/
 
-      - name: Notify Slack on Login Attempt
-        uses: slackapi/slack-github-action@v1.24.0
+      - name: Notify Slack
+        uses: actions/github-script@v7
         with:
-          payload_url: ${{ secrets.SLACK_HOOK }}
-          payload: |
-            {
-              "text": "Login attempt for ${GITHUB_REF}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Login Attempt* \n*Repository:* ${GITHUB_REPOSITORY} \n*Branch:* ${GITHUB_REF} \n*Commit:* ${GITHUB_SHA}"
-                  }
-                }
-              ]
-            }
-
-      - name: Notify Slack on Success
-        uses: slackapi/slack-github-action@v1.24.0
-        with:
-          payload_url: ${{ secrets.SLACK_HOOK }}
-          payload: |
-            {
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const SLACK_WEBHOOK_URL = '${{ secrets.SLACK_HOOK }}';
+            const payload = {
               "text": "Fingerprint scan completed for ${GITHUB_REF}",
               "blocks": [
                 {
@@ -102,8 +85,26 @@ jobs:
                   }
                 }
               ]
-            }
+            };
+            const options = {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            };
+            fetch(SLACK_WEBHOOK_URL, options);
 
       - name: Notify Slack on Failure
         if: failure()
-        uses: slackapi/s
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const SLACK_WEBHOOK_URL = '${{ secrets.SLACK_HOOK }}';
+            const payload = {
+              "text": "Fingerprint scan failed for ${GITHUB_REF}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {

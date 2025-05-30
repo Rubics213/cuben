@@ -25,7 +25,7 @@ jobs:
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl whatweb
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
           go install github.com/tomnomnom/assetfinder@latest
@@ -48,17 +48,24 @@ jobs:
             echo "ERROR: domains.txt file not found!"
             exit 1
           fi
+          sed -i '/^\s*$/d' .github/workflows/domains.txt
+          sed -i 's/\r//' .github/workflows/domains.txt
           echo "Target domains:"
           cat .github/workflows/domains.txt
 
-      - name: Detect subdomains (with multi-domain diffing)
+      - name: Detect subdomains (with multi-domain diffing and fingerprinting)
         id: subdomain-detection
         run: |
           set -e
-          mkdir -p subdomain_output old_subdomains
+          mkdir -p subdomain_output old_subdomains fingerprints
           new_subdomains_found=()
-          while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '\r\n')
+          while IFS= read -r domain || [[ -n "$domain" ]]; do
+            domain=$(echo "$domain" | tr -d '\r\n' | xargs)
+            if [[ -z "$domain" ]]; then
+              echo "⚠️ Skipping empty or invalid domain entry"
+              continue
+            fi
+
             echo "🔎 Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
             assetfinder --subs-only "$domain" | httpx -silent > "$output_file" || true
@@ -81,6 +88,10 @@ jobs:
                 echo "✅ No new subdomains for $domain"
               fi
             fi
+
+            # Fingerprint live subdomains
+            echo "🧬 Fingerprinting live subdomains for $domain"
+            httpx -l "$output_file" -tech-detect -status-code -title -server -ip -json > "fingerprints/${domain//./_}_fingerprints.json" || true
           done < .github/workflows/domains.txt
 
           echo "NEW_DOMAINS=${new_subdomains_found[*]}" >> $GITHUB_ENV
@@ -89,19 +100,6 @@ jobs:
           else
             echo "new_subdomains_detected=false" >> $GITHUB_ENV
           fi
-
-      - name: Fingerprint live hosts
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          mkdir -p fingerprints
-          for domain in $NEW_DOMAINS; do
-            input_file="subdomain_output/${domain//./_}_subdomains.txt"
-            output_file="fingerprints/${domain//./_}_httpx.txt"
-            whatweb_file="fingerprints/${domain//./_}_whatweb.txt"
-            echo "🌐 Fingerprinting $domain"
-            httpx -l "$input_file" -title -tech-detect -status-code -ip -location -web-server -silent > "$output_file" || true
-            cat "$input_file" | xargs -n1 -I{} timeout 15s whatweb --no-errors -q "{}" >> "$whatweb_file" || true
-          done
 
       - name: Prepare ZAP plan
         run: |
@@ -119,6 +117,7 @@ jobs:
               "      includePaths:" \
               "        - \"https://TARGET_DOMAIN/.*\"" \
               > .github/zap/plan.yml
+          fi
 
       - name: Run ZAP Scan (Dynamic Targets)
         if: env.new_subdomains_detected == 'true'

@@ -20,7 +20,7 @@ on:
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # Default timeout, can be overridden with env later
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code
@@ -48,11 +48,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git python3 python3-pip nikto nmap unzip wget golang jq curl docker.io
           
-          # Configure Go environment
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
           
-          # Install Go tools
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
@@ -60,7 +58,6 @@ jobs:
           go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder,naabu} /usr/local/bin/
           
-          # Install Findomain
           curl -s https://api.github.com/repos/findomain/findomain/releases/latest \
             | grep "browser_download_url.*linux.zip" \
             | cut -d '"' -f 4 \
@@ -69,10 +66,7 @@ jobs:
           chmod +x findomain
           sudo mv findomain /usr/local/bin/findomain
           
-          # Update templates
           nuclei -update-templates -silent
-          
-          # Install ZAP
           docker pull ghcr.io/zaproxy/action-full-scan:latest
 
       - name: Verify domains file exists
@@ -83,7 +77,6 @@ jobs:
             exit 1
           fi
           
-          # Clean and validate domains
           sed -i '/^[[:space:]]*$/d; /^#/d' .github/workflows/domains.txt
           if [ ! -s ".github/workflows/domains.txt" ]; then
             echo "ERROR: domains.txt is empty after cleaning!"
@@ -94,7 +87,7 @@ jobs:
           cat .github/workflows/domains.txt
           echo "DOMAINS_COUNT=$(wc -l < .github/workflows/domains.txt | tr -d ' ')" >> $GITHUB_ENV
 
-      - name: Detect subdomains (with multi-domain diffing)
+      - name: Detect subdomains
         id: subdomain-detection
         timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
@@ -110,7 +103,6 @@ jobs:
             echo "🔎 Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
             
-            # Run subdomain discovery tools in parallel
             {
               assetfinder --subs-only "$domain" | httpx -silent || true
               subfinder -d "$domain" -silent || true
@@ -119,7 +111,6 @@ jobs:
             
             sed -i '/^$/d' "$output_file"
             
-            # Check for new subdomains
             old_file="old_subdomains/${domain//./_}_old_subdomains.txt"
             if [ ! -f "$old_file" ]; then
               echo "🌟 First scan for $domain — storing results"
@@ -139,7 +130,6 @@ jobs:
             fi
           done < .github/workflows/domains.txt
 
-          # Set environment variables
           echo "NEW_DOMAINS=${new_subdomains_found[*]}" >> $GITHUB_ENV
           echo "CHANGED_DOMAINS=${changed_domains[*]}" >> $GITHUB_ENV
           
@@ -153,7 +143,7 @@ jobs:
         run: |
           mkdir -p .github/zap
           if [ ! -f ".github/zap/plan.yml" ]; then
-            cat << EOF > .github/zap/plan.yml
+            cat << 'EOF' > .github/zap/plan.yml
 plans:
   - name: "Default Scan"
     parameters:
@@ -177,7 +167,7 @@ EOF
             naabu -host "$domain" -silent -json -o "port-scans/naabu-${domain//./_}.json" || echo "Naabu scan completed"
           done
 
-      - name: Run ZAP Scan (Dynamic Targets)
+      - name: Run ZAP Scan
         if: env.new_subdomains_detected == 'true'
         timeout-minutes: ${{ env.ZAP_TIMEOUT }}
         run: |
@@ -204,7 +194,6 @@ EOF
         timeout-minutes: ${{ env.NUCLEI_TIMEOUT }}
         run: |
           mkdir -p nuclei-reports
-          # Run nuclei with parallel processing
           echo "$CHANGED_DOMAINS" | tr ' ' '\n' | xargs -P ${{ env.MAX_CONCURRENT_SCANS }} -I {} bash -c '
             domain={}
             echo "💣 Nuclei scanning $domain"
@@ -218,15 +207,12 @@ EOF
         timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           mkdir -p summaries
-          
-          # Create CSV report
           echo "domain,severity,name,url,template,description" > summaries/nuclei-findings.csv
           for file in nuclei-reports/*.json; do
             jq -r '[.host, .info.severity, .info.name, .matched, .template, .info.description? // ""] | @csv' "$file" >> summaries/nuclei-findings.csv
           done
           
-          # Create HTML report
-          cat << EOF > summaries/nuclei-summary.html
+          cat << 'EOF' > summaries/nuclei-summary.html
 <html>
 <head>
   <title>Vulnerability Scan Report</title>
@@ -255,7 +241,6 @@ EOF
           
           echo "</table><p>Report generated on $(date)</p></body></html>" >> summaries/nuclei-summary.html
           
-          # Create markdown summary
           echo "# Vulnerability Scan Report" > summaries/summary.md
           echo "Generated on $(date)" >> summaries/summary.md
           echo "## Summary by Severity" >> summaries/summary.md
@@ -275,7 +260,7 @@ EOF
             port-scans/*
             subdomain_output/*
 
-      - name: Create GitHub Issues for Critical/High
+      - name: Create GitHub Issues
         if: env.new_subdomains_detected == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -289,7 +274,6 @@ EOF
               template=$(echo "$vuln" | jq -r '.template')
               description=$(echo "$vuln" | jq -r '.info.description? // ""')
               
-              # Check if issue already exists
               existing_issue=$(gh issue list --search "in:title \"$title\" in:title \"$severity\"" --json number -q '.[0].number')
               
               if [ -z "$existing_issue" ]; then
@@ -309,14 +293,13 @@ EOF
             done
           done
 
-      - name: Notify Slack of Critical/High Findings
+      - name: Notify Slack
         if: env.new_subdomains_detected == 'true'
         timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           critical_count=0
           high_count=0
           
-          # Count findings
           for file in nuclei-reports/*.json; do
             crit=$(jq -c 'select(.info.severity == "critical")' "$file" | wc -l)
             high=$(jq -c 'select(.info.severity == "high")' "$file" | wc -l)
@@ -324,7 +307,6 @@ EOF
             high_count=$((high_count + high))
           done
           
-          # Prepare message
           if [ $critical_count -gt 0 ] || [ $high_count -gt 0 ]; then
             message="🚨 *Security Alert* 🚨\n"
             message+="*Critical findings*: $critical_count\n"

@@ -6,10 +6,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      domains:
-        description: 'Comma-separated list of domains to scan (overrides domains.txt)'
-        required: false
   schedule:
     - cron: '13 1 * * *'
     - cron: '47 5 * * *'
@@ -26,104 +22,61 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize environment variables
-        id: set-env
-        run: |
-          echo "SCAN_TIMEOUT=120" >> $GITHUB_ENV
-          echo "NUCLEI_TIMEOUT=60" >> $GITHUB_ENV
-          echo "ZAP_TIMEOUT=1800" >> $GITHUB_ENV
-          echo "MAX_CONCURRENT_SCANS=3" >> $GITHUB_ENV
-
-      - name: Setup domains input
-        id: domains-input
-        run: |
-          if [ -n "${{ github.event.inputs.domains }}" ]; then
-            echo "${{ github.event.inputs.domains }}" | tr ',' '\n' > .github/workflows/domains.txt
-            echo "Using input domains: ${{ github.event.inputs.domains }}"
-          fi
-
       - name: Install scanning dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            git python3 python3-pip nikto nmap unzip wget golang jq curl docker.io
-          
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl whatweb
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
-          
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-          sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder,naabu} /usr/local/bin/
-          
+          sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
           curl -s https://api.github.com/repos/findomain/findomain/releases/latest \
             | grep "browser_download_url.*linux.zip" \
             | cut -d '"' -f 4 \
-            | wget -q -i -
-          unzip -q findomain-linux.zip
+            | wget -i -
+          unzip findomain-linux.zip
           chmod +x findomain
           sudo mv findomain /usr/local/bin/findomain
-          
           nuclei -update-templates -silent
-          docker pull ghcr.io/zaproxy/action-full-scan:latest
 
       - name: Verify domains file exists
-        id: verify-domains
         run: |
           if [ ! -f ".github/workflows/domains.txt" ]; then
             echo "ERROR: domains.txt file not found!"
             exit 1
           fi
-          
-          sed -i '/^[[:space:]]*$/d; /^#/d' .github/workflows/domains.txt
-          if [ ! -s ".github/workflows/domains.txt" ]; then
-            echo "ERROR: domains.txt is empty after cleaning!"
-            exit 1
-          fi
-          
           echo "Target domains:"
           cat .github/workflows/domains.txt
-          echo "DOMAINS_COUNT=$(wc -l < .github/workflows/domains.txt | tr -d ' ')" >> $GITHUB_ENV
 
-      - name: Detect subdomains
+      - name: Detect subdomains (with multi-domain diffing)
         id: subdomain-detection
-        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
-          set -eo pipefail
+          set -e
           mkdir -p subdomain_output old_subdomains
           new_subdomains_found=()
-          changed_domains=()
-          
-          while IFS= read -r domain || [ -n "$domain" ]; do
-            domain=$(echo "$domain" | tr -d '\r\n' | xargs)
-            [ -z "$domain" ] && continue
-            
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '\r\n')
             echo "🔎 Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
-            
-            {
-              assetfinder --subs-only "$domain" | httpx -silent || true
-              subfinder -d "$domain" -silent || true
-              findomain -t "$domain" --quiet || true
-            } | sort -u | tee "$output_file"
-            
+            assetfinder --subs-only "$domain" | httpx -silent > "$output_file" || true
+            subfinder -d "$domain" -silent >> "$output_file" || true
+            findomain -t "$domain" --quiet >> "$output_file" || true
+            sort -u "$output_file" -o "$output_file"
             sed -i '/^$/d' "$output_file"
-            
+
             old_file="old_subdomains/${domain//./_}_old_subdomains.txt"
             if [ ! -f "$old_file" ]; then
               echo "🌟 First scan for $domain — storing results"
               cp "$output_file" "$old_file"
               new_subdomains_found+=("$domain")
-              changed_domains+=("$domain")
             else
               if ! diff -q "$output_file" "$old_file" > /dev/null; then
                 echo "🔥 New subdomains detected for $domain!"
-                new_subdomains=$(comm -13 <(sort "$old_file") <(sort "$output_file") | wc -l)
-                echo "Found $new_subdomains new subdomains"
+                new_subdomains_found+=("$domain")
                 cp "$output_file" "$old_file"
-                changed_domains+=("$domain")
               else
                 echo "✅ No new subdomains for $domain"
               fi
@@ -131,122 +84,83 @@ jobs:
           done < .github/workflows/domains.txt
 
           echo "NEW_DOMAINS=${new_subdomains_found[*]}" >> $GITHUB_ENV
-          echo "CHANGED_DOMAINS=${changed_domains[*]}" >> $GITHUB_ENV
-          
-          if [ "${#changed_domains[@]}" -gt 0 ]; then
+          if [ "${#new_subdomains_found[@]}" -gt 0 ]; then
             echo "new_subdomains_detected=true" >> $GITHUB_ENV
           else
             echo "new_subdomains_detected=false" >> $GITHUB_ENV
           fi
 
+      - name: Fingerprint live hosts
+        if: env.new_subdomains_detected == 'true'
+        run: |
+          mkdir -p fingerprints
+          for domain in $NEW_DOMAINS; do
+            input_file="subdomain_output/${domain//./_}_subdomains.txt"
+            output_file="fingerprints/${domain//./_}_httpx.txt"
+            whatweb_file="fingerprints/${domain//./_}_whatweb.txt"
+            echo "🌐 Fingerprinting $domain"
+            httpx -l "$input_file" -title -tech-detect -status-code -ip -location -web-server -silent > "$output_file" || true
+            cat "$input_file" | xargs -n1 -I{} timeout 15s whatweb --no-errors -q "{}" >> "$whatweb_file" || true
+          done
+
       - name: Prepare ZAP plan
         run: |
           mkdir -p .github/zap
           if [ ! -f ".github/zap/plan.yml" ]; then
-            cat << 'EOF' > .github/zap/plan.yml
-plans:
-  - name: "Default Scan"
-    parameters:
-      target: "https://TARGET_DOMAIN"
-      rules:
-        - "scan_rules/automatic"
-    context:
-      name: "Default Context"
-      includePaths:
-        - "https://TARGET_DOMAIN/.*"
-EOF
-          fi
+            printf "%s\n" \
+              "plans:" \
+              "  - name: \"Default Scan\"" \
+              "    parameters:" \
+              "      target: \"https://TARGET_DOMAIN\"" \
+              "      rules:" \
+              "        - \"scan_rules/automatic\"" \
+              "    context:" \
+              "      name: \"Default Context\"" \
+              "      includePaths:" \
+              "        - \"https://TARGET_DOMAIN/.*\"" \
+              > .github/zap/plan.yml
 
-      - name: Run port scans with Naabu
+      - name: Run ZAP Scan (Dynamic Targets)
         if: env.new_subdomains_detected == 'true'
-        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
-          mkdir -p port-scans
-          for domain in $CHANGED_DOMAINS; do
-            echo "🔍 Scanning ports for $domain"
-            naabu -host "$domain" -silent -json -o "port-scans/naabu-${domain//./_}.json" || echo "Naabu scan completed"
-          done
-
-      - name: Run ZAP Scan
-        if: env.new_subdomains_detected == 'true'
-        timeout-minutes: ${{ env.ZAP_TIMEOUT }}
-        run: |
-          for domain in $CHANGED_DOMAINS; do
+          for domain in $NEW_DOMAINS; do
             echo "🕷️ Running ZAP scan for $domain"
             sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
-            docker run --rm -v $(pwd):/zap/wrk -t ghcr.io/zaproxy/action-full-scan:latest \
-              -c .github/zap/plan.yml -T ${{ env.ZAP_TIMEOUT }} || echo "ZAP scan completed"
+            docker run --rm -v $(pwd):/zap/wrk -t ghcr.io/zaproxy/action-full-scan:latest -c .github/zap/plan.yml || echo "ZAP scan completed"
             sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
           done
 
       - name: Run Nikto Scan
         if: env.new_subdomains_detected == 'true'
-        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           mkdir -p nikto-reports
-          for domain in $CHANGED_DOMAINS; do
+          for domain in $NEW_DOMAINS; do
             echo "🔬 Nikto scanning $domain"
-            timeout 600 nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || echo "Nikto done"
+            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || echo "Nikto done"
           done
 
       - name: Run Nuclei Scan
         if: env.new_subdomains_detected == 'true'
-        timeout-minutes: ${{ env.NUCLEI_TIMEOUT }}
         run: |
           mkdir -p nuclei-reports
-          echo "$CHANGED_DOMAINS" | tr ' ' '\n' | xargs -P ${{ env.MAX_CONCURRENT_SCANS }} -I {} bash -c '
-            domain={}
+          for domain in $NEW_DOMAINS; do
             echo "💣 Nuclei scanning $domain"
-            nuclei -u "https://$domain" -severity critical,high,medium,low -j \
-              -o "nuclei-reports/nuclei-${domain//./_}.json" -timeout ${{ env.NUCLEI_TIMEOUT }} -silent \
-              || echo "Nuclei scan completed for $domain"
-          '
+            nuclei -u "https://$domain" -severity critical,high,medium,low,info -j -o "nuclei-reports/nuclei-${domain//./_}.json" -timeout 30 -silent || echo "Nuclei done"
+          done
 
       - name: Generate Summary Reports
         if: env.new_subdomains_detected == 'true'
-        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           mkdir -p summaries
-          echo "domain,severity,name,url,template,description" > summaries/nuclei-findings.csv
+          echo "domain,severity,name,url" > summaries/nuclei-findings.csv
           for file in nuclei-reports/*.json; do
-            jq -r '[.host, .info.severity, .info.name, .matched, .template, .info.description? // ""] | @csv' "$file" >> summaries/nuclei-findings.csv
+            jq -r '[.host, .info.severity, .info.name, .matched] | @csv' "$file" >> summaries/nuclei-findings.csv
           done
-          
-          cat << 'EOF' > summaries/nuclei-summary.html
-<html>
-<head>
-  <title>Vulnerability Scan Report</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    tr:nth-child(even) { background-color: #f2f2f2; }
-    .critical { background-color: #ffcccc; }
-    .high { background-color: #ffe6cc; }
-    .medium { background-color: #ffffcc; }
-    .low { background-color: #e6ffcc; }
-  </style>
-</head>
-<body>
-  <h1>Vulnerability Scan Summary</h1>
-  <table>
-    <tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th><th>Description</th></tr>
-EOF
-          
-          tail -n +2 summaries/nuclei-findings.csv | while IFS=',' read -r domain severity name url template description; do
-            severity_class=$(echo "$severity" | tr '[:upper:]' '[:lower:]')
-            echo "<tr class=\"$severity_class\"><td>$domain</td><td>$severity</td><td>$name</td><td><a href=\"$url\">$url</a></td><td>${description//\"/}</td></tr>" \
-              >> summaries/nuclei-summary.html
+          echo "<html><body><h1>Scan Summary</h1><table border='1'><tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th></tr>" > summaries/nuclei-summary.html
+          tail -n +2 summaries/nuclei-findings.csv | while IFS=',' read -r domain severity name url; do
+            echo "<tr><td>$domain</td><td>$severity</td><td>$name</td><td><a href='$url'>$url</a></td></tr>" >> summaries/nuclei-summary.html
           done
-          
-          echo "</table><p>Report generated on $(date)</p></body></html>" >> summaries/nuclei-summary.html
-          
-          echo "# Vulnerability Scan Report" > summaries/summary.md
-          echo "Generated on $(date)" >> summaries/summary.md
-          echo "## Summary by Severity" >> summaries/summary.md
-          echo "| Severity | Count |" >> summaries/summary.md
-          echo "|----------|-------|" >> summaries/summary.md
-          tail -n +2 summaries/nuclei-findings.csv | cut -d',' -f2 | sort | uniq -c | awk '{print "| " $2 " | " $1 " |"}' >> summaries/summary.md
+          echo "</table></body></html>" >> summaries/nuclei-summary.html
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -257,70 +171,34 @@ EOF
             summaries/*
             nikto-reports/*
             nuclei-reports/*
-            port-scans/*
-            subdomain_output/*
+            fingerprints/*
 
-      - name: Create GitHub Issues
+      - name: Create GitHub Issues for Critical/High
         if: env.new_subdomains_detected == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           for file in nuclei-reports/*.json; do
             jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
               title=$(echo "$vuln" | jq -r '.info.name')
               url=$(echo "$vuln" | jq -r '.matched')
               severity=$(echo "$vuln" | jq -r '.info.severity')
-              template=$(echo "$vuln" | jq -r '.template')
-              description=$(echo "$vuln" | jq -r '.info.description? // ""')
-              
-              existing_issue=$(gh issue list --search "in:title \"$title\" in:title \"$severity\"" --json number -q '.[0].number')
-              
-              if [ -z "$existing_issue" ]; then
-                body=$(cat << EOF
-**Severity**: $severity  
-**URL**: $url  
-**Template**: $template  
-**Description**: $description  
-**Domain**: $(basename "$file" | sed 's/nuclei-\(.*\)\.json/\1/' | tr '_' '.')
-EOF
-                )
-                
-                gh issue create --title "$title [$severity]" --body "$body" --label "bug,bounty,auto-created,$severity"
-              else
-                echo "Issue already exists: #$existing_issue"
-              fi
+              body="**Severity**: $severity%0A**URL**: $url%0A**Template**: $(echo "$vuln" | jq -r '.template')"
+              gh issue create --title "$title [$severity]" --body "$body" --label "bug,bounty,auto-created"
             done
           done
 
-      - name: Notify Slack
+      - name: Notify Slack of Critical/High Findings
         if: env.new_subdomains_detected == 'true'
-        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
-          critical_count=0
-          high_count=0
-          
           for file in nuclei-reports/*.json; do
-            crit=$(jq -c 'select(.info.severity == "critical")' "$file" | wc -l)
-            high=$(jq -c 'select(.info.severity == "high")' "$file" | wc -l)
-            critical_count=$((critical_count + crit))
-            high_count=$((high_count + high))
+            jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
+              domain=$(basename "$file" | sed 's/nuclei-\(.*\)\.json/\1/' | tr '_' '.')
+              title=$(echo "$vuln" | jq -r '.info.name')
+              url=$(echo "$vuln" | jq -r '.matched')
+              severity=$(echo "$vuln" | jq -r '.info.severity')
+              curl -X POST -H 'Content-type: application/json' \
+                --data "{\"text\":\"⚠️ *Critical/High vulnerability detected!*\\n*Domain:* $domain\\n*Severity:* $severity\\n*Name:* $title\\n*URL:* $url\"}" \
+                ${{ secrets.SLACK_WEBHOOK_URL }}
+            done
           done
-          
-          if [ $critical_count -gt 0 ] || [ $high_count -gt 0 ]; then
-            message="🚨 *Security Alert* 🚨\n"
-            message+="*Critical findings*: $critical_count\n"
-            message+="*High findings*: $high_count\n"
-            message+="*Scan details*: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            
-            curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\":\"$message\"}" \
-              ${{ secrets.SLACK_WEBHOOK_URL }}
-          else
-            echo "No critical/high findings to report"
-          fi
-
-      - name: Clean up workspace
-        run: |
-          docker system prune -af
-          sudo rm -rf /tmp/*

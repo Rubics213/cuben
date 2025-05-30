@@ -35,7 +35,7 @@ jobs:
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl chromium-browser
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl chromium-browser libpcap-dev
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
           go install github.com/tomnomnom/assetfinder@latest
@@ -71,7 +71,7 @@ jobs:
         id: recon
         run: |
           set -e
-          mkdir -p subdomain_output old_subdomains fingerprints naabu gau hakrawler nmap wayback
+          mkdir -p subdomain_output old_subdomains fingerprints naabu gau hakrawler nmap wayback nuclei-reports
           new_subdomains_found=()
 
           while IFS= read -r domain || [[ -n "$domain" ]]; do
@@ -101,6 +101,7 @@ jobs:
               hakrawler -url "https://$domain" > "hakrawler/${domain//./_}.txt" || true
               nmap -iL "$out" -oN "nmap/${domain//./_}.txt" || true
               waybackurls "$domain" > "wayback/${domain//./_}.txt" || true
+              nuclei -l "$out" -severity critical,high,medium,low,info -j -o "nuclei-reports/nuclei-${domain//./_}.json" -timeout 30 -silent || true
             fi
 
           done < .github/workflows/domains.txt

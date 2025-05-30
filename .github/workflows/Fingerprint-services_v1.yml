@@ -12,8 +12,8 @@ jobs:
     timeout-minutes: 90
     env:
       # TEMPORARY hardcoded credentials for testing
-      SHOPIFY_USERNAME: "test_username"
-      SHOPIFY_PASSWORD: "test_password"
+      SHOPIFY_USERNAME: "beetlejuice997@outlook.com"
+      SHOPIFY_PASSWORD: "B33tl3j92@"
 
     steps:
       - name: Checkout

@@ -16,23 +16,37 @@ on:
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache Go binaries
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/go/bin
+          key: ${{ runner.os }}-go-tools-${{ hashFiles('.github/workflows/**.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-go-tools-
+
       - name: Install scanning dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl
+          sudo apt-get install -y git python3 python3-pip nikto nmap unzip wget golang jq curl chromium-browser
           echo "GOPATH=$HOME/go" >> $GITHUB_ENV
           echo "PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $GITHUB_ENV
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder} /usr/local/bin/
+          go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/hakluke/hakrawler@latest
+          go install github.com/tomnomnom/waybackurls@latest
+          sudo mv ~/go/bin/* /usr/local/bin/
           curl -s https://api.github.com/repos/findomain/findomain/releases/latest \
             | grep "browser_download_url.*linux.zip" \
             | cut -d '"' -f 4 \
@@ -53,139 +67,46 @@ jobs:
           echo "Target domains:"
           cat .github/workflows/domains.txt
 
-      - name: Detect subdomains (with multi-domain diffing and fingerprinting)
-        id: subdomain-detection
+      - name: Recon + Subdomain Enumeration + Fingerprinting
+        id: recon
         run: |
           set -e
-          mkdir -p subdomain_output old_subdomains fingerprints
+          mkdir -p subdomain_output old_subdomains fingerprints naabu gau hakrawler nmap wayback
           new_subdomains_found=()
+
           while IFS= read -r domain || [[ -n "$domain" ]]; do
             domain=$(echo "$domain" | tr -d '\r\n' | xargs)
-            if [[ -z "$domain" ]]; then
-              echo "⚠️ Skipping empty or invalid domain entry"
-              continue
-            fi
+            if [[ -z "$domain" ]]; then continue; fi
 
             echo "🔎 Processing $domain"
-            output_file="subdomain_output/${domain//./_}_subdomains.txt"
-            assetfinder --subs-only "$domain" | httpx -silent > "$output_file" || true
-            subfinder -d "$domain" -silent >> "$output_file" || true
-            findomain -t "$domain" --quiet >> "$output_file" || true
-            sort -u "$output_file" -o "$output_file"
-            sed -i '/^$/d' "$output_file"
+            out="subdomain_output/${domain//./_}_subdomains.txt"
+            assetfinder --subs-only "$domain" > temp1.txt || true
+            subfinder -d "$domain" -silent > temp2.txt || true
+            findomain -t "$domain" --quiet > temp3.txt || true
+            cat temp*.txt | sort -u > "$out"
+            rm temp*.txt
 
             old_file="old_subdomains/${domain//./_}_old_subdomains.txt"
-            if [ ! -f "$old_file" ]; then
-              echo "🌟 First scan for $domain — storing results"
-              cp "$output_file" "$old_file"
+            if [ ! -f "$old_file" ] || ! diff -q "$out" "$old_file" > /dev/null; then
+              echo "🔥 New or first scan for $domain"
+              cp "$out" "$old_file"
               new_subdomains_found+=("$domain")
-            else
-              if ! diff -q "$output_file" "$old_file" > /dev/null; then
-                echo "🔥 New subdomains detected for $domain!"
-                new_subdomains_found+=("$domain")
-                cp "$output_file" "$old_file"
-              else
-                echo "✅ No new subdomains for $domain"
-              fi
             fi
 
-            # Fingerprint live subdomains
-            echo "🧬 Fingerprinting live subdomains for $domain"
-            httpx -l "$output_file" -tech-detect -status-code -title -server -ip -json > "fingerprints/${domain//./_}_fingerprints.json" || true
+            if [ -s "$out" ]; then
+              echo "🧬 Fingerprinting and scanning live hosts for $domain"
+              httpx -l "$out" -tech-detect -status-code -title -server -ip -json > "fingerprints/${domain//./_}.json" || true
+              naabu -l "$out" -o "naabu/${domain//./_}_ports.txt" -silent || true
+              gau "$domain" > "gau/${domain//./_}.txt" || true
+              hakrawler -url "https://$domain" > "hakrawler/${domain//./_}.txt" || true
+              nmap -iL "$out" -oN "nmap/${domain//./_}.txt" || true
+              waybackurls "$domain" > "wayback/${domain//./_}.txt" || true
+            fi
+
           done < .github/workflows/domains.txt
 
           echo "NEW_DOMAINS=${new_subdomains_found[*]}" >> $GITHUB_ENV
-          if [ "${#new_subdomains_found[@]}" -gt 0 ]; then
-            echo "new_subdomains_detected=true" >> $GITHUB_ENV
-          else
-            echo "new_subdomains_detected=false" >> $GITHUB_ENV
-          fi
-
-      - name: Prepare ZAP plan
-        run: |
-          mkdir -p .github/zap
-          if [ ! -f ".github/zap/plan.yml" ]; then
-            printf "%s\n" \
-              "plans:" \
-              "  - name: \"Default Scan\"" \
-              "    parameters:" \
-              "      target: \"https://TARGET_DOMAIN\"" \
-              "      rules:" \
-              "        - \"scan_rules/automatic\"" \
-              "    context:" \
-              "      name: \"Default Context\"" \
-              "      includePaths:" \
-              "        - \"https://TARGET_DOMAIN/.*\"" \
-              > .github/zap/plan.yml
-          fi
-
-      - name: Run ZAP Scan (Dynamic Targets)
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          for domain in $NEW_DOMAINS; do
-            echo "🕷️ Running ZAP scan for $domain"
-            sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
-            docker run --rm -v $(pwd):/zap/wrk -t ghcr.io/zaproxy/action-full-scan:latest -c .github/zap/plan.yml || echo "ZAP scan completed"
-            sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
-          done
-
-      - name: Run Nikto Scan
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          mkdir -p nikto-reports
-          for domain in $NEW_DOMAINS; do
-            echo "🔬 Nikto scanning $domain"
-            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || echo "Nikto done"
-          done
-
-      - name: Run Nuclei Scan
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          mkdir -p nuclei-reports
-          for domain in $NEW_DOMAINS; do
-            echo "💣 Nuclei scanning $domain"
-            nuclei -u "https://$domain" -severity critical,high,medium,low,info -j -o "nuclei-reports/nuclei-${domain//./_}.json" -timeout 30 -silent || echo "Nuclei done"
-          done
-
-      - name: Generate Summary Reports
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          mkdir -p summaries
-          echo "domain,severity,name,url" > summaries/nuclei-findings.csv
-          for file in nuclei-reports/*.json; do
-            jq -r '[.host, .info.severity, .info.name, .matched] | @csv' "$file" >> summaries/nuclei-findings.csv
-          done
-          echo "<html><body><h1>Scan Summary</h1><table border='1'><tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th></tr>" > summaries/nuclei-summary.html
-          tail -n +2 summaries/nuclei-findings.csv | while IFS=',' read -r domain severity name url; do
-            echo "<tr><td>$domain</td><td>$severity</td><td>$name</td><td><a href='$url'>$url</a></td></tr>" >> summaries/nuclei-summary.html
-          done
-          echo "</table></body></html>" >> summaries/nuclei-summary.html
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        if: env.new_subdomains_detected == 'true'
-        with:
-          name: scan-results-${{ github.run_id }}
-          path: |
-            summaries/*
-            nikto-reports/*
-            nuclei-reports/*
-            fingerprints/*
-
-      - name: Create GitHub Issues for Critical/High
-        if: env.new_subdomains_detected == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for file in nuclei-reports/*.json; do
-            jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
-              title=$(echo "$vuln" | jq -r '.info.name')
-              url=$(echo "$vuln" | jq -r '.matched')
-              severity=$(echo "$vuln" | jq -r '.info.severity')
-              body="**Severity**: $severity%0A**URL**: $url%0A**Template**: $(echo "$vuln" | jq -r '.template')"
-              gh issue create --title "$title [$severity]" --body "$body" --label "bug,bounty,auto-created"
-            done
-          done
+          echo "new_subdomains_detected=$([ ${#new_subdomains_found[@]} -gt 0 ] && echo true || echo false)" >> $GITHUB_ENV
 
       - name: Notify Slack of Critical/High Findings
         if: env.new_subdomains_detected == 'true'
@@ -198,6 +119,6 @@ jobs:
               severity=$(echo "$vuln" | jq -r '.info.severity')
               curl -X POST -H 'Content-type: application/json' \
                 --data "{\"text\":\"⚠️ *Critical/High vulnerability detected!*\\n*Domain:* $domain\\n*Severity:* $severity\\n*Name:* $title\\n*URL:* $url\"}" \
-                ${{ secrets.SLACK_WEBHOOK_URL }}
+                ${{ secrets.SLACK_HOOK }}
             done
           done

@@ -17,20 +17,22 @@ on:
     - cron: '53 14 * * *'
     - cron: '11 18 * * *'
 
-env:
-  SCAN_TIMEOUT: 120
-  NUCLEI_TIMEOUT: 60
-  ZAP_TIMEOUT: 1800
-  MAX_CONCURRENT_SCANS: 3
-
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ env.SCAN_TIMEOUT }}
+    timeout-minutes: 120  # Default timeout, can be overridden with env later
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Initialize environment variables
+        id: set-env
+        run: |
+          echo "SCAN_TIMEOUT=120" >> $GITHUB_ENV
+          echo "NUCLEI_TIMEOUT=60" >> $GITHUB_ENV
+          echo "ZAP_TIMEOUT=1800" >> $GITHUB_ENV
+          echo "MAX_CONCURRENT_SCANS=3" >> $GITHUB_ENV
 
       - name: Setup domains input
         id: domains-input
@@ -94,6 +96,7 @@ jobs:
 
       - name: Detect subdomains (with multi-domain diffing)
         id: subdomain-detection
+        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           set -eo pipefail
           mkdir -p subdomain_output old_subdomains
@@ -151,21 +154,22 @@ jobs:
           mkdir -p .github/zap
           if [ ! -f ".github/zap/plan.yml" ]; then
             cat << EOF > .github/zap/plan.yml
-            plans:
-              - name: "Default Scan"
-                parameters:
-                  target: "https://TARGET_DOMAIN"
-                  rules:
-                    - "scan_rules/automatic"
-                context:
-                  name: "Default Context"
-                  includePaths:
-                    - "https://TARGET_DOMAIN/.*"
-            EOF
+plans:
+  - name: "Default Scan"
+    parameters:
+      target: "https://TARGET_DOMAIN"
+      rules:
+        - "scan_rules/automatic"
+    context:
+      name: "Default Context"
+      includePaths:
+        - "https://TARGET_DOMAIN/.*"
+EOF
           fi
 
       - name: Run port scans with Naabu
         if: env.new_subdomains_detected == 'true'
+        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           mkdir -p port-scans
           for domain in $CHANGED_DOMAINS; do
@@ -187,6 +191,7 @@ jobs:
 
       - name: Run Nikto Scan
         if: env.new_subdomains_detected == 'true'
+        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           mkdir -p nikto-reports
           for domain in $CHANGED_DOMAINS; do
@@ -210,6 +215,7 @@ jobs:
 
       - name: Generate Summary Reports
         if: env.new_subdomains_detected == 'true'
+        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           mkdir -p summaries
           
@@ -221,25 +227,25 @@ jobs:
           
           # Create HTML report
           cat << EOF > summaries/nuclei-summary.html
-          <html>
-          <head>
-            <title>Vulnerability Scan Report</title>
-            <style>
-              body { font-family: Arial, sans-serif; margin: 20px; }
-              table { border-collapse: collapse; width: 100%; }
-              th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-              tr:nth-child(even) { background-color: #f2f2f2; }
-              .critical { background-color: #ffcccc; }
-              .high { background-color: #ffe6cc; }
-              .medium { background-color: #ffffcc; }
-              .low { background-color: #e6ffcc; }
-            </style>
-          </head>
-          <body>
-            <h1>Vulnerability Scan Summary</h1>
-            <table>
-              <tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th><th>Description</th></tr>
-          EOF
+<html>
+<head>
+  <title>Vulnerability Scan Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    tr:nth-child(even) { background-color: #f2f2f2; }
+    .critical { background-color: #ffcccc; }
+    .high { background-color: #ffe6cc; }
+    .medium { background-color: #ffffcc; }
+    .low { background-color: #e6ffcc; }
+  </style>
+</head>
+<body>
+  <h1>Vulnerability Scan Summary</h1>
+  <table>
+    <tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th><th>Description</th></tr>
+EOF
           
           tail -n +2 summaries/nuclei-findings.csv | while IFS=',' read -r domain severity name url template description; do
             severity_class=$(echo "$severity" | tr '[:upper:]' '[:lower:]')
@@ -273,6 +279,7 @@ jobs:
         if: env.new_subdomains_detected == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           for file in nuclei-reports/*.json; do
             jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
@@ -287,12 +294,12 @@ jobs:
               
               if [ -z "$existing_issue" ]; then
                 body=$(cat << EOF
-                **Severity**: $severity  
-                **URL**: $url  
-                **Template**: $template  
-                **Description**: $description  
-                **Domain**: $(basename "$file" | sed 's/nuclei-\(.*\)\.json/\1/' | tr '_' '.')
-                EOF
+**Severity**: $severity  
+**URL**: $url  
+**Template**: $template  
+**Description**: $description  
+**Domain**: $(basename "$file" | sed 's/nuclei-\(.*\)\.json/\1/' | tr '_' '.')
+EOF
                 )
                 
                 gh issue create --title "$title [$severity]" --body "$body" --label "bug,bounty,auto-created,$severity"
@@ -304,6 +311,7 @@ jobs:
 
       - name: Notify Slack of Critical/High Findings
         if: env.new_subdomains_detected == 'true'
+        timeout-minutes: ${{ env.SCAN_TIMEOUT }}
         run: |
           critical_count=0
           high_count=0

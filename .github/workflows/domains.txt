@@ -1,5 +1,1 @@
-wiki.shopify.com 
-static.shopify.com 
-m.shopify.com 
-ssl.shopify.com
-
+api.shopify.com 

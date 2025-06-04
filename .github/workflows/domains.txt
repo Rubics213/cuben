@@ -1,15 +1,4 @@
 login.community-stage.shopify.com
-staging-pt50.data.shopify.com
-staging-api.collabs.shopify.com
-ssl.shopify.com
-console1.toronto.shopify.com
-app-store-staging-sonic.shopify.com
-accounts.shopify.com
-dev.shopify.com
-tration.shopify.com
-changelog.shopify.com
-admin-gtm.shopify.com
-notifications.shopify.com
 customer.login.shopify.com
 
 geolocation-proxy-staging.shopify.com
@@ -23,3 +12,8 @@ state-of-deliver.shopify.com
 smtp4.shopify.com
 staging-vats.data.shopify.com
 collabs-merchants-staging.shopify.com
+austone.shopify.com
+data.shopify.com
+mc-proxy.shopify.com
+jfkt.github.shopify.com
+static.shopify.com

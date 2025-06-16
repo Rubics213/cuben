@@ -78,37 +78,13 @@ jobs:
             fi
           done
 
-          # --- Start github-endpoints installation ---
-          echo "Attempting to download github-endpoints 'main' branch ZIP directly..."
-          GITHUB_ENDPOINTS_DIRECT_ZIP_URL="https://github.com/initstring/github-endpoints/archive/refs/heads/main.zip"
-          
-          if wget --tries=5 --wait=5 "$GITHUB_ENDPOINTS_DIRECT_ZIP_URL" -O /tmp/github-endpoints-main.zip; then
-            echo "Successfully downloaded github-endpoints 'main' branch ZIP."
-            UNZIPPED_DIR=$(unzip -q -o /tmp/github-endpoints-main.zip -d /tmp/ | head -n 1 | awk -F'/' '{print $2}')
-            
-            if [ -z "$UNZIPPED_DIR" ]; then
-              echo "ERROR: Failed to determine extracted directory name for github-endpoints ZIP."
-              exit 1
-            fi
-
-            pip3 install "/tmp/$UNZIPPED_DIR" || { echo "ERROR: Failed to install github-endpoints from ZIP."; exit 1; }
-            rm /tmp/github-endpoints-main.zip
-            rm -rf "/tmp/$UNZIPPED_DIR"
+          # --- Start github-endpoints installation (more robust method) ---
+          echo "Installing github-endpoints directly via pip from Git repository..."
+          if pip3 install git+https://github.com/initstring/github-endpoints.git; then
             echo "github-endpoints installed successfully."
           else
-            echo "WARNING: Direct ZIP download for github-endpoints failed. Falling back to Git clone."
-            # Fallback Option: Clone the repository directly
-            echo "Cloning github-endpoints repository..."
-            GIT_REPO_DIR="/tmp/github-endpoints-repo"
-            if git clone https://github.com/initstring/github-endpoints.git "$GIT_REPO_DIR"; then
-              echo "Successfully cloned github-endpoints repository."
-              pip3 install "$GIT_REPO_DIR" || { echo "ERROR: Failed to install github-endpoints from cloned repository."; exit 1; }
-              rm -rf "$GIT_REPO_DIR"
-              echo "github-endpoints installed successfully via Git clone."
-            else
-              echo "ERROR: Failed to clone github-endpoints repository. Cannot install."
-              exit 1
-            fi
+            echo "ERROR: Failed to install github-endpoints via pip. Cannot proceed."
+            exit 1
           fi
           # --- End github-endpoints installation ---
 
@@ -122,6 +98,12 @@ jobs:
           chmod +x findomain
           sudo mv findomain /usr/local/bin/findomain || { echo "ERROR: Failed to move Findomain to /usr/local/bin."; exit 1; }
           echo "Findomain installed successfully."
+
+          # Install dirsearch
+          echo "Installing dirsearch..."
+          git clone https://github.com/dirsearch/dirsearch.git /opt/dirsearch
+          sudo ln -s /opt/dirsearch/dirsearch.py /usr/local/bin/dirsearch
+          echo "dirsearch installed successfully."
 
           # Update Nuclei templates to the latest version
           echo "Updating Nuclei templates..."
@@ -231,38 +213,6 @@ jobs:
             echo "new_subdomains_detected=false" >> $GITHUB_ENV
           fi
 
-      - name: Prepare ZAP plan
-        run: |
-          mkdir -p .github/zap
-          # Create a default ZAP plan if it doesn't exist
-          if [ ! -f ".github/zap/plan.yml" ]; then
-            printf "%s\n" \
-              "plans:" \
-              "  - name: \"Default Scan\"" \
-              "    parameters:" \
-              "      target: \"https://TARGET_DOMAIN\"" \
-              "      rules:" \
-              "        - \"scan_rules/automatic\"" \
-              "    context:" \
-              "      name: \"Default Context\"" \
-              "      includePaths:" \
-              "        - \"https://TARGET_DOMAIN/.*\"" \
-              > .github/zap/plan.yml
-          fi
-
-      - name: Run ZAP Scan (Dynamic Targets)
-        if: env.new_subdomains_detected == 'true'
-        run: |
-          for domain in $NEW_DOMAINS; do
-            echo "🕷️ Running ZAP scan for $domain"
-            # Replace placeholder with current domain for ZAP scan
-            sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
-            # Run ZAP scan. Use || echo to prevent job failure on ZAP's internal errors.
-            docker run --rm -v "$(pwd)":/zap/wrk -t ghcr.io/zaproxy/action-full-scan:latest -c .github/zap/plan.yml || echo "ZAP scan completed for $domain (may have reported issues or exited non-zero)"
-            # Revert placeholder for the next iteration
-            sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
-          done
-
       - name: Take Web Screenshots
         if: env.new_subdomains_detected == 'true'
         run: |
@@ -286,6 +236,28 @@ jobs:
             echo "🔬 Nikto scanning $domain"
             # Nikto can be verbose; output to HTML and allow non-zero exit for no findings.
             nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || echo "Nikto scan completed for $domain (no critical issues or general exit)"
+          done
+
+      - name: Run Dirsearch Scan
+        if: env.new_subdomains_detected == 'true'
+        run: |
+          mkdir -p dirsearch-reports
+          for domain in $NEW_DOMAINS; do
+            echo "📂 Running dirsearch on $domain"
+            subdomains_file="subdomain_output/${domain//./_}_subdomains.txt"
+            if [ -f "$subdomains_file" ]; then
+              # Iterate through live subdomains and run dirsearch against each
+              # Using -f for full URLs, -o for output, --simple-report for clean text output
+              cat "$subdomains_file" | while read -r url; do
+                if [[ "$url" == http* ]]; then # Only scan actual HTTP(S) URLs
+                  echo "  Scanning: $url"
+                  # Run dirsearch.py with common wordlists, increased threads, and custom output
+                  python3 /opt/dirsearch/dirsearch.py -u "$url" -w /opt/dirsearch/db/dicc.txt -t 20 --plain-text-report="dirsearch-reports/dirsearch-${url//[^a-zA-Z0-9]/_}.txt" || true
+                fi
+              done
+            else
+              echo "No active subdomains file found for $domain for Dirsearch scan. Skipping."
+            fi
           done
 
       - name: Run Nuclei Scan (Targeted and Deep)
@@ -346,6 +318,17 @@ jobs:
           done
           echo "</ul>" >> summaries/nikto-summary.html
 
+          echo "<h2>Dirsearch Reports (Plain Text)</h2>" >> summaries/dirsearch-summary.html
+          echo "<ul>" >> summaries/dirsearch-summary.html
+          for file in dirsearch-reports/*.txt; do
+              if [ -s "$file" ]; then # Check if file is not empty
+                  filename=$(basename "$file")
+                  echo "<li><a href='../dirsearch-reports/$filename'>$filename</a></li>" >> summaries/dirsearch-summary.html
+              fi
+          done
+          echo "</ul>" >> summaries/dirsearch-summary.html
+
+
           echo "<h2>Web Screenshots</h2>" >> summaries/screenshots-summary.html
           echo "<ul>" >> summaries/screenshots-summary.html
           # Find all PNG files in the screenshots directory and link them
@@ -366,6 +349,7 @@ jobs:
             summaries/*
             nikto-reports/*
             nuclei-reports/*
+            dirsearch-reports/*
             screenshots/*
             subdomain_output/* # Upload subdomain lists for review
             old_subdomains/* # Upload old subdomain lists for state persistence if needed externally

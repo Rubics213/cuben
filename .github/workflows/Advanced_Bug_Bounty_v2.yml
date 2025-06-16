@@ -57,10 +57,14 @@ jobs:
           # Move Go binaries to a common PATH for easy access
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder,gau,katana,gowitness} /usr/local/bin/
 
-          # --- FIX: Manual clone and install for github-endpoints to bypass authentication issues ---
-          echo "Manually cloning and installing github-endpoints to bypass pip/git authentication issues..."
-          git clone --depth 1 https://github.com/initstring/github-endpoints.git /tmp/github-endpoints-repo
-          pip3 install -e /tmp/github-endpoints-repo
+          # --- FIX: Download and install github-endpoints as ZIP to bypass Git clone issues ---
+          echo "Downloading and installing github-endpoints from ZIP to bypass Git authentication issues..."
+          wget -q https://github.com/initstring/github-endpoints/archive/refs/heads/main.zip -O /tmp/github-endpoints.zip
+          unzip -q /tmp/github-endpoints.zip -d /tmp/
+          pip3 install /tmp/github-endpoints-main
+          # Clean up downloaded zip and extracted folder
+          rm /tmp/github-endpoints.zip
+          rm -rf /tmp/github-endpoints-main
           # --- END FIX ---
 
           # Install Findomain

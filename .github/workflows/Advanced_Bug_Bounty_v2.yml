@@ -57,6 +57,12 @@ jobs:
           # Move Go binaries to a common PATH for easy access
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder,gau,katana,gowitness} /usr/local/bin/
 
+          # Configure Git to not prompt for username/password for github.com during pip install
+          # This helps avoid 'could not read Username' errors for public repos
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://".insteadOf "git://"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
           # Install github-endpoints (Python tool for org-wide discovery)
           pip3 install git+https://github.com/initstring/github-endpoints.git
 

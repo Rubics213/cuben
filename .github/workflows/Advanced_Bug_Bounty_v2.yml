@@ -1,4 +1,44 @@
-- name: Install scanning dependencies
+name: Advanced Bug Bounty Scanner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '13 1 * * *' # Every day at 01:13 UTC
+    - cron: '47 5 * * *' # Every day at 05:47 UTC
+    - cron: '29 9 * * *' # Every day at 09:29 UTC
+    - cron: '53 14 * * *' # Every day at 14:53 UTC
+    - cron: '11 18 * * *' # Every day at 18:11 UTC
+
+jobs:
+  vulnerability-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180 # Increased timeout to 3 hours for comprehensive scans
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go
+          key: <span class="math-inline">\{\{ runner\.os \}\}\-go\-</span>{{ hashFiles('go.mod') }} # Caches Go modules, adjust if you have a go.mod
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: <span class="math-inline">\{\{ runner\.os \}\}\-apt\-</span>{{ hashFiles('.github/workflows/Advanced_Bug_Bounty_Scanner.yml') }} # Invalidates cache if workflow dependencies change
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Install scanning dependencies
         run: |
           # Enable command tracing for detailed debugging output
           set -x
@@ -38,13 +78,13 @@
             fi
           done
 
-          # --- Attempt 1 (Preferred): Directly download 'main' branch ZIP ---
+          # --- Start github-endpoints installation ---
           echo "Attempting to download github-endpoints 'main' branch ZIP directly..."
           GITHUB_ENDPOINTS_DIRECT_ZIP_URL="https://github.com/initstring/github-endpoints/archive/refs/heads/main.zip"
           
-          if wget --tries=5 --wait=5 "$GITHUB_ENDPOINTS_DIRECT_ZIP_URL" -O /tmp/github-endpoints-main.zip; then
-            echo "Successfully downloaded github-endpoints 'main' branch ZIP."
-            UNZIPPED_DIR=$(unzip -q -o /tmp/github-endpoints-main.zip -d /tmp/ | head -n 1 | awk -F'/' '{print $2}')
+          if wget --tries=5 --wait=5 "<span class="math-inline">GITHUB\_ENDPOINTS\_DIRECT\_ZIP\_URL" \-O /tmp/github\-endpoints\-main\.zip; then
+echo "Successfully downloaded github\-endpoints 'main' branch ZIP\."
+UNZIPPED\_DIR\=</span>(unzip -q -o /tmp/github-endpoints-main.zip -d /tmp/ | head -n 1 | awk -F'/' '{print $2}')
             
             if [ -z "$UNZIPPED_DIR" ]; then
               echo "ERROR: Failed to determine extracted directory name for github-endpoints ZIP."
@@ -57,7 +97,7 @@
             echo "github-endpoints installed successfully."
           else
             echo "WARNING: Direct ZIP download for github-endpoints failed. Falling back to Git clone."
-            # --- Fallback Option 2: Clone the repository directly ---
+            # Fallback Option: Clone the repository directly
             echo "Cloning github-endpoints repository..."
             GIT_REPO_DIR="/tmp/github-endpoints-repo"
             if git clone https://github.com/initstring/github-endpoints.git "$GIT_REPO_DIR"; then
@@ -70,7 +110,7 @@
               exit 1
             fi
           fi
-          # --- END github-endpoints installation ---
+          # --- End github-endpoints installation ---
 
           # Install Findomain
           echo "Installing Findomain..."
@@ -87,3 +127,22 @@
           echo "Updating Nuclei templates..."
           nuclei -update-templates -silent || { echo "WARNING: Nuclei template update failed."; }
           echo "Nuclei templates updated."
+
+      - name: Log in to GitHub Container Registry
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Prepare Initial Target List (domains.txt / organizations.txt)
+        id: prepare-targets
+        run: |
+          # Verify that at least one target file exists
+          if [ ! -f ".github/workflows/domains.txt" ] && [ ! -f ".github/workflows/organizations.txt" ]; then
+            echo "ERROR: Neither .github/workflows/domains.txt nor .github/workflows/organizations.txt file found! Exiting."
+            exit 1
+          fi # Corrected syntax here
+
+          # Create a temporary file to store all discovered domains for this run
+          discovered_domains_file="temp_discovered_domains.txt"
+          touch "$discovered_domains_file"
+
+          # Add domains from the static domains.txt file if it exists
+          if [ -f ".github/workflows/domains.txt" ];

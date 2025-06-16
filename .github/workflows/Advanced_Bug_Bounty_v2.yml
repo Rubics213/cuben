@@ -7,16 +7,16 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '13 1 * * *'
-    - cron: '47 5 * * *'
-    - cron: '29 9 * * *'
-    - cron: '53 14 * * *'
-    - cron: '11 18 * * *'
+    - cron: '13 1 * * *' # Every day at 01:13 UTC
+    - cron: '47 5 * * *' # Every day at 05:47 UTC
+    - cron: '29 9 * * *' # Every day at 09:29 UTC
+    - cron: '53 14 * * *' # Every day at 14:53 UTC
+    - cron: '11 18 * * *' # Every day at 18:11 UTC
 
 jobs:
   vulnerability-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 180 # Increased timeout due to added tools and deeper scanning
+    timeout-minutes: 180 # Increased timeout to 3 hours for comprehensive scans
 
     steps:
       - name: Checkout code
@@ -26,7 +26,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/go
-          key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }} # Adjust if you have a go.mod, otherwise use a static key or hash other relevant files
+          key: ${{ runner.os }}-go-${{ hashFiles('go.mod') }} # Caches Go modules, adjust if you have a go.mod
           restore-keys: |
             ${{ runner.os }}-go-
 
@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/advanced_bug_bounty_scanner.yml') }} # Hash the workflow file for cache invalidation on dependency changes
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/Advanced_Bug_Bounty_Scanner.yml') }} # Invalidates cache if workflow dependencies change
           restore-keys: |
             ${{ runner.os }}-apt-
 
@@ -54,10 +54,10 @@ jobs:
           go install github.com/projectdiscovery/katana/cmd/katana@latest
           go install github.com/sensepost/gowitness@latest # For web screenshots
 
-          # Move Go binaries to a common PATH
+          # Move Go binaries to a common PATH for easy access
           sudo mv ~/go/bin/{assetfinder,nuclei,httpx,subfinder,gau,katana,gowitness} /usr/local/bin/
 
-          # Install github-endpoints (Python tool)
+          # Install github-endpoints (Python tool for org-wide discovery)
           pip3 install git+https://github.com/initstring/github-endpoints.git
 
           # Install Findomain
@@ -69,7 +69,7 @@ jobs:
           chmod +x findomain
           sudo mv findomain /usr/local/bin/findomain
 
-          # Update Nuclei templates
+          # Update Nuclei templates to the latest version
           nuclei -update-templates -silent
 
       - name: Log in to GitHub Container Registry
@@ -78,27 +78,27 @@ jobs:
       - name: Prepare Initial Target List (domains.txt / organizations.txt)
         id: prepare-targets
         run: |
-          # Check for domains.txt or organizations.txt
+          # Verify that at least one target file exists
           if [ ! -f ".github/workflows/domains.txt" ] && [ ! -f ".github/workflows/organizations.txt" ]; then
-            echo "ERROR: Neither .github/workflows/domains.txt nor .github/workflows/organizations.txt file found!"
+            echo "ERROR: Neither .github/workflows/domains.txt nor .github/workflows/organizations.txt file found! Exiting."
             exit 1
           fi
 
-          # Create a temporary file for discovered domains
+          # Create a temporary file to store all discovered domains for this run
           discovered_domains_file="temp_discovered_domains.txt"
           touch "$discovered_domains_file"
 
-          # Add existing domains from domains.txt (if it exists)
+          # Add domains from the static domains.txt file if it exists
           if [ -f ".github/workflows/domains.txt" ]; then
-            echo "Initial target domains from .github/workflows/domains.txt:"
+            echo "Loading initial target domains from .github/workflows/domains.txt:"
             cat .github/workflows/domains.txt >> "$discovered_domains_file"
             sort -u "$discovered_domains_file" -o "$discovered_domains_file" # Deduplicate
             sed -i '/^$/d' "$discovered_domains_file" # Remove empty lines
-            echo "Current merged list:"
+            echo "Current merged list after domains.txt:"
             cat "$discovered_domains_file"
           fi
 
-          # Dynamic Scope Discovery from organizations.txt (if it exists)
+          # Perform dynamic scope discovery from organizations.txt if it exists
           if [ -f ".github/workflows/organizations.txt" ]; then
             echo "Starting dynamic discovery from .github/workflows/organizations.txt..."
             while IFS= read -r org; do
@@ -107,52 +107,50 @@ jobs:
 
               echo "🔍 Discovering domains for organization: $org"
 
-              # Use github-endpoints to find domains in public repos
+              # Use github-endpoints to find domains in public GitHub repositories
               echo "Running github-endpoints for $org..."
               github-endpoints -o "$org" -m "domains" | httpx -silent >> "$discovered_domains_file" || true
 
-              # Find domains via assetfinder (uses crt.sh, passive sources, etc.)
+              # Use assetfinder for broad passive domain discovery (includes crt.sh, etc.)
               echo "Running assetfinder for $org..."
               assetfinder --subs-only "$org" | httpx -silent >> "$discovered_domains_file" || true
 
             done < .github/workflows/organizations.txt
           fi
 
-          # Final deduplication and cleanup
+          # Final deduplication and cleanup of the combined domain list
           sort -u "$discovered_domains_file" -o "$discovered_domains_file"
           sed -i '/^$/d' "$discovered_domains_file"
 
-          echo "Final target domains for this run:"
+          echo "Final list of domains for subdomain enumeration and scanning:"
           cat "$discovered_domains_file"
 
-          # Overwrite domains.txt with the comprehensive list for the next step and future runs
+          # Overwrite domains.txt with the comprehensive list for subsequent steps and next runs
           mv "$discovered_domains_file" .github/workflows/domains.txt
 
       - name: Detect subdomains (with multi-domain diffing)
         id: subdomain-detection
         run: |
-          set -e
+          set -e # Exit immediately if a command exits with a non-zero status.
           mkdir -p subdomain_output old_subdomains
           new_subdomains_found=()
-
-          # Ensure old_subdomains directory exists and potentially populate from artifact (if implemented)
-          # For simplicity here, we assume if it's not present, it's the first run or a fresh clone.
 
           while IFS= read -r domain; do
             domain=$(echo "$domain" | tr -d '\r\n')
             if [ -z "$domain" ]; then continue; fi # Skip empty lines
+
             echo "🔎 Processing $domain"
             output_file="subdomain_output/${domain//./_}_subdomains.txt"
-            touch "$output_file" # Ensure file exists before appending
+            touch "$output_file" # Ensure output file exists for appending
 
-            # Run multiple subdomain enumeration tools
+            # Run multiple subdomain enumeration tools and probe for live hosts
             assetfinder --subs-only "$domain" | httpx -silent >> "$output_file" || true
             subfinder -d "$domain" -silent >> "$output_file" || true
             findomain -t "$domain" --quiet >> "$output_file" || true
             gau "$domain" | grep "^\(http\|https\)" | httpx -silent >> "$output_file" || true # Passive URLs and subdomains
 
-            sort -u "$output_file" -o "$output_file"
-            sed -i '/^$/d' "$output_file" # Remove empty lines
+            sort -u "$output_file" -o "$output_file" # Sort and unique the results
+            sed -i '/^$/d' "$output_file" # Remove any lingering empty lines
 
             old_file="old_subdomains/${domain//./_}_old_subdomains.txt"
             if [ ! -f "$old_file" ]; then
@@ -161,14 +159,14 @@ jobs:
               new_subdomains_found+=("$domain")
             else
               if ! diff -q "$output_file" "$old_file" > /dev/null; then
-                echo "🔥 New subdomains detected for $domain!"
+                echo "🔥 New subdomains detected for $domain! Triggering deeper scans."
                 new_subdomains_found+=("$domain")
-                cp "$output_file" "$old_file"
+                cp "$output_file" "$old_file" # Update old results with new ones
               else
                 echo "✅ No new subdomains for $domain"
               fi
             fi
-          done < .github/workflows/domains.txt # Read from the potentially updated domains.txt
+          done < .github/workflows/domains.txt # Read from the consolidated domains.txt
 
           echo "NEW_DOMAINS=${new_subdomains_found[*]}" >> $GITHUB_ENV
           if [ "${#new_subdomains_found[@]}" -gt 0 ]; then
@@ -180,6 +178,7 @@ jobs:
       - name: Prepare ZAP plan
         run: |
           mkdir -p .github/zap
+          # Create a default ZAP plan if it doesn't exist
           if [ ! -f ".github/zap/plan.yml" ]; then
             printf "%s\n" \
               "plans:" \
@@ -200,10 +199,12 @@ jobs:
         run: |
           for domain in $NEW_DOMAINS; do
             echo "🕷️ Running ZAP scan for $domain"
+            # Replace placeholder with current domain for ZAP scan
             sed -i "s|TARGET_DOMAIN|$domain|g" .github/zap/plan.yml
-            # Use '|| true' here so a ZAP internal error doesn't fail the entire workflow
-            docker run --rm -v "$(pwd)":/zap/wrk -t ghcr.io/zaproxy/action-full-scan:latest -c .github/zap/plan.yml || echo "ZAP scan completed for $domain (may have errors)"
-            sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml # Revert change for next loop iteration
+            # Run ZAP scan. Use || echo to prevent job failure on ZAP's internal errors.
+            docker run --rm -v "$(pwd)":/zap/wrk -t ghcr.io/zaproxy/action-full-scan:latest -c .github/zap/plan.yml || echo "ZAP scan completed for $domain (may have reported issues or exited non-zero)"
+            # Revert placeholder for the next iteration
+            sed -i "s|$domain|TARGET_DOMAIN|g" .github/zap/plan.yml
           done
 
       - name: Take Web Screenshots
@@ -227,8 +228,8 @@ jobs:
           mkdir -p nikto-reports
           for domain in $NEW_DOMAINS; do
             echo "🔬 Nikto scanning $domain"
-            # Nikto can be noisy; using -nointeractive and allowing it to "fail" gracefully if no findings
-            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || echo "Nikto scan completed for $domain"
+            # Nikto can be verbose; output to HTML and allow non-zero exit for no findings.
+            nikto -h "https://$domain" -Format htm -output "nikto-reports/nikto-${domain//./_}.html" -nointeractive || echo "Nikto scan completed for $domain (no critical issues or general exit)"
           done
 
       - name: Run Nuclei Scan (Targeted and Deep)
@@ -239,17 +240,18 @@ jobs:
             echo "💣 Nuclei scanning $domain"
             subdomains_file="subdomain_output/${domain//./_}_subdomains.txt"
             if [ -f "$subdomains_file" ]; then
-              # Active crawling with katana to get more URLs
+              # Active crawling with katana to get more URLs within the domain
               echo "Crawling $domain with katana for deeper Nuclei scan..."
               katana -u "https://$domain" -silent -d 3 -jc -o "katana_urls_for_${domain//./_}.txt" || true
               
-              # Combine subdomains and crawled URLs for Nuclei input
+              # Combine live subdomains and crawled URLs for Nuclei input
               cat "$subdomains_file" "katana_urls_for_${domain//./_}.txt" | sort -u > "all_targets_for_nuclei_${domain//./_}.txt"
               
               # Run Nuclei on the combined list of URLs/domains
               nuclei -l "all_targets_for_nuclei_${domain//./_}.txt" -severity critical,high,medium,low,info -j -o "nuclei-reports/nuclei-${domain//./_}.json" -timeout 60 -silent || echo "Nuclei scan completed for $domain"
 
-              rm -f "katana_urls_for_${domain//./_}.txt" "all_targets_for_nuclei_${domain//./_}.txt" # Clean up temp files
+              # Clean up temporary files
+              rm -f "katana_urls_for_${domain//./_}.txt" "all_targets_for_nuclei_${domain//./_}.txt"
             else
               echo "No active subdomains file found for $domain for Nuclei scan. Skipping."
             fi
@@ -269,7 +271,7 @@ jobs:
           echo "<html><body><h1>Scan Summary</h1>" > summaries/nuclei-summary.html
           echo "<h2>Nuclei Findings (Critical/High/Medium/Low/Info)</h2>" >> summaries/nuclei-summary.html
           echo "<table border='1'><tr><th>Domain</th><th>Severity</th><th>Name</th><th>URL</th></tr>" >> summaries/nuclei-summary.html
-          if [ -s summaries/nuclei-findings.csv ]; then # Check if CSV is not empty
+          if [ -s summaries/nuclei-findings.csv ]; then # Check if CSV has data
             tail -n +2 summaries/nuclei-findings.csv | while IFS=',' read -r domain severity name url; do
               echo "<tr><td>$domain</td><td>$severity</td><td>$name</td><td><a href='$url'>$url</a></td></tr>" >> summaries/nuclei-summary.html
             done
@@ -281,7 +283,7 @@ jobs:
           echo "<h2>Nikto Scan Reports (HTML)</h2>" >> summaries/nikto-summary.html
           echo "<ul>" >> summaries/nikto-summary.html
           for file in nikto-reports/*.html; do
-              if [ -s "$file" ]; then
+              if [ -s "$file" ]; then # Check if file is not empty
                   filename=$(basename "$file")
                   echo "<li><a href='../nikto-reports/$filename'>$filename</a></li>" >> summaries/nikto-summary.html
               fi
@@ -290,11 +292,11 @@ jobs:
 
           echo "<h2>Web Screenshots</h2>" >> summaries/screenshots-summary.html
           echo "<ul>" >> summaries/screenshots-summary.html
+          # Find all PNG files in the screenshots directory and link them
           find screenshots -name "*.png" | sed 's|^screenshots/||' | while read -r img_path; do
               echo "<li><a href='../screenshots/$img_path'>$img_path</a></li>" >> summaries/screenshots-summary.html
           done
           echo "</ul>" >> summaries/screenshots-summary.html
-
 
           echo "</body></html>" >> summaries/nuclei-summary.html
 
@@ -309,7 +311,8 @@ jobs:
             nikto-reports/*
             nuclei-reports/*
             screenshots/*
-            subdomain_output/* # Keep the subdomain output for review
+            subdomain_output/* # Upload subdomain lists for review
+            old_subdomains/* # Upload old subdomain lists for state persistence if needed externally
 
       - name: Create GitHub Issues for Critical/High
         if: env.new_subdomains_detected == 'true'
@@ -317,7 +320,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for file in nuclei-reports/*.json; do
-            if [ -s "$file" ]; then # Check if file is not empty
+            if [ -s "$file" ]; then # Process only if the Nuclei report file is not empty
               jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
                 title=$(echo "$vuln" | jq -r '.info.name')
                 url=$(echo "$vuln" | jq -r '.matched')
@@ -325,8 +328,8 @@ jobs:
                 template=$(echo "$vuln" | jq -r '.template') # Include template ID for better context
                 body="**Severity**: $severity%0A**URL**: $url%0A**Template**: $template%0A**Found in Workflow Run**: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
                 
-                # Deduplication logic (basic - checks open issues with same title)
-                # More advanced would involve a state file or querying specific labels/bodies
+                # Basic deduplication: Check for an existing open issue with the same title
+                # This is a simple check; for robust deduplication, you might need to track findings in a database.
                 existing_issue=$(gh issue list --search "is:open in:title \"$title [$severity]\"" --json number --jq '.[0].number' || true)
                 if [ -z "$existing_issue" ]; then
                   echo "Creating GitHub issue for: $title [$severity]"
@@ -339,11 +342,18 @@ jobs:
           done
 
       - name: Notify Slack of Critical/High Findings
-        if: env.new_subdomains_detected == 'true' && success() && secrets.SLACK_WEBHOOK_URL # Only if Slack URL is set
+        if: env.new_subdomains_detected == 'true' && success() # Run only if new subdomains were detected and previous steps succeeded
         run: |
+          # Check if the SLACK_WEBHOOK_URL secret is provided.
+          # We check it here in the `run` block because `secrets` cannot be directly accessed in `if:` conditionals.
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "SLACK_WEBHOOK_URL secret is not configured. Skipping Slack notifications."
+            exit 0 # Exit this step successfully if the secret isn't there
+          fi
+
           NOTIFICATIONS_SENT=false
           for file in nuclei-reports/*.json; do
-            if [ -s "$file" ]; then # Check if file is not empty
+            if [ -s "$file" ]; then # Process only if the Nuclei report file is not empty
               jq -c 'select(.info.severity == "critical" or .info.severity == "high")' "$file" | while read -r vuln; do
                 domain=$(echo "$vuln" | jq -r '.host' | sed 's|https://||;s|http://||;s|/.*||') # Extract base domain
                 title=$(echo "$vuln" | jq -r '.info.name')
@@ -356,12 +366,12 @@ jobs:
                 echo "Sending Slack notification for: $title ($severity) on $domain"
                 curl -X POST -H 'Content-type: application/json' \
                   --data "$SLACK_MESSAGE" \
-                  "${{ secrets.SLACK_WEBHOOK_URL }}" || true # Use || true to prevent job failure if Slack fails
+                  "${{ secrets.SLACK_WEBHOOK_URL }}" || true # Use || true to prevent job failure if Slack API call fails
                 NOTIFICATIONS_SENT=true
               done
             fi
           done
 
           if [ "$NOTIFICATIONS_SENT" = false ]; then
-            echo "No Critical/High findings to notify Slack about."
+            echo "No Critical/High findings to notify Slack about for this run."
           fi

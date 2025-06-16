@@ -78,15 +78,32 @@ jobs:
             fi
           done
 
-          # --- FIX: Download and install github-endpoints as ZIP to bypass Git clone issues ---
-          echo "Downloading and installing github-endpoints from ZIP to bypass Git authentication issues..."
-          # Removed -q for more verbose output, added retries and wait
-          wget --tries=5 --wait=5 https://github.com/initstring/github-endpoints/archive/refs/heads/main.zip -O /tmp/github-endpoints.zip || { echo "ERROR: Failed to download github-endpoints.zip from GitHub."; exit 1; }
-          unzip -q /tmp/github-endpoints.zip -d /tmp/ || { echo "ERROR: Failed to unzip github-endpoints.zip"; exit 1; }
-          pip3 install /tmp/github-endpoints-main || { echo "ERROR: Failed to install github-endpoints."; exit 1; }
+          # --- FIX: Dynamically download and install github-endpoints from latest release asset ---
+          echo "Dynamically downloading and installing github-endpoints from latest release..."
+          GITHUB_ENDPOINTS_ZIP_URL=$(curl -s https://api.github.com/repos/initstring/github-endpoints/releases/latest \
+            | jq -r '.zipball_url')
+
+          if [ -z "$GITHUB_ENDPOINTS_ZIP_URL" ] || [ "$GITHUB_ENDPOINTS_ZIP_URL" == "null" ]; then
+            echo "ERROR: Could not find the latest release ZIP URL for github-endpoints. Please check the repository or adjust the script."
+            exit 1
+          fi
+
+          echo "Found ZIP URL: $GITHUB_ENDPOINTS_ZIP_URL"
+          wget --tries=5 --wait=5 "$GITHUB_ENDPOINTS_ZIP_URL" -O /tmp/github-endpoints-release.zip || { echo "ERROR: Failed to download github-endpoints release ZIP."; exit 1; }
+          
+          # Unzip will create a folder like 'initstring-github-endpoints-TAG' or 'initstring-github-endpoints-COMMITSHA'
+          # We need to find the name of the extracted directory
+          UNZIPPED_DIR=$(unzip -q -o /tmp/github-endpoints-release.zip -d /tmp/ | head -n 1 | awk -F'/' '{print $2}')
+          
+          if [ -z "$UNZIPPED_DIR" ]; then
+            echo "ERROR: Failed to determine extracted directory name for github-endpoints."
+            exit 1
+          fi
+
+          pip3 install "/tmp/$UNZIPPED_DIR" || { echo "ERROR: Failed to install github-endpoints."; exit 1; }
           # Clean up downloaded zip and extracted folder
-          rm /tmp/github-endpoints.zip
-          rm -rf /tmp/github-endpoints-main
+          rm /tmp/github-endpoints-release.zip
+          rm -rf "/tmp/$UNZIPPED_DIR"
           echo "github-endpoints installed successfully."
           # --- END FIX ---
 
@@ -116,8 +133,7 @@ jobs:
           if [ ! -f ".github/workflows/domains.txt" ] && [ ! -f ".github/workflows/organizations.txt" ]; then
             echo "ERROR: Neither .github/workflows/domains.txt nor .github/workflows/organizations.txt file found! Exiting."
             exit 1
-          fi
-
+          C
           # Create a temporary file to store all discovered domains for this run
           discovered_domains_file="temp_discovered_domains.txt"
           touch "$discovered_domains_file"
@@ -198,6 +214,7 @@ jobs:
                 cp "$output_file" "$old_file" # Update old results with new ones
               else
                 echo "✅ No new subdomains for $domain"
+              S
               fi
             fi
           done < .github/workflows/domains.txt # Read from the consolidated domains.txt

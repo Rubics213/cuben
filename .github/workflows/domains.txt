@@ -1,6 +1,1 @@
-irbis.grammarly.com/api
-subscription.private.grammarly.com
-sso.private.grammarly.com.
-view.send.grammarly.com
-support.grammarly.com
-mta.send.grammarly.com
+https://irbis.grammarly.com

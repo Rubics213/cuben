@@ -1,2 +1,6 @@
-http://66.206.54.197/admin.cgi?2
-
+irbis.grammarly.com/api
+subscription.private.grammarly.com
+sso.private.grammarly.com.
+view.send.grammarly.com
+support.grammarly.com
+mta.send.grammarly.com

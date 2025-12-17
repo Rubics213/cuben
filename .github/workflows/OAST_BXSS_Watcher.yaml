@@ -2,7 +2,7 @@ name: OAST Blackout Watcher
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # Still every 30 mins
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -18,22 +18,18 @@ jobs:
           go-version: '>=1.20'
           cache: false
 
-      - name: Install Interactsh Client
-        run: go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
-
-      - name: Poll and Filter Logs
+      - name: Verify Session File
         run: |
-          # 1. Run the client and save all output to a file
-          timeout 60s interactsh-client -session-file ./session.yaml -v > full_logs.txt 2>&1 || true
-          
-          # 2. Print the full logs to the GitHub Action console for history
-          cat full_logs.txt
-
-          # 3. Specifically search for evidence of an Airbnb hit
-          # We search for 'HTTP', 'Airbnb', or 'Internal' in the log
-          if grep -E "HTTP|Airbnb|internal" full_logs.txt; then
-            echo "****************************************************"
-            echo "🚨 POTENTIAL AIRBNB HIT DETECTED! 🚨"
-            echo "Check the Poll and Filter Logs section above for details."
-            echo "****************************************************"
+          if [ -f "session.yaml" ]; then
+            echo "✅ session.yaml found!"
+            cat session.yaml | grep "correlation-id"
+          else
+            echo "❌ session.yaml NOT FOUND in root folder!"
+            ls -R
+            exit 1
           fi
+
+      - name: Poll Interactions
+        run: |
+          # We force it to use the file in the current directory
+          timeout 60s interactsh-client -session-file session.yaml -v || true

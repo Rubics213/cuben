@@ -2,8 +2,8 @@ name: OAST Blackout Watcher
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # Runs every 30 minutes
-  workflow_dispatch:      # Allows you to trigger it manually
+    - cron: '*/30 * * * *' # Still every 30 mins
+  workflow_dispatch:
 
 jobs:
   check_hits:
@@ -21,7 +21,19 @@ jobs:
       - name: Install Interactsh Client
         run: go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
 
-      - name: Poll Interactions
+      - name: Poll and Filter Logs
         run: |
-          # We look for the file in the root folder where we just moved it
-          timeout 60s interactsh-client -session-file ./session.yaml -v || true
+          # 1. Run the client and save all output to a file
+          timeout 60s interactsh-client -session-file ./session.yaml -v > full_logs.txt 2>&1 || true
+          
+          # 2. Print the full logs to the GitHub Action console for history
+          cat full_logs.txt
+
+          # 3. Specifically search for evidence of an Airbnb hit
+          # We search for 'HTTP', 'Airbnb', or 'Internal' in the log
+          if grep -E "HTTP|Airbnb|internal" full_logs.txt; then
+            echo "****************************************************"
+            echo "🚨 POTENTIAL AIRBNB HIT DETECTED! 🚨"
+            echo "Check the Poll and Filter Logs section above for details."
+            echo "****************************************************"
+          fi

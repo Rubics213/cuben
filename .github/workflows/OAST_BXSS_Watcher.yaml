@@ -3,7 +3,7 @@ name: OAST Blackout Watcher
 on:
   schedule:
     - cron: '*/30 * * * *' # Runs every 30 minutes
-  workflow_dispatch:      # Allows you to trigger it manually from the UI
+  workflow_dispatch:      # Allows manual trigger
 
 jobs:
   check_hits:
@@ -22,7 +22,7 @@ jobs:
 
       - name: Poll Interactions
         run: |
-          # Using -duration 60 to poll the server for 1 minute then exit.
-          # The -v flag ensures the output is printed to the GitHub Action logs.
-          # The client automatically uses session.yaml to decrypt the backlog.
-          interactsh-client -session-file session.yaml -v -duration 60
+          # 'timeout 60s' tells Linux to kill the process after 1 minute.
+          # Upon startup, interactsh-client will fetch all missed logs from the server.
+          # The '|| true' ensures the workflow doesn't fail when the timeout kills the process.
+          timeout 60s interactsh-client -session-file session.yaml -v || true

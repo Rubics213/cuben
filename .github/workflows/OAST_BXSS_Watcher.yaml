@@ -3,7 +3,7 @@ name: OAST Blackout Watcher
 on:
   schedule:
     - cron: '*/30 * * * *' # Runs every 30 minutes
-  workflow_dispatch:      # Allows manual trigger
+  workflow_dispatch:      # Allows you to trigger it manually
 
 jobs:
   check_hits:
@@ -16,13 +16,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.20'
-          cache: false # Fixes the "go.sum not found" warning
+          cache: false
 
       - name: Install Interactsh Client
         run: go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
 
       - name: Poll Interactions
         run: |
-          # timeout 60s ensures the job finishes cleanly.
-          # interactsh-client will fetch any backlog from your session.yaml immediately.
-          timeout 60s interactsh-client -session-file session.yaml -v || true
+          # We look for the file in the root folder where we just moved it
+          timeout 60s interactsh-client -session-file ./session.yaml -v || true

@@ -1,0 +1,25 @@
+name: OAST Watcher
+on:
+  schedule:
+    - cron: '0 * * * *' # Every hour
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '>=1.20'
+
+      - name: Install Interactsh
+        run: go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+
+      - name: Poll Interactions
+        # This uses your existing session file to decrypt the results
+        run: |
+          interactsh-client -session-file session.yaml -poll -poll-interval 5 -poll-duration 30

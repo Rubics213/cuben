@@ -17,14 +17,21 @@ jobs:
         with:
           go-version: '>=1.20'
 
-      - name: Install and Poll
+      - name: Full Execution
         run: |
-          # 1. Install the client
+          # 1. Install
           go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
           
-          # 2. Get the absolute path to the tool
-          INTERACTSH_BIN=$(go env GOPATH)/bin/interactsh-client
+          # 2. Define the path directly
+          BIN_PATH=$(go env GOPATH)/bin/interactsh-client
           
-          # 3. Run the tool using the absolute path
+          # 3. Check if it actually installed
+          if [ ! -f "$BIN_PATH" ]; then
+            echo "❌ Binary not found at $BIN_PATH"
+            exit 1
+          fi
+          
+          # 4. Run it (without the 'timeout' command to be safe)
+          # Using --poll-interval to check and then exit naturally
           echo "Starting poll for d51hku5a9dbj8v34kung..."
-          timeout 60s $INTERACTSH_BIN -session-file session.yaml -v || true
+          $BIN_PATH -session-file session.yaml -v -poll-interval 10 -t 55

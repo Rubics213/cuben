@@ -12,20 +12,28 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Verify Session Path
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      - name: Install Interactsh Client
         run: |
-          echo "Current Directory: $(pwd)"
-          echo "Listing all files in root:"
-          ls -F
+          go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+          # Add the Go bin directory to the system path for this run
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Verify Session File
+        run: |
           if [ -f "session.yaml" ]; then
-            echo "✅ session.yaml found in root!"
+            echo "✅ session.yaml found!"
+            grep "correlation-id" session.yaml
           else
-            echo "❌ session.yaml NOT FOUND. Checking subdirectories..."
-            find . -name "session.yaml"
+            echo "❌ session.yaml NOT FOUND!"
             exit 1
           fi
 
       - name: Poll Interactions
         run: |
-          # Use the absolute path to ensure the client finds the file
-          timeout 60s interactsh-client -session-file $GITHUB_WORKSPACE/session.yaml -v || true
+          # Now that the path is set, we run the client
+          timeout 60s interactsh-client -session-file session.yaml -v || true

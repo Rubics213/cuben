@@ -13,16 +13,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '>=1.20'
+          cache: false # Fixes the "go.sum not found" warning
 
       - name: Install Interactsh Client
         run: go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
 
       - name: Poll Interactions
         run: |
-          # 'timeout 60s' tells Linux to kill the process after 1 minute.
-          # Upon startup, interactsh-client will fetch all missed logs from the server.
-          # The '|| true' ensures the workflow doesn't fail when the timeout kills the process.
+          # timeout 60s ensures the job finishes cleanly.
+          # interactsh-client will fetch any backlog from your session.yaml immediately.
           timeout 60s interactsh-client -session-file session.yaml -v || true

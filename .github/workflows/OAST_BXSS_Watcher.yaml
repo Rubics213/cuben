@@ -1,11 +1,12 @@
-name: OAST Watcher
+name: OAST Blackout Watcher
+
 on:
   schedule:
-    - cron: '0 * * * *' # Every hour
-  workflow_dispatch:
+    - cron: '*/30 * * * *' # Runs every 30 minutes
+  workflow_dispatch:      # Allows you to trigger it manually from the UI
 
 jobs:
-  check:
+  check_hits:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -16,10 +17,12 @@ jobs:
         with:
           go-version: '>=1.20'
 
-      - name: Install Interactsh
+      - name: Install Interactsh Client
         run: go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
 
       - name: Poll Interactions
-        # This uses your existing session file to decrypt the results
         run: |
-          interactsh-client -session-file session.yaml -poll -poll-interval 5 -poll-duration 30
+          # Using -duration 60 to poll the server for 1 minute then exit.
+          # The -v flag ensures the output is printed to the GitHub Action logs.
+          # The client automatically uses session.yaml to decrypt the backlog.
+          interactsh-client -session-file session.yaml -v -duration 60

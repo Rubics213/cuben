@@ -17,23 +17,14 @@ jobs:
         with:
           go-version: '>=1.20'
 
-      - name: Install Interactsh Client
+      - name: Install and Poll
         run: |
+          # 1. Install the client
           go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
-          # Add the Go bin directory to the system path for this run
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-
-      - name: Verify Session File
-        run: |
-          if [ -f "session.yaml" ]; then
-            echo "✅ session.yaml found!"
-            grep "correlation-id" session.yaml
-          else
-            echo "❌ session.yaml NOT FOUND!"
-            exit 1
-          fi
-
-      - name: Poll Interactions
-        run: |
-          # Now that the path is set, we run the client
-          timeout 60s interactsh-client -session-file session.yaml -v || true
+          
+          # 2. Get the absolute path to the tool
+          INTERACTSH_BIN=$(go env GOPATH)/bin/interactsh-client
+          
+          # 3. Run the tool using the absolute path
+          echo "Starting poll for d51hku5a9dbj8v34kung..."
+          timeout 60s $INTERACTSH_BIN -session-file session.yaml -v || true

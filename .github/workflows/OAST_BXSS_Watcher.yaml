@@ -40,6 +40,6 @@ jobs:
           
       - name: Run interactsh-client
         run: |
-          BIN_PATH=$(go env GOPATH)/bin/interactsh-client
+          export PATH=$PATH:$(go env GOPATH)/bin
           echo "Starting poll for session..."
-          timeout 60s $BIN_PATH -session-file session.yaml -v -poll-interval 10 || true
+          timeout 60s interactsh-client -session-file session.yaml -v -poll-interval 10 || true

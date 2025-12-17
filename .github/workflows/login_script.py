@@ -1,4 +1,0 @@
-import os
-
-SHOPIFY_USERNAME = os.environ['SHOPIFY_USERNAME']
-SHOPIFY_PASSWORD = os.environ['SHOPIFY_PASSWORD']

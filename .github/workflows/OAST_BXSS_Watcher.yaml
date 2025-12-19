@@ -1,8 +1,10 @@
 name: OAST Blackout Watcher
+
 on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
+
 jobs:
   check_hits:
     runs-on: ubuntu-latest
@@ -14,32 +16,34 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.20'
+          cache: false
       
       - name: Install interactsh-client
         run: |
           go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
-          
-      - name: Verify Installation
-        run: |
-          BIN_PATH=$(go env GOPATH)/bin/interactsh-client
-          if [ ! -f "$BIN_PATH" ]; then
-            echo "❌ Binary not found at $BIN_PATH"
-            exit 1
-          fi
-          echo "✅ Binary found at $BIN_PATH"
-          
-      - name: Check for session file
-        run: |
-          if [ -f "session.yaml" ]; then
-            echo "✅ session.yaml found!"
-            cat session.yaml
-          else
-            echo "❌ session.yaml not found"
-            exit 1
-          fi
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           
       - name: Run interactsh-client
         run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
           echo "Starting poll for session..."
-          timeout 60s interactsh-client -session-file session.yaml -v -poll-interval 10 || true
+          # We save output to results.log to check for hits later
+          timeout 60s interactsh-client -session-file session.yaml -v -poll-interval 10 > results.log 2>&1 || true
+          cat results.log
+
+      - name: Send Email Alert
+        # This step only runs if 'HTTP' or 'DNS' interactions are found in the log
+        if: grep -qE "HTTP|DNS" results.log
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{secrets.EMAIL_USERNAME}}
+          password: ${{secrets.EMAIL_PASSWORD}}
+          subject: "⚠️ AIRBNB OAST HIT DETECTED!"
+          to: ${{secrets.EMAIL_USERNAME}}
+          from: "OAST Watcher"
+          body: |
+            A hit was detected on your OAST link! 
+            
+            Check your GitHub Action logs for IP and Cookie details.
+            Link: d51hku5a9dbj8v34kung.oast.live

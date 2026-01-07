@@ -1,41 +1,31 @@
-name: Automated Target Recon
-on:
-  push:
-    paths:
-      - 'targets.txt'  # Trigger only when you add new targets
-
-jobs:
-  recon:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install Recon Tools
-        run: |
-          sudo apt-get update
-          # Install subfinder for subdomain discovery
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-
-      - name: Discovery Phase
-        run: |
-          # Read from targets.txt and find subdomains
-          subfinder -dL targets.txt -o subdomains.txt
-          echo "Discovery complete. Found $(wc -l < subdomains.txt) subdomains."
-
-      - name: Gemini Analysis Phase
+- name: Run Recon and Analyze
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          # Use the newly created subdomains.txt as context for Gemini
-          npm install -g @google/gemini-cli
-          gemini --yolo -p "@subdomains.txt These are newly discovered subdomains for the targets in targets.txt. Categorize them and identify which ones look like development, staging, or sensitive admin panels." > reconnaissance_report.md
+          # 1. Detect files
+          FILES=$(git diff --name-only HEAD^ HEAD | grep -E '\.js$|subdomains\.txt' || true)
+          
+          if [ -z "$FILES" ]; then
+            echo "No files found to analyze."
+            exit 0
+          fi
 
-      - name: Upload Results
+          # 2. Analyze and force a consistent naming convention
+          for file in $FILES; do
+            filename=$(basename "$file")
+            echo "Analyzing $filename..."
+            # Using --yolo and ensuring we save to a clear .md file
+            gemini --yolo -p "@$file Perform a security analysis." > "ANALYSIS_${filename}.md"
+          done
+
+          # 3. DEBUG: List files to see if they exist before the next step
+          ls -lh ANALYSIS_*.md
+
+      - name: Upload Reports
         uses: actions/upload-artifact@v4
         with:
-          name: recon-results
-          path: |
-            subdomains.txt
-            reconnaissance_report.md
+          name: security-reports
+          # Change this to catch the specific prefix we just set
+          path: ANALYSIS_*.md
+          # If no files are found, make the action FAIL so you know immediately
+          if-no-files-found: error

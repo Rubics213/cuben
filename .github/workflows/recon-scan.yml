@@ -1,0 +1,41 @@
+name: Automated Target Recon
+on:
+  push:
+    paths:
+      - 'targets.txt'  # Trigger only when you add new targets
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Recon Tools
+        run: |
+          sudo apt-get update
+          # Install subfinder for subdomain discovery
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Discovery Phase
+        run: |
+          # Read from targets.txt and find subdomains
+          subfinder -dL targets.txt -o subdomains.txt
+          echo "Discovery complete. Found $(wc -l < subdomains.txt) subdomains."
+
+      - name: Gemini Analysis Phase
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Use the newly created subdomains.txt as context for Gemini
+          npm install -g @google/gemini-cli
+          gemini --yolo -p "@subdomains.txt These are newly discovered subdomains for the targets in targets.txt. Categorize them and identify which ones look like development, staging, or sensitive admin panels." > reconnaissance_report.md
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results
+          path: |
+            subdomains.txt
+            reconnaissance_report.md

@@ -1,0 +1,148 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+
+concurrency:
+  group: recon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false # We handle custom caching below
+
+      - name: Cache Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/pip
+            ~/.npm
+          key: recon-tools-${{ runner.os }}-v3
+          restore-keys: |
+            recon-tools-${{ runner.os }}-
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 jq > /dev/null
+          
+          # Install Go tools only if missing from cache
+          export PATH=$PATH:$(go env GOPATH)/bin
+          if ! command -v gau &> /dev/null; then go install github.com/lc/gau/v2/cmd/gau@latest; fi
+          if ! command -v katana &> /dev/null; then go install github.com/projectdiscovery/katana/cmd/katana@latest; fi
+          
+          pip install -q waymore waybackpy
+          
+          if ! command -v gemini &> /dev/null; then
+            npm install -g @google/gemini-cli --silent
+          fi
+          
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Recon and Analyze
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p output/js_files
+          touch analyzed_hashes.txt
+          touch all_discovered_js_urls.txt
+          
+          KEYWORDS="api_key|secret|password|db_|admin|internal|config|token|bearer|jwt"
+          MAX_TARGETS=5
+          MAX_JS_PER_DOMAIN=20
+          MAX_AI_CALLS=10
+          ai_total_count=0
+          
+          # Process targets
+          head -n $MAX_TARGETS targets.txt | while IFS= read -r domain || [ -n "$domain" ]; do
+            [[ "$domain" =~ ^#.*$ || -z "$domain" ]] && continue
+            
+            echo "🔍 Processing: $domain"
+            
+            # 1. Collection
+            timeout 120 gau "$domain" --subs --threads 5 > urls_gau.txt 2>/dev/null &
+            timeout 90 waymore -i "$domain" -mode U -oU urls_waymore.txt 2>/dev/null &
+            timeout 120 katana -u "$domain" -d 2 -jc -silent > urls_katana.txt 2>/dev/null &
+            wait
+            
+            # 2. Extract and append unique JS to the master list
+            cat urls_*.txt | grep -Ei '\.js($|\?)' | sort -u >> all_discovered_js_urls.txt
+            
+            # Filter for this specific domain run
+            grep "$domain" all_discovered_js_urls.txt | head -n $MAX_JS_PER_DOMAIN > current_js_urls.txt
+            
+            # 3. Download
+            aria2c -i current_js_urls.txt -d output/js_files --auto-file-renaming=true --allow-overwrite=true --console-log-level=error --max-file-not-found=3 || true
+            
+            echo "# Recon Report: $domain" > "MAP_${domain}.md"
+            
+            # 4. Analysis Loop
+            for jsfile in output/js_files/*.js; do
+              [ -e "$jsfile" ] || continue
+              fname=$(basename "$jsfile")
+              
+              # SKIP: Vendor/Library Files
+              if echo "$fname" | grep -qiE 'jquery|react|vue|angular|bootstrap|vendor|min\.js|node_modules'; then
+                continue
+              fi
+              
+              # SKIP: Already analyzed content (Hash check)
+              fhash=$(sha256sum "$jsfile" | awk '{print $1}')
+              if grep -q "$fhash" analyzed_hashes.txt; then
+                continue
+              fi
+              echo "$fhash" >> analyzed_hashes.txt
+              
+              # KEYWORD SCAN
+              matches=$(grep -Eio "$KEYWORDS" "$jsfile" 2>/dev/null | sort -u | head -n 10)
+              
+              if [ -n "$matches" ]; then
+                echo "### 🚨 Found in $fname" >> "MAP_${domain}.md"
+                echo '```text' >> "MAP_${domain}.md"
+                echo "$matches" >> "MAP_${domain}.md"
+                echo '```' >> "MAP_${domain}.md"
+                
+                # 5. AI Analysis (Secret/High-Value focus)
+                if [ $ai_total_count -lt $MAX_AI_CALLS ]; then
+                  if echo "$matches" | grep -Eiq "secret|password|token|bearer"; then
+                    echo "🤖 AI Analysis for $fname..."
+                    head -c 50000 "$jsfile" > temp_ai.js
+                    gemini --yolo -p "Security analysis: find credentials and endpoints. File: @temp_ai.js" > "ANALYSIS_${domain}_${fname}.md" 2>/dev/null || true
+                    ai_total_count=$((ai_total_count + 1))
+                    rm -f temp_ai.js
+                  fi
+                fi
+              fi
+            done
+            
+            # Cleanup JS files to prevent cross-domain pollution
+            rm -rf output/js_files/*
+          done
+
+      - name: Upload Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-results-${{ github.run_number }}
+          path: |
+            MAP_*.md
+            ANALYSIS_*.md
+            all_discovered_js_urls.txt
+          retention-days: 7

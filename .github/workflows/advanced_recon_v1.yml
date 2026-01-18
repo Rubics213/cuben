@@ -1,0 +1,142 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: recon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Cache Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/pip
+            ~/.npm
+          key: recon-tools-${{ runner.os }}-v4
+          restore-keys: |
+            recon-tools-${{ runner.os }}-
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl > /dev/null
+          export PATH=$PATH:$(go env GOPATH)/bin
+          if ! command -v gau &> /dev/null; then go install github.com/lc/gau/v2/cmd/gau@latest; fi
+          if ! command -v katana &> /dev/null; then go install github.com/projectdiscovery/katana/cmd/katana@latest; fi
+          pip install -q waymore waybackpy
+          if ! command -v gemini &> /dev/null; then npm install -g @google/gemini-cli --silent; fi
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Recon and Analyze
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p output/js_files
+          touch analyzed_hashes.txt
+          KEYWORDS="api_key|secret|password|db_|admin|internal|config|token|bearer|jwt|aws_access|s3_bucket"
+          MAX_TARGETS=5
+          MAX_JS_PER_DOMAIN=25
+          MAX_AI_CALLS=15
+          ai_total_count=0
+          
+          shuf -n $MAX_TARGETS targets.txt | while IFS= read -r domain || [ -n "$domain" ]; do
+            [[ "$domain" =~ ^#.*$ || -z "$domain" ]] && continue
+            echo "🔍 Starting Recon: $domain"
+            echo "# Security Recon: $domain" > "MAP_${domain}.md"
+            
+            timeout 120 gau "$domain" --subs --threads 5 > urls_gau.txt 2>/dev/null &
+            timeout 90 waymore -i "$domain" -mode U -oU urls_waymore.txt 2>/dev/null &
+            timeout 120 katana -u "$domain" -d 2 -jc -silent > urls_katana.txt 2>/dev/null &
+            wait
+            
+            cat urls_*.txt | grep -Ei '\.js($|\?)' | sort -u | head -n $MAX_JS_PER_DOMAIN > js_urls.txt
+            
+            while read -r url; do
+              safe_name=$(echo -n "$url" | sha256sum | cut -c1-12).js
+              curl -sL --max-time 10 "$url" -o "output/js_files/$safe_name" || continue
+              jsfile="output/js_files/$safe_name"
+              [ -s "$jsfile" ] || continue
+              
+              if echo "$url" | grep -qiE 'jquery|react|vue|angular|bootstrap|vendor|min\.js|node_modules'; then
+                rm "$jsfile"; continue
+              fi
+              
+              fhash=$(sha256sum "$jsfile" | awk '{print $1}')
+              if grep -q "$fhash" analyzed_hashes.txt; then rm "$jsfile"; continue; fi
+              echo "$fhash" >> analyzed_hashes.txt
+              
+              matches=$(grep -Eio "$KEYWORDS" "$jsfile" 2>/dev/null | sort -u | head -n 10)
+              if [ -n "$matches" ]; then
+                echo "### 🚨 Match in: $url" >> "MAP_${domain}.md"
+                echo '```text' >> "MAP_${domain}.md"
+                echo "$matches" >> "MAP_${domain}.md"
+                echo '```' >> "MAP_${domain}.md"
+                
+                if [ $ai_total_count -lt $MAX_AI_CALLS ]; then
+                  if echo "$matches" | grep -Eiq "secret|password|token|bearer|aws"; then
+                    head -c 50000 "$jsfile" > temp_ai.js
+                    gemini --yolo -p "Security analysis: @temp_ai.js" > "ANALYSIS_${domain}_${safe_name}.md" 2>/dev/null || true
+                    ai_total_count=$((ai_total_count + 1))
+                    rm -f temp_ai.js
+                  fi
+                fi
+              fi
+            done < js_urls.txt
+            rm -rf output/js_files/*
+          done
+
+      - name: Prepare Email Body
+        id: email_body
+        run: |
+          if ls MAP_*.md 1> /dev/null 2>&1; then
+            echo "FINDINGS_FOUND=true" >> $GITHUB_ENV
+            echo "Recon complete. Findings discovered for $(ls MAP_*.md | wc -l) domains." > email_msg.txt
+          else
+            echo "FINDINGS_FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send Email Report
+        if: env.FINDINGS_FOUND == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Recon Report: Findings Discovered (${{ github.run_number }})"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Gemini Recon Bot"
+          body: file://email_msg.txt
+          attachments: "MAP_*.md,ANALYSIS_*.md"
+
+      - name: Cleanup Reports
+        if: always()
+        run: |
+          rm -f MAP_*.md
+          rm -f ANALYSIS_*.md
+          rm -f email_msg.txt
+          rm -f analyzed_hashes.txt
+          echo "Cleanup complete."

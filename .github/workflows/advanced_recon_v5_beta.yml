@@ -1,0 +1,160 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: recon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    permissions:
+      contents: write 
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+        
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq curl > /dev/null
+          export PATH=$PATH:$(go env GOPATH)/bin
+          if ! command -v gau &> /dev/null; then go install github.com/lc/gau/v2/cmd/gau@latest; fi
+          if ! command -v katana &> /dev/null; then go install github.com/projectdiscovery/katana/cmd/katana@latest; fi
+          pip install -q waymore waybackpy
+          if ! command -v gemini &> /dev/null; then npm install -g @google/gemini-cli --silent; fi
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Recon and Analyze
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p output/js_files
+          mkdir -p final_reports
+          touch analyzed_hashes.txt
+          
+          KEYWORDS="api_key|secret|password|db_|admin|internal|config|token|bearer|jwt|aws_access|s3_bucket"
+          AI_TRIGGER_WORDS="password|secret|token|aws|key|bearer|internal|db_"
+          
+          shuf -n 5 targets.txt | while IFS= read -r domain || [ -n "$domain" ]; do
+            [[ "$domain" =~ ^#.*$ || -z "$domain" ]] && continue
+            
+            # --- DOMAIN HEALTH CHECK ---
+            echo "test"
+            if ! curl -IsL --max-time 10 "http://$domain" | grep -q "HTTP/"; then
+              echo "⚠️ $domain appears down. Skipping..."
+              continue
+            fi
+            echo "✅ $domain is alive. Starting Recon..."
+            # ---------------------------
+
+            map_file="final_reports/MAP_${domain}.md"
+            echo "# Security Recon: $domain" > "$map_file"
+            
+            timeout 120 gau "$domain" --subs --threads 5 > urls_gau.txt 2>/dev/null &
+            timeout 90 waymore -i "$domain" -mode U -oU urls_waymore.txt 2>/dev/null &
+            timeout 120 katana -u "$domain" -d 2 -jc -silent > urls_katana.txt 2>/dev/null &
+            wait
+            
+            cat urls_*.txt 2>/dev/null | grep -Ei '\.js($|\?)' | sort -u | head -n 25 > js_urls.txt || true
+            
+            while read -r url; do
+              safe_name=$(echo -n "$url" | sha256sum | cut -c1-12)
+              js_path="output/js_files/${safe_name}.js"
+              curl -sL --max-time 10 "$url" -o "$js_path" || continue
+              [ -s "$js_path" ] || continue
+              
+              if echo "$url" | grep -qiE 'jquery|react|vue|angular|bootstrap|vendor|min\.js|node_modules'; then
+                rm "$js_path"; continue
+              fi
+              
+              fhash=$(sha256sum "$js_path" | awk '{print $1}')
+              if grep -q "$fhash" analyzed_hashes.txt; then rm "$js_path"; continue; fi
+              echo "$fhash" >> analyzed_hashes.txt
+              
+              matches=$(grep -Eio "$KEYWORDS" "$js_path" 2>/dev/null | sort -u | head -n 10)
+              if [ -n "$matches" ]; then
+                echo "### 🚨 Match in: $url" >> "$map_file"
+                echo '```text' >> "$map_file"
+                echo "$matches" >> "$map_file"
+                echo '```' >> "$map_file"
+                
+                if echo "$matches" | grep -Eiq "$AI_TRIGGER_WORDS"; then
+                    echo "🤖 AI Analysis for $url..."
+                    head -c 50000 "$js_path" > temp_ai.js
+                    gemini --yolo -p "Audit this JS for credentials and internal endpoints. File: @temp_ai.js" > "final_reports/ANALYSIS_${domain}_${safe_name}.md" 2>/dev/null || true
+                    rm -f temp_ai.js
+                  fi
+              fi
+            done < js_urls.txt
+            rm -rf output/js_files/*
+            rm -f urls_*.txt js_urls.txt all_urls.tmp 2>/dev/null
+          done
+
+      - name: Save History to Branch
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            mkdir -p history_archive/$(date +%Y-%m-%d)
+            cp final_reports/* history_archive/$(date +%Y-%m-%d)/
+            git config --global user.name "Recon Bot"
+            git config --global user.email "recon-bot@github.com"
+            mkdir history_repo
+            cd history_repo
+            git init
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+            if git fetch origin recon-history; then
+                git checkout recon-history
+            else
+                git checkout -b recon-history
+            fi
+            cp -r ../history_archive/* .
+            git add .
+            git commit -m "Add recon findings for $(date +%Y-%m-%d)" || echo "No changes"
+            git push origin recon-history
+          fi
+
+      - name: Prepare Email Summary
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            echo "FINDINGS_FOUND=true" >> $GITHUB_ENV
+            echo "## Recon Summary Report" > email_msg.txt
+            ls final_reports/MAP_*.md | xargs -n 1 basename | sed 's/MAP_//;s/.md//' | sed 's/^/- /' >> email_msg.txt
+          else
+            echo "FINDINGS_FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send Email Report
+        if: env.FINDINGS_FOUND == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Recon History Updated: $(date +%Y-%m-%d)"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Gemini Recon Bot"
+          body: file://email_msg.txt
+          attachments: "final_reports/*"
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf final_reports output/ history_archive/ history_repo/ email_msg.txt analyzed_hashes.txt

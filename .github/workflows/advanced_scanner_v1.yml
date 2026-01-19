@@ -1,0 +1,81 @@
+- name: Run Recon
+        id: recon
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$GEMINI_API_KEY"
+          
+          # Initialize state files (Variables in functions won't persist otherwise)
+          echo "0" > tmp/p_count
+          echo "0" > tmp/s_count
+          echo "0" > tmp/c_count
+          
+          ERROR_LOG="tmp/errors_run.log"
+          grep -v '^#' targets.txt | grep -v '^$' | shuf -n 5 > selected.txt
+          
+          process_domain() {
+            local domain=$1
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            local map_file="final_reports/report_${domain//[^a-zA-Z0-9]/_}.md"
+            
+            # Health check
+            if ! timeout 6s bash -c "exec 3<>/dev/tcp/$domain/443" 2>/dev/null; then
+              echo "⚠️ $domain unreachable" >> "$ERROR_LOG"
+              return
+            fi
+
+            echo "# Recon Report: $domain" > "$map_file"
+            
+            # Visual Capture (Fixed Flag: --path)
+            timeout 35s gowitness single --url "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            latest=$(ls -t screenshots/*.png 2>/dev/null | head -1)
+            if [[ -n "$latest" ]]; then
+              mv "$latest" "screenshots/${domain}.png"
+              echo "## 📸 Visual Presence" >> "$map_file"
+              echo "![Screenshot](./${domain}.png)" >> "$map_file"
+              # Update shared state
+              echo "$(($(cat tmp/s_count) + 1))" > tmp/s_count
+            fi
+
+            # Nuclei Scan
+            timeout 90s nuclei -u "https://$domain" -t custom_templates/ -severity critical,high -silent -o "tmp/n-${domain}.txt" 2>/dev/null || true
+            if [[ -s "tmp/n-${domain}.txt" ]]; then
+              echo "## 🚨 Nuclei Findings" >> "$map_file"
+              echo '```text' >> "$map_file"; cat "tmp/n-${domain}.txt" >> "$map_file"; echo '```' >> "$map_file"
+              local count=$(grep -c "critical" "tmp/n-${domain}.txt" || echo "0")
+              echo "$(($(cat tmp/c_count) + $count))" > tmp/c_count
+            fi
+
+            # URL Collection & JS Analysis
+            timeout 50s katana -u "https://$domain" -silent -d 2 -jc > "tmp/u-${domain}.txt" 2>/dev/null || true
+            grep -Ei '\.js($|\?)' "tmp/u-${domain}.txt" 2>/dev/null | head -n 10 | while read -r js_url; do
+              fname=$(echo -n "$js_url" | sha256sum | cut -c1-12)
+              js_file="output/js_files/${fname}.js"
+              if timeout 10s curl -sL "$js_url" -o "$js_file" 2>/dev/null; then
+                if grep -Eaiq "api_key|secret|aws_access|jwt" "$js_file" 2>/dev/null; then
+                  echo "### 🚨 JS Leak: $js_url" >> "$map_file"
+                  if [[ $(stat -c %s "$js_file") -lt 150000 ]]; then
+                    gemini --yolo -p "Audit JS: @${js_file}" > "final_reports/ai_${domain}_${fname}.md" 2>/dev/null || true
+                  fi
+                fi
+              fi
+            done
+            
+            echo "$(($(cat tmp/p_count) + 1))" > tmp/p_count
+            sleep 3
+          }
+
+          # Execute loop
+          while IFS= read -r target; do
+            process_domain "$target"
+          done < selected.txt
+
+          # Pull final stats from files into ENV for subsequent steps
+          echo "DOMAINS_PROCESSED=$(cat tmp/p_count)" >> $GITHUB_ENV
+          echo "SCREENSHOTS_TAKEN=$(cat tmp/s_count)" >> $GITHUB_ENV
+          echo "CRITICAL_FINDINGS=$(cat tmp/c_count)" >> $GITHUB_ENV
+          
+          if [[ $(cat tmp/c_count) -gt 0 ]]; then
+            echo "HAS_CRITICAL=true" >> $GITHUB_OUTPUT
+          fi

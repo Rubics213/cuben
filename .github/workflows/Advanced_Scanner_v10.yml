@@ -1,0 +1,120 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths: 
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Tools
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          # Install gowitness
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Filtered Recon
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+        run: |
+          mkdir -p final_reports screenshots tmp
+          
+          # 1. Define High-Signal Patterns
+          # PRIORITY_REGEX uses PCRE (?i) which is fine for grep -P
+          PRIORITY_REGEX="(?i)\b(api_key|secret|password|token|bearer)\b\s*[:=]\s*['\"][^'\"]{3,}['"]"
+          
+          # BOILERPLATE_FILTER uses ERE (grep -E). Removed (?i) and will use grep -i flag instead.
+          BOILERPLATE_FILTER="(type:|config:|next/image|datetime-local|scheme:|username:""|password:"")"
+
+          shuf -n 5 targets.txt | while read -r domain || [ -n "$domain" ]; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            report="final_reports/REPORT_${domain}.md"
+            
+            echo "# Security Recon: $domain" > "$report"
+            
+            # 2. Screenshot
+            # Changed --url to -u to fix "unknown flag" error
+            /usr/local/bin/gowitness scan single -u "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            
+            # 3. JS Deep Analysis with Noise Filtering
+            echo "## 📜 Javascript Analysis" >> "$report"
+            katana -u "https://$domain" -jc -d 2 -silent > tmp/urls_raw.txt 2>/dev/null || true
+            
+            if [ -f tmp/urls_raw.txt ]; then
+              # FILTER: Ignore known library files and vendors
+              grep -Ei '\.js($|\?)' tmp/urls_raw.txt | grep -vEi "(webpack|jquery|bootstrap|react|framework|polyfills|main-|vendor)" | sort -u | head -n 10 > tmp/js_filtered.txt || true
+              
+              while read -r js_url; do
+                curl -sL --max-time 10 "$js_url" -o tmp/current.js || continue
+                # Beautify slightly for better grep context
+                sed -i 's/;/;\n/g; s/{/{\n/g' tmp/current.js
+                
+                # Check for High-Priority Assignments first
+                # grep -P handles the PRIORITY_REGEX
+                # grep -vEi handles the BOILERPLATE_FILTER case-insensitively
+                high_signal=$(grep -oP ".{0,40}$PRIORITY_REGEX.{0,40}" tmp/current.js | grep -vEi "$BOILERPLATE_FILTER" | head -n 5) || true
+                
+                if [ -n "$high_signal" ]; then
+                  echo "### 🚨 HIGH PRIORITY: $js_url" >> "$report"
+                  echo '```text' >> "$report"
+                  echo "$high_signal" >> "$report"
+                  echo '```' >> "$report"
+                fi
+              done < tmp/js_filtered.txt
+            fi
+
+            # 4. Nuclei Vulnerability Scan
+            echo "## 🛡️ Vulnerability Scan" >> "$report"
+            nuclei -u "https://$domain" -severity critical,high -silent >> "$report" || true
+          done
+
+      - name: Save History
+        if: always()
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            git config --global user.name "Recon Bot"
+            git config --global user.email "recon-bot@github.com"
+            mkdir history_repo && cd history_repo && git init
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+            git fetch origin recon-history && git checkout recon-history || git checkout -b recon-history
+            TODAY=$(date +%Y-%m-%d)
+            mkdir -p "$TODAY"
+            cp -r ../final_reports/* "$TODAY/" 2>/dev/null || true
+            cp -r ../screenshots/* "$TODAY/" 2>/dev/null || true
+            git add . && git commit -m "Results $TODAY" && git push origin recon-history || true
+          fi
+
+      - name: Send Email Report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🛡️ High-Signal Recon: $(date +%Y-%m-%d)"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Gemini Recon Bot"
+          body: "Scan complete. Framework boilerplate has been filtered. Only high-priority or unique JS patterns are listed."
+          attachments: "final_reports/*,screenshots/*"

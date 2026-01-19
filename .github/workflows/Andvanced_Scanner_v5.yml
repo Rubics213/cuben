@@ -1,0 +1,118 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Tools
+        run: |
+          # Install Go Tools
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          
+          # Install Gowitness (v2.5.1)
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+          
+          # Add Go bin to PATH
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Recon and Analysis
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p final_reports screenshots tmp
+          
+          # Process 5 random targets from targets.txt
+          shuf -n 5 targets.txt | while read -r domain || [ -n "$domain" ]; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            report="final_reports/REPORT_${domain}.md"
+            
+            echo "🔍 Processing: $domain"
+            echo "# Security Recon: $domain" > "$report"
+            echo "Date: $(date)" >> "$report"
+            
+            # Gowitness Scan (Corrected syntax for v2.5.1)
+            gowitness scan single --url "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            
+            # Nuclei Scan
+            nuclei -u "https://$domain" -severity critical,high -silent >> "$report" || true
+          done
+
+      - name: Save History to Branch
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            git config --global user.name "Recon Bot"
+            git config --global user.email "recon-bot@github.com"
+            
+            # Setup temporary repo to push to recon-history
+            mkdir history_repo
+            cd history_repo
+            git init
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+            
+            if git fetch origin recon-history; then
+                git checkout recon-history
+            else
+                git checkout -b recon-history
+            fi
+            
+            TODAY=$(date +%Y-%m-%d)
+            mkdir -p "$TODAY"
+            cp ../final_reports/* "$TODAY/" 2>/dev/null || true
+            cp ../screenshots/* "$TODAY/" 2>/dev/null || true
+            
+            git add .
+            git commit -m "Add recon findings for $TODAY" || echo "No changes to commit"
+            git push origin recon-history
+          fi
+
+      - name: Prepare Email Summary
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            echo "FINDINGS_FOUND=true" >> $GITHUB_ENV
+            echo "## Recon Summary Report" > email_msg.txt
+            echo "New findings found for:" >> email_msg.txt
+            ls final_reports/REPORT_*.md | xargs -n 1 basename | sed 's/REPORT_//;s/.md//' | sed 's/^/- /' >> email_msg.txt
+          else
+            echo "FINDINGS_FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send Email Report
+        if: env.FINDINGS_FOUND == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🛡️ Recon History Updated: $(date +%Y-%m-%d)"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Gemini Recon Bot"
+          body: file://email_msg.txt
+          attachments: "final_reports/*,screenshots/*"
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf final_reports/ screenshots/ tmp/ email_msg.txt history_repo/

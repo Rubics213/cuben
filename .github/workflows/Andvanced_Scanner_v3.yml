@@ -1,0 +1,143 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    env:
+      NUCLEI_VERSION: v3.3.5
+      KATANA_VERSION: v1.1.0
+      GAU_VERSION: v2.2.3
+      GOWITNESS_VERSION: 2.5.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-go-tools-${{ env.NUCLEI_VERSION }}
+
+      - name: Install Go tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@${{ env.NUCLEI_VERSION }}
+          go install github.com/projectdiscovery/katana/cmd/katana@${{ env.KATANA_VERSION }}
+          go install github.com/lc/gau/v2/cmd/gau@${{ env.GAU_VERSION }}
+
+      - name: Install gowitness
+        run: |
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/${{ env.GOWITNESS_VERSION }}/gowitness-${{ env.GOWITNESS_VERSION }}-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+
+      - name: Prepare Workspace
+        run: mkdir -p output/js_files final_reports custom_templates screenshots tmp final_zip
+
+      - name: Run Recon
+        id: recon
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$GEMINI_API_KEY"
+          
+          # State tracking via files (required for subshell persistence)
+          echo "0" > tmp/p_count
+          echo "0" > tmp/s_count
+          echo "0" > tmp/c_count
+          
+          grep -v '^#' targets.txt | grep -v '^$' | shuf -n 5 > selected.txt
+          
+          while IFS= read -r domain; do
+            [[ -z "$domain" ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            map_file="final_reports/report_${domain//[^a-zA-Z0-9]/_}.md"
+            
+            # Port check to save time
+            if ! timeout 5s bash -c "exec 3<>/dev/tcp/$domain/443" 2>/dev/null; then
+              continue
+            fi
+
+            echo "# Recon Report: $domain" > "$map_file"
+            
+            # Screenshot
+            timeout 40s gowitness single --url "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            if ls screenshots/*.png >/dev/null 2>&1; then
+              latest=$(ls -t screenshots/*.png | head -1)
+              mv "$latest" "screenshots/${domain}.png"
+              echo "![Screenshot](./${domain}.png)" >> "$map_file"
+              echo "$(($(cat tmp/s_count) + 1))" > tmp/s_count
+            fi
+
+            # Nuclei
+            ~/go/bin/nuclei -u "https://$domain" -severity critical,high -silent -o "tmp/n-${domain}.txt" 2>/dev/null || true
+            if [[ -s "tmp/n-${domain}.txt" ]]; then
+              echo "## 🚨 Findings" >> "$map_file"
+              echo '```text' >> "$map_file"; cat "tmp/n-${domain}.txt" >> "$map_file"; echo '```' >> "$map_file"
+              count=$(grep -c "critical" "tmp/n-${domain}.txt" || echo "0")
+              echo "$(($(cat tmp/c_count) + $count))" > tmp/c_count
+            fi
+
+            # JS Analysis with Direct API Call (Replaces 'gemini' command)
+            timeout 40s ~/go/bin/katana -u "https://$domain" -silent -d 2 -jc > "tmp/u-${domain}.txt" 2>/dev/null || true
+            grep -Ei '\.js($|\?)' "tmp/u-${domain}.txt" 2>/dev/null | head -n 5 | while read -r js_url; do
+              fname=$(echo -n "$js_url" | sha256sum | cut -c1-12)
+              js_content=$(curl -sL --max-time 10 "$js_url" | head -c 5000 | base64 | tr -d '\n')
+              
+              if [[ -n "$GEMINI_API_KEY" && -n "$js_content" ]]; then
+                curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}" \
+                  -H 'Content-Type: application/json' \
+                  -d "{ \"contents\": [{ \"parts\":[{ \"text\": \"Find secrets in this JS (base64): $js_content\" }]}] }" \
+                  -o "final_reports/ai_${domain}_${fname}.json" || true
+              fi
+            done
+
+            echo "$(($(cat tmp/p_count) + 1))" > tmp/p_count
+          done < selected.txt
+
+          echo "DOMAINS_PROCESSED=$(cat tmp/p_count)" >> $GITHUB_ENV
+          echo "SCREENSHOTS_TAKEN=$(cat tmp/s_count)" >> $GITHUB_ENV
+          echo "CRITICAL_FINDINGS=$(cat tmp/c_count)" >> $GITHUB_ENV
+
+      - name: Commit and Send
+        if: always()
+        run: |
+          git config user.name "Recon Bot"
+          git config user.email "bot@recon.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git fetch origin
+          git checkout recon-history || git checkout --orphan recon-history
+          mkdir -p "history/$(date +%F)"
+          cp -r final_reports/* "history/$(date +%F)/" 2>/dev/null || true
+          cp -r screenshots/* "history/$(date +%F)/" 2>/dev/null || true
+          git add history/ && git commit -m "Recon $(date +%F)" && git push origin recon-history || true
+
+      - name: Send Email
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "🛡️ Recon Summary: ${{ env.CRITICAL_FINDINGS }} Criticals"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Recon Bot"
+          body: "Scan complete. Processed ${{ env.DOMAINS_PROCESSED }} targets. See history branch for full reports."

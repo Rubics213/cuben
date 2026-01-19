@@ -1,0 +1,377 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Tools
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Filtered Recon
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+        run: |
+          mkdir -p final_reports screenshots tmp
+          
+          # Initialize counters
+          domains_scanned=0
+          screenshots_taken=0
+          js_files_analyzed=0
+          high_priority_findings=0
+          
+          # 1. Define High-Signal Patterns
+          # Fixed: Use single quotes for the outer string to avoid quote escaping issues
+          PRIORITY_REGEX='(?i)\b(api_key|secret|password|token|bearer)\b\s*[:=]\s*["\047][^"\047]{3,}["\047]'
+          
+          # Simplified Boilerplate Filter
+          BOILERPLATE_FILTER="type:|config:|next/image|datetime-local|scheme:|username:|password:"
+
+          # Select targets
+          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
+            echo "targets.txt is missing or empty"
+            exit 0
+          fi
+          
+          shuf -n 5 targets.txt > tmp/selected.txt
+
+          while read -r domain || [ -n "$domain" ]; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            
+            echo "🔍 Scanning: $domain"
+            report="final_reports/REPORT_${domain}.md"
+            
+            cat > "$report" << EOF
+          # Security Recon: $domain
+          **Date:** $(date '+%Y-%m-%d %H:%M:%S')
+          **Status:** Processing
+          
+          ---
+          
+          EOF
+            
+            domains_scanned=$((domains_scanned + 1))
+            
+            # 2. Screenshot
+            echo "📸 Capturing screenshot..."
+            if /usr/local/bin/gowitness single "https://$domain" --path screenshots/ --disable-db 2>/dev/null; then
+              # Find and rename the most recent screenshot
+              latest_screenshot=$(find screenshots/ -type f -name "*.png" -mmin -1 | head -1)
+              if [[ -n "$latest_screenshot" ]]; then
+                mv "$latest_screenshot" "screenshots/${domain}.png" 2>/dev/null || true
+                if [[ -f "screenshots/${domain}.png" ]]; then
+                  echo "## 📸 Visual Capture" >> "$report"
+                  echo "Screenshot saved as \`${domain}.png\`" >> "$report"
+                  echo "" >> "$report"
+                  screenshots_taken=$((screenshots_taken + 1))
+                fi
+              fi
+            else
+              echo "⚠️ Screenshot failed for $domain"
+            fi
+            
+            # 3. JS Deep Analysis with Noise Filtering
+            echo "📜 Analyzing JavaScript files..."
+            echo "## 📜 Javascript Analysis" >> "$report"
+            
+            katana -u "https://$domain" -jc -d 2 -silent > tmp/urls_raw_${domain}.txt 2>/dev/null || true
+            
+            if [ -f tmp/urls_raw_${domain}.txt ] && [ -s tmp/urls_raw_${domain}.txt ]; then
+              # FILTER: Ignore known library files and vendors
+              grep -i "\.js" tmp/urls_raw_${domain}.txt | \
+                grep -iv "\.json" | \
+                grep -vEi "(webpack|jquery|bootstrap|react|framework|polyfills|main-|vendor|chunk)" | \
+                sort -u | head -n 10 > tmp/js_filtered_${domain}.txt || true
+              
+              local_js_count=0
+              local_findings=0
+              
+              if [ -f tmp/js_filtered_${domain}.txt ] && [ -s tmp/js_filtered_${domain}.txt ]; then
+                echo "**JavaScript files to analyze:** $(wc -l < tmp/js_filtered_${domain}.txt)" >> "$report"
+                echo "" >> "$report"
+                
+                while read -r js_url; do
+                  [[ -z "$js_url" ]] && continue
+                  local_js_count=$((local_js_count + 1))
+                  
+                  echo "  → Analyzing: $js_url"
+                  
+                  if curl -sL --max-time 10 "$js_url" -o tmp/current.js 2>/dev/null; then
+                    # Beautify slightly for better grep context
+                    sed -i 's/;/;\n/g; s/{/{\n/g' tmp/current.js
+                    
+                    # Check for High-Priority Assignments
+                    high_signal=$(grep -oP ".{0,40}${PRIORITY_REGEX}.{0,40}" tmp/current.js 2>/dev/null | \
+                      grep -vEi "$BOILERPLATE_FILTER" | head -n 5) || true
+                    
+                    if [ -n "$high_signal" ]; then
+                      echo "### 🚨 HIGH PRIORITY: $js_url" >> "$report"
+                      echo '```text' >> "$report"
+                      echo "$high_signal" >> "$report"
+                      echo '```' >> "$report"
+                      echo "" >> "$report"
+                      local_findings=$((local_findings + 1))
+                      high_priority_findings=$((high_priority_findings + 1))
+                    fi
+                  fi
+                done < tmp/js_filtered_${domain}.txt
+                
+                js_files_analyzed=$((js_files_analyzed + local_js_count))
+                
+                if [ $local_findings -eq 0 ]; then
+                  echo "*No high-priority patterns detected in analyzed files.*" >> "$report"
+                  echo "" >> "$report"
+                fi
+              else
+                echo "*No relevant JavaScript files found after filtering.*" >> "$report"
+                echo "" >> "$report"
+              fi
+            else
+              echo "*No JavaScript files discovered.*" >> "$report"
+              echo "" >> "$report"
+            fi
+          
+            # 4. Nuclei Vulnerability Scan
+            echo "🛡️ Running vulnerability scan..."
+            echo "## 🛡️ Vulnerability Scan" >> "$report"
+            
+            nuclei_output=$(mktemp)
+            if nuclei -u "https://$domain" -severity critical,high -silent > "$nuclei_output" 2>/dev/null; then
+              if [ -s "$nuclei_output" ]; then
+                cat "$nuclei_output" >> "$report"
+                echo "" >> "$report"
+              else
+                echo "*No critical or high severity vulnerabilities detected.*" >> "$report"
+                echo "" >> "$report"
+              fi
+            else
+              echo "*Scan completed with no findings.*" >> "$report"
+              echo "" >> "$report"
+            fi
+            rm -f "$nuclei_output"
+            
+            echo "✓ Completed: $domain"
+            echo ""
+          done < tmp/selected.txt
+          
+          # Export statistics
+          echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
+          echo "SCREENSHOTS_TAKEN=$screenshots_taken" >> $GITHUB_ENV
+          echo "JS_FILES_ANALYZED=$js_files_analyzed" >> $GITHUB_ENV
+          echo "HIGH_PRIORITY_FINDINGS=$high_priority_findings" >> $GITHUB_ENV
+          
+          # Set flags for conditional steps
+          if [ $high_priority_findings -gt 0 ]; then
+            echo "HAS_FINDINGS=true" >> $GITHUB_ENV
+          else
+            echo "HAS_FINDINGS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Generate Summary Report
+        if: always()
+        run: |
+          cat > final_reports/SUMMARY.md << EOF
+          # 🛡️ Reconnaissance Summary
+          **Date:** $(date '+%Y-%m-%d %H:%M:%S')
+          **Workflow Run:** #${{ github.run_number }}
+          
+          ---
+          
+          ## 📊 Scan Statistics
+          
+          | Metric | Count |
+          |--------|-------|
+          | Domains Scanned | ${DOMAINS_SCANNED:-0} |
+          | Screenshots Captured | ${SCREENSHOTS_TAKEN:-0} |
+          | JS Files Analyzed | ${JS_FILES_ANALYZED:-0} |
+          | High-Priority Findings | ${HIGH_PRIORITY_FINDINGS:-0} |
+          
+          ## 🎯 Scanned Domains
+          
+          $(if [ -f tmp/selected.txt ]; then cat tmp/selected.txt | sed 's/^/- /'; else echo "No domains scanned"; fi)
+          
+          ## 📝 Report Files
+          
+          $(ls final_reports/*.md 2>/dev/null | grep -v SUMMARY | sed 's/final_reports\//- /' || echo "No reports generated")
+          
+          ## 🔍 Scan Results
+          
+          $(if [ "${HIGH_PRIORITY_FINDINGS:-0}" -gt 0 ]; then
+            echo "⚠️ **${HIGH_PRIORITY_FINDINGS} high-priority finding(s) detected!**"
+            echo ""
+            echo "Review the individual reports for details."
+          else
+            echo "✅ **No high-priority security issues detected.**"
+            echo ""
+            echo "All analyzed JavaScript files passed filtering criteria."
+          fi)
+          
+          ---
+          
+          **Repository:** ${{ github.repository }}
+          **Triggered by:** ${{ github.event_name }}
+          **Branch:** ${{ github.ref_name }}
+          EOF
+
+      - name: Upload Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-${{ github.run_number }}
+          path: |
+            final_reports/
+            screenshots/
+          retention-days: 30
+
+      - name: Save History
+        if: always()
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            git config --global user.name "Recon Bot"
+            git config --global user.email "recon-bot@github.com"
+            
+            # Work in a separate directory
+            mkdir -p history_repo && cd history_repo
+            git init
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+            
+            # Fetch and checkout history branch
+            if git fetch origin recon-history 2>/dev/null; then
+              git checkout recon-history
+            else
+              git checkout -b recon-history
+            fi
+            
+            # Create dated directory
+            TODAY=$(date +%Y-%m-%d)
+            RUN_DIR="${TODAY}_run${{ github.run_number }}"
+            mkdir -p "$RUN_DIR"
+            
+            # Copy results
+            cp -r ../final_reports/* "$RUN_DIR/" 2>/dev/null || true
+            cp -r ../screenshots/* "$RUN_DIR/" 2>/dev/null || true
+            
+            # Commit and push
+            git add .
+            if git diff --staged --quiet; then
+              echo "No changes to commit"
+            else
+              git commit -m "🔍 Scan results: $TODAY (Run #${{ github.run_number }})" \
+                -m "Domains: ${DOMAINS_SCANNED:-0} | Findings: ${HIGH_PRIORITY_FINDINGS:-0}"
+              git push origin recon-history || echo "⚠️ Push failed (this is okay for first run)"
+            fi
+          else
+            echo "No results to save"
+          fi
+
+      - name: Send Email Report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "${{ env.HAS_FINDINGS == 'true' && '🚨' || '✅' }} Recon Scan: $(date +%Y-%m-%d) - ${{ env.HIGH_PRIORITY_FINDINGS }} Finding(s)"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Recon Bot <recon@security.local>"
+          body: |
+            Security Reconnaissance Scan Complete
+            
+            📊 SCAN SUMMARY
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            Date: $(date '+%Y-%m-%d %H:%M:%S')
+            Run: #${{ github.run_number }}
+            
+            📈 STATISTICS
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            • Domains Scanned: ${{ env.DOMAINS_SCANNED }}
+            • Screenshots: ${{ env.SCREENSHOTS_TAKEN }}
+            • JS Files Analyzed: ${{ env.JS_FILES_ANALYZED }}
+            • High-Priority Findings: ${{ env.HIGH_PRIORITY_FINDINGS }}
+            
+            ${{ env.HAS_FINDINGS == 'true' && '⚠️ ALERT: High-priority security patterns detected!' || '✅ STATUS: No high-priority issues found.' }}
+            
+            📎 ATTACHMENTS
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            • Individual domain reports (REPORT_*.md)
+            • Screenshots of scanned sites
+            • Summary report (SUMMARY.md)
+            
+            🔗 LINKS
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            Full Results: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            History Branch: https://github.com/${{ github.repository }}/tree/recon-history
+            
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            Framework boilerplate filtered. Only unique, high-signal patterns included.
+          attachments: "final_reports/*,screenshots/*"
+          priority: ${{ env.HAS_FINDINGS == 'true' && 'high' || 'normal' }}
+
+      - name: Send Critical Alert
+        if: always() && env.HAS_FINDINGS == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🚨 SECURITY ALERT: ${{ env.HIGH_PRIORITY_FINDINGS }} Critical Pattern(s) Detected"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Security Alert <security@alert.local>"
+          body: |
+            ⚠️⚠️⚠️ SECURITY ALERT ⚠️⚠️⚠️
+            
+            HIGH-PRIORITY SECURITY PATTERNS DETECTED
+            
+            ${{ env.HIGH_PRIORITY_FINDINGS }} potential security issue(s) found in JavaScript analysis.
+            
+            Patterns detected may include:
+            • Hardcoded API keys
+            • Exposed secrets or tokens
+            • Plaintext passwords
+            • Authentication credentials
+            
+            ⚡ ACTION REQUIRED
+            Review the attached reports immediately for:
+            - Exposed credentials
+            - API key leakage
+            - Security misconfigurations
+            
+            📎 Full details in attached REPORT_*.md files
+            🔗 Workflow: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Scanned: $(date '+%Y-%m-%d %H:%M:%S')
+          attachments: "final_reports/REPORT_*.md"
+          priority: high
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf tmp/
+          echo "✅ Cleanup completed"

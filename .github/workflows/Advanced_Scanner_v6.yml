@@ -1,0 +1,123 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Tools
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Enhanced Recon
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          mkdir -p final_reports screenshots tmp
+          
+          # IMPROVED REGEX: Using word boundaries (\b) and high-value patterns
+          # Tier 1: High Entropy / Likely Secrets
+          SECRETS_REGEX="(\bapi_key\b|\bsecret\b|\bpassword\b|\btoken\b|\bbearer\b|AIza[0-9A-Za-z-_]{35})"
+          # Tier 2: Internal Infrastructure
+          INTERNAL_REGEX="(\badmin\b|\binternal\b|\bconfig\b|\bdb_password\b|\bs3_bucket\b)"
+
+          shuf -n 5 targets.txt | while read -r domain || [ -n "$domain" ]; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            report="final_reports/REPORT_${domain}.md"
+            
+            echo "🔍 Deep Scanning: $domain"
+            echo "# Security Recon: $domain" > "$report"
+            
+            # 1. Screenshot
+            /usr/local/bin/gowitness scan single --url "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            
+            # 2. JS Crawling & Analysis
+            echo "## 📜 Javascript Analysis" >> "$report"
+            katana -u "https://$domain" -jc -d 2 -silent -o tmp/urls.txt 2>/dev/null || true
+            
+            grep -Ei '\.js($|\?)' tmp/urls.txt | sort -u | head -n 15 | while read -r js_url; do
+              echo "Checking $js_url"
+              curl -sL --max-time 10 "$js_url" -o tmp/current.js || continue
+              
+              # Basic De-minification (simple newline insertion for readability)
+              sed -i 's/;/;\n/g; s/{/{\n/g; s/}/\n}/g' tmp/current.js
+              
+              # Extract context (grep with -o for matches, then show 50 chars of context)
+              matches=$(grep -Ei -o ".{0,50}$SECRETS_REGEX.{0,50}|.{0,50}$INTERNAL_REGEX.{0,50}" tmp/current.js | head -n 5)
+              
+              if [ -n "$matches" ]; then
+                echo "### 🚨 Found in: $js_url" >> "$report"
+                echo '```text' >> "$report"
+                echo "$matches" >> "$report"
+                echo '```' >> "$report"
+              fi
+            done
+
+            # 3. Nuclei Scan
+            echo "## 🛡️ Vulnerability Scan" >> "$report"
+            nuclei -u "https://$domain" -severity critical,high -silent >> "$report" || true
+          done
+
+      - name: Save History to Branch
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            git config --global user.name "Recon Bot"
+            git config --global user.email "recon-bot@github.com"
+            mkdir history_repo && cd history_repo && git init
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+            git fetch origin recon-history && git checkout recon-history || git checkout -b recon-history
+            
+            TODAY=$(date +%Y-%m-%d)
+            mkdir -p "$TODAY"
+            cp ../final_reports/* "$TODAY/" 2>/dev/null || true
+            cp ../screenshots/* "$TODAY/" 2>/dev/null || true
+            git add . && git commit -m "Results $TODAY" && git push origin recon-history
+          fi
+
+      - name: Prepare Email Summary
+        run: |
+          if [ "$(ls -A final_reports 2>/dev/null)" ]; then
+            echo "FINDINGS_FOUND=true" >> $GITHUB_ENV
+            echo "## Recon Summary Report" > email_msg.txt
+            ls final_reports/REPORT_*.md | xargs -n 1 basename | sed 's/REPORT_//;s/.md//' | sed 's/^/- /' >> email_msg.txt
+          else
+            echo "FINDINGS_FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send Email Report
+        if: env.FINDINGS_FOUND == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🛡️ Deep Recon: $(date +%Y-%m-%d)"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Gemini Recon Bot"
+          body: file://email_msg.txt
+          attachments: "final_reports/*,screenshots/*"

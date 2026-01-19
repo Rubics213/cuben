@@ -1,0 +1,46 @@
+- name: Commit results
+        if: always()
+        run: |
+          git config user.name "Recon Bot"
+          git config user.email "bot@recon.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          
+          # Switch to history branch
+          git fetch origin
+          git checkout recon-history || git checkout --orphan recon-history
+          
+          # Create date folder and move files
+          TODAY=$(date +%Y-%m-%d)
+          mkdir -p "history/$TODAY"
+          
+          # Check if files exist before copying to avoid errors
+          if [ -d "final_reports" ]; then cp -r final_reports/* "history/$TODAY/" 2>/dev/null || true; fi
+          if [ -d "screenshots" ]; then cp -r screenshots/* "history/$TODAY/" 2>/dev/null || true; fi
+
+          # Add and commit only if changes exist
+          git add history/
+          if git diff --cached --quiet; then
+            echo "No new findings to commit today."
+          else
+            git commit -m "🔍 Recon Update: $TODAY"
+            git push origin recon-history
+          fi
+
+      - name: Send Email
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          # IMPORTANT: Use an App Password here, not your Gmail password!
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "🛡️ Recon Summary: ${{ env.CRITICAL_FINDINGS }} Criticals"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Recon Bot <${{ secrets.EMAIL_USERNAME }}>"
+          body: |
+            Reconnaissance scan completed.
+            - Targets Processed: ${{ env.DOMAINS_PROCESSED }}
+            - Critical Findings: ${{ env.CRITICAL_FINDINGS }}
+            
+            View full history on the 'recon-history' branch.

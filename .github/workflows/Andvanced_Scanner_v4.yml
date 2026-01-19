@@ -1,46 +1,123 @@
-- name: Commit results
+name: Recon and Analysis
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    env:
+      NUCLEI_VERSION: v3.3.5
+      KATANA_VERSION: v1.1.0
+      GAU_VERSION: v2.2.3
+      GOWITNESS_VERSION: 2.5.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Cache tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-go-tools-${{ env.NUCLEI_VERSION }}
+
+      - name: Install Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+
+      - name: Install gowitness
+        run: |
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/${{ env.GOWITNESS_VERSION }}/gowitness-${{ env.GOWITNESS_VERSION }}-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+
+      - name: Init Workspace
+        run: |
+          mkdir -p output/js_files final_reports custom_templates screenshots tmp
+          echo "0" > tmp/p_count
+          echo "0" > tmp/c_count
+
+      - name: Execute Scan
+        id: scanner
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Validate targets exist
+          if [ ! -s targets.txt ]; then echo "No targets found"; exit 0; fi
+          
+          # Pick 5 random domains
+          grep -v '^#' targets.txt | grep -v '^$' | shuf -n 5 > selected.txt
+          
+          while read -r domain; do
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            report="final_reports/${domain}.md"
+            
+            echo "Processing $domain..."
+            
+            # Simple Health Check
+            if ! timeout 5s bash -c "exec 3<>/dev/tcp/$domain/443" 2>/dev/null; then continue; fi
+            
+            echo "# Report for $domain" > "$report"
+            
+            # Screenshot
+            gowitness single --url "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            
+            # Nuclei Scan
+            ~/go/bin/nuclei -u "https://$domain" -severity critical,high -silent >> "$report" || true
+            
+            # Update counts
+            echo "$(($(cat tmp/p_count) + 1))" > tmp/p_count
+          done < selected.txt
+          
+          echo "DOMAINS_PROCESSED=$(cat tmp/p_count)" >> $GITHUB_ENV
+
+      - name: Save to History
         if: always()
         run: |
           git config user.name "Recon Bot"
           git config user.email "bot@recon.com"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-          
-          # Switch to history branch
           git fetch origin
           git checkout recon-history || git checkout --orphan recon-history
-          
-          # Create date folder and move files
-          TODAY=$(date +%Y-%m-%d)
-          mkdir -p "history/$TODAY"
-          
-          # Check if files exist before copying to avoid errors
-          if [ -d "final_reports" ]; then cp -r final_reports/* "history/$TODAY/" 2>/dev/null || true; fi
-          if [ -d "screenshots" ]; then cp -r screenshots/* "history/$TODAY/" 2>/dev/null || true; fi
-
-          # Add and commit only if changes exist
+          mkdir -p "history/$(date +%F)"
+          cp -r final_reports/* "history/$(date +%F)/" 2>/dev/null || true
           git add history/
-          if git diff --cached --quiet; then
-            echo "No new findings to commit today."
-          else
-            git commit -m "🔍 Recon Update: $TODAY"
-            git push origin recon-history
-          fi
+          git commit -m "Results $(date +%F)" || echo "Nothing to commit"
+          git push origin recon-history || echo "Push failed"
 
-      - name: Send Email
+      - name: Send Report
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
-          # IMPORTANT: Use an App Password here, not your Gmail password!
           password: ${{ secrets.EMAIL_APP_PASSWORD }}
-          subject: "🛡️ Recon Summary: ${{ env.CRITICAL_FINDINGS }} Criticals"
+          subject: "Recon Done: ${{ env.DOMAINS_PROCESSED }} Domains"
           to: ${{ secrets.EMAIL_USERNAME }}
-          from: "Recon Bot <${{ secrets.EMAIL_USERNAME }}>"
-          body: |
-            Reconnaissance scan completed.
-            - Targets Processed: ${{ env.DOMAINS_PROCESSED }}
-            - Critical Findings: ${{ env.CRITICAL_FINDINGS }}
-            
-            View full history on the 'recon-history' branch.
+          from: "Recon Bot"
+          body: "The scan completed. Check the recon-history branch for details."

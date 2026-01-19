@@ -1,0 +1,156 @@
+name: Recon and Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    env:
+      NUCLEI_VERSION: v3.3.5
+      KATANA_VERSION: v1.1.0
+      GAU_VERSION: v2.2.3
+      GOWITNESS_VERSION: 2.5.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-go-tools-${{ env.NUCLEI_VERSION }}-${{ env.KATANA_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-go-tools-
+
+      - name: Install Go tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@${{ env.NUCLEI_VERSION }}
+          go install github.com/projectdiscovery/katana/cmd/katana@${{ env.KATANA_VERSION }}
+          go install github.com/lc/gau/v2/cmd/gau@${{ env.GAU_VERSION }}
+
+      - name: Install gowitness
+        run: |
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/${{ env.GOWITNESS_VERSION }}/gowitness-${{ env.GOWITNESS_VERSION }}-linux-amd64" \
+            -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+
+      - name: Install Python tools
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install --user waymore
+
+      - name: Prepare directories
+        run: |
+          mkdir -p output/js_files final_reports custom_templates screenshots tmp final_zip
+          cat > custom_templates/leaks-critical.yaml << 'EOF'
+          id: critical-leaks
+          info:
+            name: Critical Information Disclosure
+            severity: critical
+          requests:
+            - method: GET
+              path:
+                - "{{BaseURL}}/.env"
+                - "{{BaseURL}}/.git/config"
+              matchers-condition: or
+              matchers:
+                - type: word
+                  words: ["DB_PASSWORD", "AWS_ACCESS_KEY_ID", "repositoryformatversion"]
+                  part: body
+          EOF
+
+      - name: Run Recon
+        id: recon
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$GEMINI_API_KEY"
+          
+          echo "0" > tmp/p_count
+          echo "0" > tmp/s_count
+          echo "0" > tmp/c_count
+          
+          ERROR_LOG="tmp/errors_run.log"
+          grep -v '^#' targets.txt | grep -v '^$' | shuf -n 5 > selected.txt
+          
+          while IFS= read -r domain; do
+            [[ -z "$domain" ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            map_file="final_reports/report_${domain//[^a-zA-Z0-9]/_}.md"
+            
+            if ! timeout 6s bash -c "exec 3<>/dev/tcp/$domain/443" 2>/dev/null; then
+              continue
+            fi
+
+            echo "# Recon Report: $domain" > "$map_file"
+            
+            timeout 35s gowitness single --url "https://$domain" --path screenshots/ --disable-db 2>/dev/null || true
+            latest=$(ls -t screenshots/*.png 2>/dev/null | head -1)
+            if [[ -n "$latest" ]]; then
+              mv "$latest" "screenshots/${domain}.png"
+              echo "![Screenshot](./${domain}.png)" >> "$map_file"
+              echo "$(($(cat tmp/s_count) + 1))" > tmp/s_count
+            fi
+
+            timeout 90s nuclei -u "https://$domain" -t custom_templates/ -severity critical,high -silent -o "tmp/n-${domain}.txt" 2>/dev/null || true
+            if [[ -s "tmp/n-${domain}.txt" ]]; then
+              echo "## 🚨 Findings" >> "$map_file"
+              echo '```text' >> "$map_file"; cat "tmp/n-${domain}.txt" >> "$map_file"; echo '```' >> "$map_file"
+              count=$(grep -c "critical" "tmp/n-${domain}.txt" || echo "0")
+              echo "$(($(cat tmp/c_count) + $count))" > tmp/c_count
+            fi
+
+            echo "$(($(cat tmp/p_count) + 1))" > tmp/p_count
+          done < selected.txt
+
+          echo "DOMAINS_PROCESSED=$(cat tmp/p_count)" >> $GITHUB_ENV
+          echo "SCREENSHOTS_TAKEN=$(cat tmp/s_count)" >> $GITHUB_ENV
+          echo "CRITICAL_FINDINGS=$(cat tmp/c_count)" >> $GITHUB_ENV
+          [[ $(cat tmp/c_count) -gt 0 ]] && echo "HAS_CRITICAL=true" >> $GITHUB_OUTPUT || echo "HAS_CRITICAL=false" >> $GITHUB_OUTPUT
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "Recon Bot"
+          git config user.email "bot@recon.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git fetch origin
+          git checkout recon-history || git checkout --orphan recon-history
+          TODAY=$(date +%Y-%m-%d)
+          mkdir -p "history/$TODAY"
+          cp -r final_reports/* "history/$TODAY/" 2>/dev/null || true
+          cp -r screenshots/* "history/$TODAY/" 2>/dev/null || true
+          git add history/
+          git commit -m "Recon update $TODAY" || exit 0
+          git push origin recon-history
+
+      - name: Send Email
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "🛡️ Recon Summary: ${{ env.CRITICAL_FINDINGS }} Criticals"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Recon Bot"
+          body: "Scan finished. Processed ${{ env.DOMAINS_PROCESSED }} domains."
+          attachments: "final_reports/*.md,screenshots/*.png"

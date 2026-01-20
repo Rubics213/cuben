@@ -1,0 +1,73 @@
+name: "OAST Blackout Watcher"
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Runs exactly once every hour
+  workflow_dispatch:     # Allows you to trigger a manual check anytime
+
+jobs:
+  check_hits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+          cache: false
+      
+      - name: Install interactsh-client
+        run: |
+          go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Restore OAST Session
+        id: cache-session
+        uses: actions/cache/restore@v4
+        with:
+          path: session.yaml
+          key: oast-session-v1
+          # This ensures we pull the last session file created
+
+      - name: Run interactsh-client
+        id: poll
+        run: |
+          echo "Starting poll for persistent session..."
+          # If session.yaml doesn't exist, it will create one. 
+          # If it was restored from cache, it will use the existing ID.
+          timeout 60s interactsh-client -session-file session.yaml -v -poll-interval 10 > results.log 2>&1 || true
+          cat results.log
+          
+          if grep -qE "HTTP|DNS" results.log; then
+            echo "HIT_FOUND=true" >> $GITHUB_ENV
+          else
+            echo "HIT_FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Save OAST Session
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: session.yaml
+          key: oast-session-v1-${{ github.run_id }}
+          # We save it with a unique key to ensure GitHub stores the update
+
+      - name: Send Email Alert
+        if: env.HIT_FOUND == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "⚠️ BXSS HIT DETECTED!"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "OAST Watcher"
+          body: |
+            A hit was detected on your OAST link! 
+            
+            Check your GitHub Action logs for IP, User-Agent, and Header details.
+            Link: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

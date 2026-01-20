@@ -1,0 +1,198 @@
+name: "Recon and Analysis"
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin
+            ~/.cache/nuclei-templates
+          key: ${{ runner.os }}-recon-tools-v3
+          restore-keys: |
+            ${{ runner.os }}-recon-tools-
+
+      - name: Install Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+
+      - name: Add Tools to PATH
+        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Optimized Recon
+        shell: bash
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+        run: |
+          # Use -u to catch unset variables, but removed -e to allow the loop to continue on tool errors
+          set -uo pipefail
+          mkdir -p final_reports tmp
+
+          domains_scanned=0
+          js_files_analyzed=0
+          high_priority_findings=0
+          vulnerabilities_found=0
+
+          PRIORITY_REGEX='(?i)\b(api_key|secret|password|token|bearer|aws_access|private_key)\b\s*[:=]\s*["\047][^"\047]{3,}["\047]'
+          BOILERPLATE_FILTER="type:|config:|next/image|datetime-local|scheme:|username:|password:|placeholder|example|demo"
+
+          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
+            echo "❌ targets.txt is missing or empty"
+            exit 0
+          fi
+
+          grep -vE '^\s*#|^\s*$' targets.txt | shuf -n 4 > tmp/selected.txt || true
+
+          while IFS= read -r domain || [[ -n "$domain" ]]; do
+            [[ -z "$domain" ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            domains_scanned=$((domains_scanned + 1))
+
+            echo "🔍 DOMAIN $domains_scanned/4: $domain"
+            safe_name=$(echo "$domain" | sed 's/[^a-z0-9]/_/g')
+            report="final_reports/REPORT_${safe_name}.md"
+
+            cat > "$report" << EOF
+          # 🛡️ Security Recon: $domain
+          **Scan Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')
+          ---
+          EOF
+
+            echo "📜 Analyzing JavaScript..."
+            echo "## 📜 JavaScript Analysis" >> "$report"
+
+            timeout 70s katana -u "https://$domain" -jc -d 2 -silent < /dev/null > tmp/raw_urls.txt 2>/dev/null || touch tmp/raw_urls.txt
+
+            if [[ -s tmp/raw_urls.txt ]]; then
+              grep -iE '\.js(\?|$)' tmp/raw_urls.txt \
+                | grep -iv '\.json' \
+                | grep -vEi '(webpack|jquery|bootstrap|react|angular|vue|framework|polyfill|chunk|bundle|vendor|node_modules)' \
+                | sort -u > tmp/sorted_js.txt
+              
+              head -n 8 tmp/sorted_js.txt > tmp/js_filtered.txt || true
+
+              if [[ -s tmp/js_filtered.txt ]]; then
+                local_findings=0
+                while IFS= read -r js_url; do
+                  [[ -z "$js_url" ]] && continue
+                  
+                  # 1. Download
+                  timeout 12s curl -sL --max-time 10 "$js_url" -o tmp/current.js 2>/dev/null || continue
+                  
+                  # 2. Safety Check: Skip files larger than 2MB to prevent OOM/Crashes
+                  filesize=$(wc -c < tmp/current.js)
+                  if [ "$filesize" -gt 2097152 ]; then
+                    echo "  ⚠️ Skipping $(basename "$js_url") (Too large: $filesize bytes)"
+                    continue
+                  fi
+
+                  js_files_analyzed=$((js_files_analyzed + 1))
+                  
+                  # 3. Stream-based beautification (much safer than sed -i for large lines)
+                  tr ';' '\n' < tmp/current.js | tr '{' '\n' | tr '}' '\n' > tmp/formatted.js 2>/dev/null || cp tmp/current.js tmp/formatted.js
+
+                  # 4. Search
+                  high_signal=$(grep -oP -m 5 ".{0,50}${PRIORITY_REGEX}.{0,50}" tmp/formatted.js 2>/dev/null | grep -vEi "$BOILERPLATE_FILTER" | head -n 3) || true
+
+                  if [[ -n "$high_signal" ]]; then
+                    echo "### 🚨 HIGH PRIORITY: $(basename "$js_url")" >> "$report"
+                    echo "**URL:** \`$js_url\`" >> "$report"
+                    echo '```javascript' >> "$report"
+                    echo "$high_signal" >> "$report"
+                    echo '```' >> "$report"
+                    local_findings=$((local_findings + 1))
+                    high_priority_findings=$((high_priority_findings + 1))
+                  fi
+                done < tmp/js_filtered.txt
+                [[ $local_findings -eq 0 ]] && echo "*✓ No sensitive patterns detected*" >> "$report"
+              fi
+            fi
+
+            echo "🛡️ Vulnerability scan..."
+            echo "## 🛡️ Vulnerability Scan" >> "$report"
+            nuclei_output=$(mktemp)
+            timeout 80s nuclei -u "https://$domain" -severity critical,high -silent -nc < /dev/null > "$nuclei_output" 2>/dev/null || true
+            if [[ -s "$nuclei_output" ]]; then
+              vulnerabilities_found=$((vulnerabilities_found + $(wc -l < "$nuclei_output")))
+              echo '```text' >> "$report"
+              cat "$nuclei_output" >> "$report"
+              echo '```' >> "$report"
+            else
+              echo "*✓ No critical/high issues found*" >> "$report"
+            fi
+            rm -f "$nuclei_output"
+            
+            # Clean up JS files for next domain to save disk space
+            rm -f tmp/*.js tmp/*.txt
+          done < tmp/selected.txt
+
+          echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
+          echo "JS_FILES_ANALYZED=$js_files_analyzed" >> $GITHUB_ENV
+          echo "HIGH_PRIORITY_FINDINGS=$high_priority_findings" >> $GITHUB_ENV
+          echo "VULNERABILITIES_FOUND=$vulnerabilities_found" >> $GITHUB_ENV
+          total_issues=$((high_priority_findings + vulnerabilities_found))
+          echo "TOTAL_ISSUES=$total_issues" >> $GITHUB_ENV
+          echo "HAS_FINDINGS=$([[ $total_issues -gt 0 ]] && echo true || echo false)" >> $GITHUB_ENV
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          cat > final_reports/SUMMARY.md << EOF
+          # 🛡️ Recon Summary
+          **Domains:** $DOMAINS_SCANNED
+          **JS Files:** $JS_FILES_ANALYZED
+          **Issues:** $TOTAL_ISSUES
+          EOF
+
+      - name: Commit to History
+        if: always()
+        run: |
+          git config --global user.name "Recon Bot"
+          git config --global user.email "recon-bot@users.noreply.github.com"
+          mkdir -p history_work && cd history_work
+          git init
+          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git fetch origin recon-history 2>/dev/null && git checkout recon-history || git checkout -b recon-history
+          TIMESTAMP=$(date +%Y-%m-%d_%H%M)
+          mkdir -p "scans/$TIMESTAMP"
+          cp ../final_reports/*.md "scans/$TIMESTAMP/" 2>/dev/null || true
+          git add scans/ && git commit -m "Scan: $TIMESTAMP" && git push origin recon-history || true
+
+      - name: Send Email Report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "${{ env.HAS_FINDINGS == 'true' && '🚨' || '✅' }} Recon Report | ${{ env.TOTAL_ISSUES }} Issues"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: Security Scanner
+          body: "Recon complete. Find reports attached."
+          attachments: final_reports/*.md

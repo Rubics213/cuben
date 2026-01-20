@@ -1,0 +1,177 @@
+name: "Advanced Recon v2.0 (jsluice)"
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin
+            ~/.cache/nuclei-templates
+          key: ${{ runner.os }}-recon-v2-jsluice
+          restore-keys: ${{ runner.os }}-recon-
+
+      - name: Install Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          # Corrected capitalization for Go module path
+          go install github.com/BishopFox/jsluice/cmd/jsluice@latest
+
+      - name: Add Tools to PATH
+        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Optimized Recon
+        shell: bash
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+        run: |
+          set -uo pipefail
+          mkdir -p final_reports tmp
+
+          domains_scanned=0
+          js_files_analyzed=0
+          high_priority_findings=0
+          vulnerabilities_found=0
+
+          [[ ! -s targets.txt ]] && echo "❌ targets.txt empty" && exit 0
+
+          # Pick 4 random targets
+          grep -vE '^\s*#|^\s*$' targets.txt | shuf -n 4 > tmp/selected.txt || true
+
+          while IFS= read -r domain || [[ -n "$domain" ]]; do
+            [[ -z "$domain" ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            domains_scanned=$((domains_scanned + 1))
+
+            echo "🔍 SCANNING: $domain"
+            safe_name=$(echo "$domain" | sed 's/[^a-z0-9]/_/g')
+            report="final_reports/REPORT_${safe_name}.md"
+
+            cat > "$report" << EOF
+          # 🛡️ Security Recon: $domain
+          **Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')
+          ---
+          EOF
+
+            # --- JS ANALYSIS WITH JSLUICE ---
+            echo "📜 Running jsluice..."
+            echo "## 📜 JavaScript Intelligence" >> "$report"
+
+            timeout 70s katana -u "https://$domain" -jc -d 2 -silent < /dev/null > tmp/raw_urls.txt 2>/dev/null || touch tmp/raw_urls.txt
+
+            if [[ -s tmp/raw_urls.txt ]]; then
+              grep -iE '\.js(\?|$)' tmp/raw_urls.txt | grep -iv '\.json' | \
+              grep -vEi '(webpack|jquery|bootstrap|react|angular|vue|framework|polyfill|node_modules)' | \
+              sort -u > tmp/js_list.txt
+              
+              head -n 8 tmp/js_list.txt > tmp/js_to_scan.txt || true
+
+              while IFS= read -r js_url; do
+                [[ -z "$js_url" ]] && continue
+                
+                timeout 12s curl -sL --max-time 10 "$js_url" -o tmp/current.js 2>/dev/null || continue
+                
+                # OOM Protection: Skip files > 2MB
+                filesize=$(wc -c < tmp/current.js)
+                [[ "$filesize" -gt 2097152 ]] && continue
+
+                js_files_analyzed=$((js_files_analyzed + 1))
+                
+                # Extract Secrets
+                secrets=$(jsluice secrets tmp/current.js 2>/dev/null)
+                if [[ -n "$secrets" ]]; then
+                  echo "### 🚨 Secrets in $(basename "$js_url")" >> "$report"
+                  echo '```json' >> "$report"
+                  echo "$secrets" | head -n 15 >> "$report"
+                  echo '```' >> "$report"
+                  high_priority_findings=$((high_priority_findings + 1))
+                fi
+
+                # Extract Endpoints
+                endpoints=$(jsluice urls tmp/current.js 2>/dev/null | grep -Ei "api/v|/admin|/config|/auth" | head -n 5)
+                if [[ -n "$endpoints" ]]; then
+                  echo "**Hidden Endpoints Found in $(basename "$js_url"):**" >> "$report"
+                  echo '```text' >> "$report"
+                  echo "$endpoints" >> "$report"
+                  echo '```' >> "$report"
+                fi
+              done < tmp/js_to_scan.txt
+            fi
+
+            # --- NUCLEI SCAN ---
+            echo "🛡️ Nuclei scanning..."
+            echo "## 🛡️ Vulnerability Scan" >> "$report"
+            nuclei_out=$(mktemp)
+            timeout 90s nuclei -u "https://$domain" -severity critical,high -silent -nc < /dev/null > "$nuclei_out" 2>/dev/null || true
+            if [[ -s "$nuclei_out" ]]; then
+              vulnerabilities_found=$((vulnerabilities_found + $(wc -l < "$nuclei_out")))
+              echo '```text' >> "$report"
+              cat "$nuclei_out" >> "$report"
+              echo '```' >> "$report"
+            else
+              echo "*✓ No critical issues found*" >> "$report"
+            fi
+            
+            rm -f tmp/*.js tmp/*.txt
+          done < tmp/selected.txt
+
+          # Export metrics
+          echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
+          echo "JS_FILES_ANALYZED=$js_files_analyzed" >> $GITHUB_ENV
+          echo "HIGH_PRIORITY_FINDINGS=$high_priority_findings" >> $GITHUB_ENV
+          echo "VULNERABILITIES_FOUND=$vulnerabilities_found" >> $GITHUB_ENV
+          total_issues=$((high_priority_findings + vulnerabilities_found))
+          echo "TOTAL_ISSUES=$total_issues" >> $GITHUB_ENV
+          echo "HAS_FINDINGS=$([[ $total_issues -gt 0 ]] && echo true || echo false)" >> $GITHUB_ENV
+
+      - name: Commit to History
+        if: always()
+        run: |
+          git config --global user.name "Recon Bot"
+          git config --global user.email "bot@recon.local"
+          mkdir -p hist && cd hist
+          git init
+          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git fetch origin recon-history 2>/dev/null || true
+          git checkout recon-history 2>/dev/null || git checkout -b recon-history
+          TIMESTAMP=$(date +%Y-%m-%d_%H%M)
+          mkdir -p "scans/$TIMESTAMP"
+          cp ../final_reports/*.md "scans/$TIMESTAMP/" 2>/dev/null || true
+          git add . && git commit -m "Recon $TIMESTAMP" && git push origin recon-history || true
+
+      - name: Send Email Report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🛡️ Recon: ${{ env.TOTAL_ISSUES }} Issues found"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Security Scanner"
+          body: "Scanned ${{ env.DOMAINS_SCANNED }} domains. Found ${{ env.TOTAL_ISSUES }} issues."
+          attachments: final_reports/*.md

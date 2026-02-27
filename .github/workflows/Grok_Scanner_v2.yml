@@ -50,599 +50,161 @@ jobs:
           
           if [[ ! -f ~/go/bin/katana ]]; then
             echo "Installing katana..."
-            go install github.com/projectdiscovery/katana/cmd/katana@latest || {
-              echo "❌ Katana install failed"
-              exit 1
-            }
-          else
-            echo "✅ Katana cached"
+            go install github.com/projectdiscovery/katana/cmd/katana@latest
           fi
           
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           echo "✅ Dependencies ready"
 
-      - name: Verify Tools
-        run: |
-          echo "🔍 Verifying tools..."
-          which python3 && python3 --version
-          which katana && katana -version || echo "⚠️ Katana not in PATH yet"
-          python3 -c "import groq; print('✅ Groq module OK')" 2>/dev/null || echo "⚠️ Groq not available"
-
       - name: Create Production Scanner
         run: |
           cat > production_js_scanner.py << 'PYTHON_SCRIPT'
           #!/usr/bin/env python3
-          """
-          Production-Grade JS Security Scanner v4
-          Fixed: All edge cases, error handling, and performance issues
-          """
+          """Production JS Security Scanner v4 - Simplified & Robust"""
           
-          import os
-          import sys
-          import json
-          import asyncio
-          import re
-          import hashlib
-          import math
-          import subprocess
+          import os, sys, json, asyncio, re, hashlib, math, subprocess
           from typing import List, Dict, Optional, Set, Tuple
-          from urllib.parse import urlparse, urljoin
-          
-          try:
-              import jsbeautifier
-              BEAUTIFIER_AVAILABLE = True
-          except ImportError:
-              BEAUTIFIER_AVAILABLE = False
-              print("⚠️ jsbeautifier not available", file=sys.stderr)
+          from urllib.parse import urlparse
+          import concurrent.futures
           
           try:
               from groq import Groq
-              GROQ_AVAILABLE = True
-          except ImportError:
-              GROQ_AVAILABLE = False
-              print("⚠️ Groq not available", file=sys.stderr)
+              GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+              client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+              if client:
+                  print("✅ Groq active", file=sys.stderr)
+          except:
+              client = None
+              print("⚠️ Groq unavailable", file=sys.stderr)
           
-          # Initialize Groq
-          GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-          client = None
-          if GROQ_API_KEY and GROQ_AVAILABLE:
-              try:
-                  client = Groq(api_key=GROQ_API_KEY)
-                  print("✅ Groq initialized", file=sys.stderr)
-              except Exception as e:
-                  print(f"⚠️ Groq init failed: {e}", file=sys.stderr)
-          
-          # Concurrency limits
-          DOWNLOAD_CONCURRENCY = 6  # Reduced to avoid rate limits
-          LLM_CONCURRENCY = 3
-          
-          # Patterns (same as before but with better error handling)
           PATTERNS = {
-              "private_key": {
-                  "regex": r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
-                  "severity": "CRITICAL",
-                  "risk": "Full system compromise",
-                  "require_entropy": False,
-              },
-              "aws_access_key": {
-                  "regex": r'(?<![A-Z0-9])(AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}(?![A-Z0-9])',
-                  "severity": "CRITICAL",
-                  "risk": "AWS account takeover",
-                  "require_entropy": False,
-              },
-              "github_token": {
-                  "regex": r'gh[pousr]_[A-Za-z0-9_]{36,}',
-                  "severity": "CRITICAL",
-                  "risk": "Repository access",
-                  "require_entropy": False,
-              },
-              "slack_token": {
-                  "regex": r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}',
-                  "severity": "HIGH",
-                  "risk": "Slack workspace compromise",
-                  "require_entropy": False,
-              },
-              "jwt_token": {
-                  "regex": r'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}',
-                  "severity": "HIGH",
-                  "risk": "Session hijacking",
-                  "require_entropy": False,
-              },
-              "database_url": {
-                  "regex": r'(?i)(mongodb(\+srv)?|mysql|postgresql|redis)://[^@\s\'"<>]{3,}@[^\s\'"<>]{4,}',
-                  "severity": "CRITICAL",
-                  "risk": "Database access",
-                  "require_entropy": False,
-              },
-              "api_key": {
-                  "regex": r'(?i)\b(api[_\-]?key|apikey)\s*[:=]\s*["\']([a-zA-Z0-9_\-\.]{20,})["\']',
-                  "severity": "HIGH",
-                  "risk": "API access",
-                  "require_entropy": True,
-                  "value_group": 2,
-              },
+              "private_key": {"regex": r'-----BEGIN (RSA |EC )?PRIVATE KEY-----', "severity": "CRITICAL"},
+              "aws_key": {"regex": r'(AKIA|ASIA)[A-Z0-9]{16}', "severity": "CRITICAL"},
+              "github_token": {"regex": r'gh[pousr]_[A-Za-z0-9_]{36,}', "severity": "CRITICAL"},
+              "api_key": {"regex": r'(?i)api[_-]?key\s*[:=]\s*["\']([a-zA-Z0-9_\-]{20,})["\']', "severity": "HIGH"},
           }
           
-          # Safe public keys
-          SAFE_KEY_PREFIXES = [
-              "key_live_", "key_test_", "pk_live_", "pk_test_",
-              "AIza", "G-", "UA-", "GTM-", "ca-pub-",
-              "undefined", "null", "false", "true",
-          ]
+          SAFE_PREFIXES = ["key_live_", "pk_live_", "AIza", "G-", "UA-"]
+          BOILERPLATE = ["your_", "example", "demo", "test", "placeholder"]
           
-          # Third-party domains to skip
-          THIRD_PARTY_DOMAINS = [
-              "googletagmanager.com", "google-analytics.com", "facebook.net",
-              "cdn.segment.com", "hotjar.com", "intercom.io",
-              "stripe.com", "cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
-          ]
-          
-          # Library indicators
-          LIBRARY_INDICATORS = [
-              "jquery", "bootstrap", "angular", "lodash", "moment",
-              "webpack", "vendor", "polyfill", "analytics", "gtag",
-          ]
-          
-          # Boilerplate patterns
-          BOILERPLATE_VALUES = [
-              "your_", "insert_", "replace_", "example", "demo", "test",
-              "placeholder", "todo", "fixme", "xxx", "changeme",
-          ]
-          
-          FALSE_POSITIVE_PATTERNS = [
-              r'\be\.[A-Z][a-zA-Z]+',  # Enum style
-              r'"[a-z_]{5,}"',         # Route strings
-              r'(//|/\*)',              # Comments
-          ]
-          
-          
-          def shannon_entropy(data: str) -> float:
-              """Calculate Shannon entropy"""
-              if not data or len(data) < 8:
-                  return 0.0
-              try:
-                  freq = {}
-                  for ch in data:
-                      freq[ch] = freq.get(ch, 0) + 1
-                  n = len(data)
-                  return -sum((c / n) * math.log2(c / n) for c in freq.values())
-              except Exception:
-                  return 0.0
-          
-          
-          def is_boilerplate(value: str) -> bool:
-              """Check if value is boilerplate"""
-              v = value.lower()
-              return any(bp in v for bp in BOILERPLATE_VALUES)
-          
-          
-          def is_safe_key(value: str) -> bool:
-              """Check if it's a known public key"""
-              return any(value.startswith(pfx) for pfx in SAFE_KEY_PREFIXES)
-          
-          
-          def is_false_positive_context(context: str) -> bool:
-              """Check if context indicates false positive"""
-              for pattern in FALSE_POSITIVE_PATTERNS:
-                  try:
-                      if re.search(pattern, context):
-                          return True
-                  except Exception:
-                      continue
-              return False
-          
-          
-          def extract_value(match_text: str) -> str:
-              """Extract value from match"""
-              try:
-                  m = re.search(r'[:=]\s*["\']([^"\']{8,})["\']', match_text)
-                  return m.group(1) if m else match_text
-              except Exception:
-                  return match_text
-          
-          
-          # Download function
-          def _curl_fetch(url: str, timeout: int) -> Tuple[Optional[str], str]:
-              """Blocking curl fetch"""
-              try:
-                  parsed = urlparse(url)
-                  origin = f"{parsed.scheme}://{parsed.netloc}"
-                  
-                  cmd = [
-                      "curl", "-sL", "-A",
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                      "--max-time", str(timeout),
-                      "--max-filesize", "3000000",
-                      "--compressed",
-                      "-H", "Accept: */*",
-                      "-H", f"Referer: {origin}/",
-                      url,
-                  ]
-                  
-                  result = subprocess.run(
-                      cmd,
-                      capture_output=True,
-                      timeout=timeout + 5
-                  )
-                  
-                  if result.returncode != 0:
-                      return None, f"curl_error_{result.returncode}"
-                  
-                  content = result.stdout.decode("utf-8", errors="ignore")
-                  
-                  if len(content) < 200:
-                      return None, "too_small"
-                  
-                  # Check if HTML (error page)
-                  stripped = content.lstrip()
-                  if (stripped.startswith("<!") or 
-                      stripped.lower().startswith("<html") or
-                      "<title>" in stripped[:1000].lower()):
-                      return None, "html_response"
-                  
-                  return content, ""
-              
-              except subprocess.TimeoutExpired:
-                  return None, "timeout"
-              except Exception as e:
-                  return None, str(e)[:50]
-          
-          
-          import concurrent.futures
           _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
           
+          def _curl_fetch(url: str, timeout: int) -> Tuple[Optional[str], str]:
+              try:
+                  result = subprocess.run(
+                      ["curl", "-sL", "-A", "Mozilla/5.0", "--max-time", str(timeout), url],
+                      capture_output=True, timeout=timeout + 5
+                  )
+                  if result.returncode != 0:
+                      return None, "curl_failed"
+                  content = result.stdout.decode("utf-8", errors="ignore")
+                  if len(content) < 200 or content.lstrip().startswith("<"):
+                      return None, "html_or_small"
+                  return content, ""
+              except:
+                  return None, "error"
           
-          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15) -> Tuple[Optional[str], str]:
-              """Async wrapper for download"""
+          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15):
               async with sem:
                   loop = asyncio.get_event_loop()
                   return await loop.run_in_executor(_thread_pool, _curl_fetch, url, timeout)
           
-          
-          # Analyzer class
           class JSAnalyzer:
-              def __init__(self, target_domain: str):
-                  self.target_domain = target_domain.lower().replace("www.", "")
-                  self.seen_hashes: Set[str] = set()
-                  self.llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-                  self.stats = {
-                      "total": 0,
-                      "skipped_download": 0,
-                      "skipped_3rd_party": 0,
-                      "skipped_library": 0,
-                      "skipped_html": 0,
-                      "skipped_duplicate": 0,
-                      "analyzed": 0,
-                      "findings": 0,
-                      "fp_suppressed": 0,
-                  }
+              def __init__(self, domain: str):
+                  self.domain = domain.lower().replace("www.", "")
+                  self.seen: Set[str] = set()
+                  self.stats = {"total": 0, "analyzed": 0, "findings": 0, "skipped": 0}
               
               def is_same_domain(self, url: str) -> bool:
-                  """Check if URL is from target domain"""
                   try:
                       host = urlparse(url).netloc.lower().replace("www.", "")
-                      if host == self.target_domain or host.endswith("." + self.target_domain):
-                          return True
-                      stem = self.target_domain.split(".")[0]
-                      return len(stem) >= 4 and stem in host
-                  except Exception:
-                      return False
-              
-              def is_third_party(self, url: str) -> bool:
-                  """Check if URL is third-party"""
-                  try:
-                      host = urlparse(url).netloc.lower()
-                      return any(tp in host for tp in THIRD_PARTY_DOMAINS)
-                  except Exception:
-                      return False
-              
-              def is_library(self, url: str) -> bool:
-                  """Check if file is a library"""
-                  try:
-                      basename = os.path.basename(urlparse(url).path).lower()
-                      return any(lib in basename for lib in LIBRARY_INDICATORS)
-                  except Exception:
-                      return False
-              
-              def is_html(self, content: str) -> bool:
-                  """Check if content is HTML"""
-                  try:
-                      s = content.lstrip()[:500]
-                      return (s.startswith("<!") or 
-                              s.lower().startswith("<html") or
-                              "<title>" in s.lower())
-                  except Exception:
+                      return host == self.domain or host.endswith("." + self.domain) or self.domain.split(".")[0] in host
+                  except:
                       return False
               
               def is_duplicate(self, content: str) -> bool:
-                  """Check for duplicate content"""
-                  try:
-                      h = hashlib.md5(content.encode()).hexdigest()
-                      if h in self.seen_hashes:
-                          return True
-                      self.seen_hashes.add(h)
-                      return False
-                  except Exception:
-                      return False
+                  h = hashlib.md5(content.encode()).hexdigest()
+                  if h in self.seen:
+                      return True
+                  self.seen.add(h)
+                  return False
               
-              def get_context(self, content: str, pos: int, size: int = 200) -> str:
-                  """Extract context around match"""
-                  try:
-                      start = max(0, pos - size)
-                      end = min(len(content), pos + size)
-                      ctx = content[start:end]
-                      return re.sub(r'\s+', ' ', ctx).strip()[:300]
-                  except Exception:
-                      return ""
-              
-              def pattern_scan(self, content: str, url: str) -> Tuple[List[Dict], int]:
-                  """Scan content for patterns"""
+              def scan(self, content: str, url: str) -> List[Dict]:
                   findings = []
-                  suppressed = 0
-                  
                   for name, info in PATTERNS.items():
                       try:
                           for m in re.finditer(info["regex"], content):
-                              try:
-                                  raw_match = m.group(0)
-                                  vg = info.get("value_group", 0)
-                                  value = m.group(vg) if vg and vg <= len(m.groups()) else extract_value(raw_match)
-                                  context = self.get_context(content, m.start())
-                                  
-                                  # Filter false positives
-                                  if is_boilerplate(value):
-                                      suppressed += 1
-                                      continue
-                                  
-                                  if is_safe_key(value):
-                                      suppressed += 1
-                                      continue
-                                  
-                                  if is_false_positive_context(context):
-                                      suppressed += 1
-                                      continue
-                                  
-                                  if info.get("require_entropy"):
-                                      if shannon_entropy(value) < 3.5 or len(value) < 16:
-                                          suppressed += 1
-                                          continue
-                                  
-                                  if len(value) < 12:
-                                      suppressed += 1
-                                      continue
-                                  
-                                  findings.append({
-                                      "type": name,
-                                      "severity": info["severity"],
-                                      "risk": info["risk"],
-                                      "url": url,
-                                      "context": context,
-                                      "match": raw_match[:80],
-                                      "line": content[:m.start()].count("\n") + 1,
-                                      "confidence": "pattern",
-                                      "entropy": round(shannon_entropy(value), 2),
-                                      "recommendation": self._get_recommendation(name),
-                                  })
-                              
-                              except Exception as e:
-                                  print(f"  Match error: {e}", file=sys.stderr)
+                              val = m.group(1) if m.lastindex else m.group(0)
+                              if any(bp in val.lower() for bp in BOILERPLATE):
                                   continue
-                      
-                      except Exception as e:
-                          print(f"  Pattern {name} error: {e}", file=sys.stderr)
-                          continue
-                  
-                  return findings, suppressed
-              
-              def _get_recommendation(self, vuln_type: str) -> str:
-                  """Get recommendation for vuln type"""
-                  recs = {
-                      "private_key": "URGENT: Rotate immediately. Audit all systems.",
-                      "aws_access_key": "URGENT: Deactivate in AWS IAM. Enable CloudTrail.",
-                      "github_token": "Revoke on GitHub. Check audit log.",
-                      "api_key": "Rotate key. Move to environment variables.",
-                  }
-                  return recs.get(vuln_type, "Review and rotate if real.")
-              
-              async def llm_analyze(self, content: str, url: str) -> Optional[Dict]:
-                  """LLM analysis (optional, if Groq available)"""
-                  if not client:
-                      return None
-                  
-                  try:
-                      # Extract suspicious lines
-                      keywords = ["AKIA", "private_key", "client_secret", "mongodb://"]
-                      suspicious = [l for l in content.split("\n")[:500] 
-                                   if any(kw in l for kw in keywords)]
-                      
-                      if len(suspicious) < 1:
-                          return None
-                      
-                      sample = "\n".join(suspicious[:20])
-                      
-                      prompt = f"""Analyze for REAL backend secrets in frontend JS.
-
-          File: {os.path.basename(url)}
-          Code:
-          ```
-          {sample[:1500]}
-          ```
-
-          Only flag REAL backend secrets with high entropy.
-          Ignore: public SDK keys, placeholders, UI strings.
-
-          If real secret found:
-          {{"has_vulnerability": true, "type": "type", "severity": "CRITICAL|HIGH", "evidence": "line", "confidence": "high"}}
-
-          If nothing: {{"has_vulnerability": false}}
-
-          JSON only, no markdown."""
-                      
-                      async with self.llm_sem:
-                          resp = client.chat.completions.create(
-                              model="llama-3.3-70b-versatile",
-                              messages=[{"role": "user", "content": prompt}],
-                              max_tokens=400,
-                              temperature=0.1,
-                          )
-                          
-                          raw = resp.choices[0].message.content.strip()
-                          raw = raw.replace("```json", "").replace("```", "").strip()
-                          result = json.loads(raw)
-                          
-                          if result.get("has_vulnerability") and result.get("confidence") == "high":
-                              return {
-                                  "type": result.get("type", "unknown"),
-                                  "severity": result.get("severity", "HIGH"),
-                                  "risk": "Backend secret in frontend",
+                              if any(val.startswith(sp) for sp in SAFE_PREFIXES):
+                                  continue
+                              if len(val) < 12:
+                                  continue
+                              findings.append({
+                                  "type": name,
+                                  "severity": info["severity"],
                                   "url": url,
-                                  "context": result.get("evidence", "")[:300],
-                                  "confidence": "llm_verified",
-                                  "recommendation": "Rotate immediately.",
-                              }
-                  
-                  except Exception as e:
-                      print(f"  LLM error: {e}", file=sys.stderr)
-                  
-                  return None
+                                  "match": val[:60],
+                              })
+                      except:
+                          continue
+                  return findings
               
-              async def analyze_file(self, url: str, content: str) -> List[Dict]:
-                  """Analyze single JS file"""
+              async def analyze(self, url: str, content: str) -> List[Dict]:
                   self.stats["total"] += 1
-                  
-                  # Filters
-                  if not self.is_same_domain(url) or self.is_third_party(url):
-                      self.stats["skipped_3rd_party"] += 1
+                  if not self.is_same_domain(url) or self.is_duplicate(content):
+                      self.stats["skipped"] += 1
                       return []
-                  
-                  if self.is_library(url):
-                      self.stats["skipped_library"] += 1
-                      return []
-                  
-                  if self.is_html(content):
-                      self.stats["skipped_html"] += 1
-                      return []
-                  
-                  if self.is_duplicate(content):
-                      self.stats["skipped_duplicate"] += 1
-                      return []
-                  
                   self.stats["analyzed"] += 1
-                  findings = []
-                  
-                  # Pattern scan
-                  pattern_findings, suppressed = self.pattern_scan(content, url)
-                  self.stats["fp_suppressed"] += suppressed
-                  findings.extend(pattern_findings)
-                  
-                  # LLM scan (if available)
-                  if client and len(content) > 500:
-                      llm_finding = await self.llm_analyze(content, url)
-                      if llm_finding:
-                          findings.append(llm_finding)
-                  
+                  findings = self.scan(content, url)
                   self.stats["findings"] += len(findings)
                   return findings
           
-          
           async def main():
-              """Main entry point"""
               if len(sys.argv) < 3:
-                  print("Usage: scanner.py <js_urls.txt> <target_domain>", file=sys.stderr)
                   sys.exit(1)
               
-              js_list, target_domain = sys.argv[1], sys.argv[2]
-              
-              if not os.path.exists(js_list):
-                  print(f"❌ File not found: {js_list}", file=sys.stderr)
-                  sys.exit(1)
-              
+              js_list, domain = sys.argv[1], sys.argv[2]
               with open(js_list) as f:
                   urls = [l.strip() for l in f if l.strip()]
               
-              if not urls:
-                  print(json.dumps({"findings": [], "stats": {}}))
-                  return
+              analyzer = JSAnalyzer(domain)
+              sem = asyncio.Semaphore(6)
               
-              analyzer = JSAnalyzer(target_domain)
-              dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+              print(f"🧠 Scanner: {len(urls)} files", file=sys.stderr)
               
-              print(f"🧠 JS Scanner v4", file=sys.stderr)
-              print(f"   Target: {target_domain}", file=sys.stderr)
-              print(f"   URLs: {len(urls)}", file=sys.stderr)
-              print(f"   LLM: {'✅' if client else '⚠️ Pattern-only'}", file=sys.stderr)
-              print("", file=sys.stderr)
-              
-              async def fetch_and_analyze(i: int, url: str) -> List[Dict]:
-                  """Download and analyze single file"""
-                  try:
-                      fname = os.path.basename(urlparse(url).path) or "unknown.js"
-                      print(f"[{i:02d}/{len(urls)}] {fname[:40]}", file=sys.stderr)
-                      
-                      content, skip_reason = await download_js(url, dl_sem)
-                      
-                      if not content:
-                          analyzer.stats["skipped_download"] += 1
-                          print(f"[{i:02d}]    ⚠️ {skip_reason}", file=sys.stderr)
-                          return []
-                      
-                      findings = await analyzer.analyze_file(url, content)
-                      status = f"🔥 {len(findings)}" if findings else "✓"
-                      print(f"[{i:02d}]    {status}", file=sys.stderr)
-                      return findings
-                  
-                  except Exception as e:
-                      print(f"[{i:02d}]    ❌ {e}", file=sys.stderr)
+              async def process(i, url):
+                  print(f"[{i:02d}] {os.path.basename(url)[:40]}", file=sys.stderr)
+                  content, err = await download_js(url, sem)
+                  if not content:
+                      print(f"[{i:02d}]    ⚠️ {err}", file=sys.stderr)
                       return []
+                  findings = await analyzer.analyze(url, content)
+                  print(f"[{i:02d}]    {'🔥 ' + str(len(findings)) if findings else '✓'}", file=sys.stderr)
+                  return findings
               
-              # Parallel processing
-              tasks = [fetch_and_analyze(i, url) for i, url in enumerate(urls, 1)]
-              results = await asyncio.gather(*tasks, return_exceptions=True)
+              results = await asyncio.gather(*[process(i, u) for i, u in enumerate(urls, 1)], return_exceptions=True)
+              all_findings = [f for r in results if isinstance(r, list) for f in r]
+              all_findings.sort(key=lambda x: {"CRITICAL": 0, "HIGH": 1}.get(x.get("severity"), 2))
               
-              # Collect findings (handle exceptions)
-              all_findings = []
-              for r in results:
-                  if isinstance(r, list):
-                      all_findings.extend(r)
-                  elif isinstance(r, Exception):
-                      print(f"Task error: {r}", file=sys.stderr)
-              
-              # Sort by severity
-              sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-              all_findings.sort(key=lambda x: sev_order.get(x.get("severity", "LOW"), 4))
-              
-              output = {"findings": all_findings, "stats": analyzer.stats}
-              
-              # Write results
               with open("scan_results.json", "w") as f:
-                  json.dump(output, f, indent=2)
+                  json.dump({"findings": all_findings, "stats": analyzer.stats}, f, indent=2)
               
-              print("", file=sys.stderr)
-              print("📊 Stats:", file=sys.stderr)
-              for k, v in analyzer.stats.items():
-                  print(f"   {k:20s}: {v}", file=sys.stderr)
-          
+              print(f"\n📊 Stats: analyzed={analyzer.stats['analyzed']}, findings={analyzer.stats['findings']}", file=sys.stderr)
           
           if __name__ == "__main__":
-              try:
-                  asyncio.run(main())
-              except KeyboardInterrupt:
-                  print("\n⚠️ Interrupted", file=sys.stderr)
-              except Exception as e:
-                  print(f"\n❌ Fatal error: {e}", file=sys.stderr)
-                  import traceback
-                  traceback.print_exc(file=sys.stderr)
-                  sys.exit(1)
+              asyncio.run(main())
           PYTHON_SCRIPT
           
           chmod +x production_js_scanner.py
-          echo "✅ Scanner created"
 
       - name: Run Production Scan
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          set -euo pipefail
+          # CRITICAL: Do NOT use 'set -e' here - we want to process ALL domains even if one fails
+          set -uo pipefail
           
           mkdir -p reports tmp stats
           
@@ -654,150 +216,134 @@ jobs:
           
           # Validate targets
           if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
-            echo "⚠️ No targets.txt, using default"
             echo "example.com" > targets.txt
           fi
           
-          # Select targets (wrapped to prevent errors)
-          (grep -v '^#' targets.txt | grep -v '^$' | shuf -n 6 > tmp/selected.txt) 2>/dev/null || echo "example.com" > tmp/selected.txt
+          # Select targets
+          grep -v '^#' targets.txt 2>/dev/null | grep -v '^$' | shuf -n 6 > tmp/selected.txt || echo "example.com" > tmp/selected.txt
           
           echo "════════════════════════════════════════"
           echo "🧠 PRODUCTION JS SCANNER"
           echo "════════════════════════════════════════"
-          cat tmp/selected.txt | nl || echo "No targets"
+          cat tmp/selected.txt | nl
+          total_domains=$(wc -l < tmp/selected.txt)
           echo "════════════════════════════════════════"
           echo ""
           
-          # Process domains
-          while IFS= read -r domain; do
-            [[ -z "$domain" ]] && continue
+          # Process EACH domain (with error isolation)
+          while read -r domain; do
+            # Validate domain
+            if [[ -z "$domain" ]] || [[ "$domain" =~ ^[[:space:]]*# ]]; then
+              continue
+            fi
+            
             domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            [[ -z "$domain" ]] && continue
+            if [[ -z "$domain" ]]; then
+              continue
+            fi
             
             domains_scanned=$((domains_scanned + 1))
             
             echo ""
             echo "════════════════════════════════════════"
-            echo "🔍 [$domains_scanned] $domain"
+            echo "🔍 [$domains_scanned/$total_domains] $domain"
             echo "════════════════════════════════════════"
             
-            report="reports/${domain}_report.md"
-            
-            # JS Discovery
-            echo "📡 Discovering JavaScript..."
-            (timeout 90s katana -u "https://$domain" -jc -d 3 -c 20 -silent > tmp/urls_${domain}.txt) 2>/dev/null || touch tmp/urls_${domain}.txt
-            
-            if [[ -s tmp/urls_${domain}.txt ]]; then
-              base_domain="${domain#www.}"
-              base_stem="${base_domain%%.*}"
+            # Isolate each domain in a subshell so errors don't break the loop
+            (
+              set +e  # Don't exit on errors within domain processing
               
-              # Show sample (FIX: Added error suppression + subshell)
-              echo "   🔍 Sample URLs from katana:"
-              (grep -iE '\.js' tmp/urls_${domain}.txt 2>/dev/null | grep -i "${base_stem}" 2>/dev/null | head -5 | sed 's/^/      /') 2>/dev/null || echo "      (none found)"
+              report="reports/${domain}_report.md"
               
-              # Filter JS files (all wrapped to prevent pipe errors)
-              (grep -iE '\.js(\?[^[:space:]]*)?$' tmp/urls_${domain}.txt 2>/dev/null \
+              # Discovery
+              echo "📡 Discovering..."
+              timeout 90s katana -u "https://$domain" -jc -d 3 -c 20 -silent > tmp/urls_${domain}.txt 2>/dev/null || touch tmp/urls_${domain}.txt
+              
+              if [[ ! -s tmp/urls_${domain}.txt ]]; then
+                echo "⚠️ No URLs found"
+                echo "# $domain - No JS Found" > "$report"
+                exit 0
+              fi
+              
+              # Filter JS
+              stem="${domain%%.*}"
+              grep -iE '\.js(\?|$)' tmp/urls_${domain}.txt 2>/dev/null \
                 | grep -iv '\.json' \
-                | grep -i "${base_stem}" \
-                | grep -ivE '://app\.' \
-                | grep -ivE '://account\.' \
-                | grep -ivE '://login\.' \
-                | grep -ivE '://dashboard\.' \
-                | grep -ivE '(analytics|hotjar|gtag)' \
-                > tmp/js_${domain}_raw.txt) 2>/dev/null || touch tmp/js_${domain}_raw.txt
+                | grep -i "$stem" \
+                | grep -ivE '(analytics|gtag|ads)' \
+                | sort -u \
+                | head -20 > tmp/js_${domain}.txt 2>/dev/null || touch tmp/js_${domain}.txt
               
-              # Deduplicate and limit
-              (sort -u tmp/js_${domain}_raw.txt 2>/dev/null | awk -F/ '!seen[$NF]++' | head -n 20 > tmp/js_${domain}.txt) 2>/dev/null || touch tmp/js_${domain}.txt
+              js_count=$(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo 0)
               
-              js_count=$(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo "0")
+              if [[ $js_count -eq 0 ]]; then
+                echo "⚠️ No JS after filtering"
+                echo "# $domain - No JS After Filtering" > "$report"
+                exit 0
+              fi
               
-              if [[ $js_count -gt 0 ]]; then
-                echo "🧠 Analyzing $js_count files..."
-                
-                # Run scanner (redirect only stderr to log)
-                python3 production_js_scanner.py tmp/js_${domain}.txt "$domain" 2>tmp/scanner_log_${domain}.txt || {
-                  echo "⚠️ Scanner error"
-                  cat tmp/scanner_log_${domain}.txt 2>/dev/null || true
-                }
-                
-                # Show scanner log
-                cat tmp/scanner_log_${domain}.txt 2>/dev/null || true
-                
-                if [[ -f scan_results.json ]]; then
-                  mv scan_results.json tmp/scan_${domain}.json
-                  
-                  # Parse results safely
-                  finding_count=$(jq '.findings | length' tmp/scan_${domain}.json 2>/dev/null || echo "0")
-                  critical=$(jq '[.findings[] | select(.severity=="CRITICAL")] | length' tmp/scan_${domain}.json 2>/dev/null || echo "0")
-                  high=$(jq '[.findings[] | select(.severity=="HIGH")] | length' tmp/scan_${domain}.json 2>/dev/null || echo "0")
-                  analyzed=$(jq '.stats.analyzed' tmp/scan_${domain}.json 2>/dev/null || echo "0")
-                  
-                  total_findings=$((total_findings + finding_count))
-                  critical_findings=$((critical_findings + critical))
-                  high_findings=$((high_findings + high))
-                  js_analyzed=$((js_analyzed + analyzed))
-                  
-                  # Generate report
-                  cat > "$report" << EOF
-          # 🧠 JS Security Analysis: $domain
+              echo "🧠 Analyzing $js_count files..."
+              
+              # Run scanner
+              python3 production_js_scanner.py tmp/js_${domain}.txt "$domain" 2>&1 || {
+                echo "⚠️ Scanner error"
+                exit 0
+              }
+              
+              if [[ ! -f scan_results.json ]]; then
+                echo "⚠️ No results"
+                exit 0
+              fi
+              
+              mv scan_results.json tmp/scan_${domain}.json
+              
+              # Parse results
+              finding_count=$(jq '.findings | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              critical=$(jq '[.findings[] | select(.severity=="CRITICAL")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              high=$(jq '[.findings[] | select(.severity=="HIGH")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              analyzed=$(jq '.stats.analyzed' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              
+              # Generate report
+              cat > "$report" << EOF
+          # 🧠 $domain Security Scan
           
           **Date:** $(date '+%Y-%m-%d %H:%M UTC')
           **Run:** #${{ github.run_number }}
-          **Scanner:** v4 (production)
           
-          ## 📊 Stats
-          
+          ## Stats
           | Metric | Value |
           |--------|------:|
-          | JS Files Scanned | $js_count |
-          | Files Analyzed | $analyzed |
-          | Total Findings | **$finding_count** |
+          | JS Files | $js_count |
+          | Analyzed | $analyzed |
+          | Findings | **$finding_count** |
           | Critical | **$critical** |
           | High | **$high** |
           
           EOF
-                  
-                  if [[ $finding_count -gt 0 ]]; then
-                    echo "## 🚨 Findings" >> "$report"
-                    echo "" >> "$report"
-                    
-                    # Add findings by severity
-                    for severity in CRITICAL HIGH MEDIUM; do
-                      count=$(jq "[.findings[] | select(.severity==\"$severity\")] | length" tmp/scan_${domain}.json 2>/dev/null || echo "0")
-                      if [[ $count -gt 0 ]]; then
-                        echo "### ${severity} ($count)" >> "$report"
-                        echo "" >> "$report"
-                        
-                        (jq -r ".findings[] | select(.severity==\"$severity\") | \"
-          #### \(.type | ascii_upcase)
-          **Severity:** \(.severity)
-          **Risk:** \(.risk)
-          **File:** \`\(.url)\`
-          **Line:** ~\(.line // 0)
-          
-          \`\`\`javascript
-          \(.context // \"see file\")
-          \`\`\`
-          
-          **Action:** \(.recommendation)
-          
-          ---
-          \"" tmp/scan_${domain}.json >> "$report") 2>/dev/null || echo "Error formatting findings" >> "$report"
-                      fi
-                    done
-                  else
-                    echo "## ✅ No Issues" >> "$report"
-                  fi
-                  
-                  echo "✅ Complete: $finding_count findings ($critical critical, $high high)"
-                else
-                  echo "⚠️ No results file"
-                fi
+              
+              if [[ $finding_count -gt 0 ]]; then
+                echo "## 🚨 Findings" >> "$report"
+                jq -r '.findings[] | "### \(.type)\n**Severity:** \(.severity)\n**File:** `\(.url)`\n**Match:** `\(.match)`\n"' tmp/scan_${domain}.json >> "$report" 2>/dev/null
               else
-                echo "⚠️ No JS files after filtering"
+                echo "## ✅ No Issues" >> "$report"
               fi
-            else
-              echo "⚠️ Discovery returned no results"
+              
+              echo "✅ Done: $finding_count findings"
+              
+              # Export results (these will be picked up by parent shell)
+              echo "$finding_count" > tmp/${domain}_findings.txt
+              echo "$critical" > tmp/${domain}_critical.txt
+              echo "$high" > tmp/${domain}_high.txt
+              echo "$analyzed" > tmp/${domain}_analyzed.txt
+              
+            ) || echo "⚠️ Domain processing failed (continuing)"
+            
+            # Collect stats from subshell
+            if [[ -f tmp/${domain}_findings.txt ]]; then
+              total_findings=$((total_findings + $(cat tmp/${domain}_findings.txt)))
+              critical_findings=$((critical_findings + $(cat tmp/${domain}_critical.txt)))
+              high_findings=$((high_findings + $(cat tmp/${domain}_high.txt)))
+              js_analyzed=$((js_analyzed + $(cat tmp/${domain}_analyzed.txt)))
             fi
             
             sleep 1
@@ -816,21 +362,17 @@ jobs:
           echo "════════════════════════════════════════"
           
           # Save stats
-          cat > stats/scan_${{ github.run_number }}.json << STATS_EOF
+          cat > stats/scan_${{ github.run_number }}.json << EOF
           {
             "run": ${{ github.run_number }},
             "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "domains": $domains_scanned,
             "js_files": $js_analyzed,
-            "findings": {
-              "total": $total_findings,
-              "critical": $critical_findings,
-              "high": $high_findings
-            }
+            "findings": {"total": $total_findings, "critical": $critical_findings, "high": $high_findings}
           }
-          STATS_EOF
+          EOF
           
-          # Export to env
+          # Export
           echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
           echo "JS_ANALYZED=$js_analyzed" >> $GITHUB_ENV
           echo "TOTAL_FINDINGS=$total_findings" >> $GITHUB_ENV
@@ -845,14 +387,13 @@ jobs:
         run: |
           mkdir -p reports
           
-          cat > reports/SUMMARY.md << 'SUMMARY_EOF'
+          cat > reports/SUMMARY.md << 'EOF'
           # 🧠 JS Security Scanner - Summary
           
           **Date:** $(date '+%Y-%m-%d %H:%M UTC')
           **Run:** #${{ github.run_number }}
           
-          ## 📊 Metrics
-          
+          ## Metrics
           | Metric | Value |
           |--------|------:|
           | Domains | ${DOMAINS_SCANNED:-0} |
@@ -861,26 +402,9 @@ jobs:
           | Critical | ${CRITICAL_FINDINGS:-0} |
           | High | ${HIGH_FINDINGS:-0} |
           
-          ## 🎯 Targets
-          
-          $(cat tmp/selected.txt 2>/dev/null | nl || echo "None")
-          
-          ## 🔍 Status
-          
-          $(if [[ "${CRITICAL_FINDINGS:-0}" -gt 0 ]]; then
-            echo "🚨 **CRITICAL:** ${CRITICAL_FINDINGS} issue(s) - immediate action required"
-          elif [[ "${HIGH_FINDINGS:-0}" -gt 0 ]]; then
-            echo "⚠️ **HIGH:** ${HIGH_FINDINGS} issue(s) - review within 24h"
-          elif [[ "${TOTAL_FINDINGS:-0}" -gt 0 ]]; then
-            echo "ℹ️ **Findings:** ${TOTAL_FINDINGS} issue(s) detected"
-          else
-            echo "✅ **Clean:** No issues detected"
-          fi)
-          
-          ## 📝 Reports
-          
-          $(ls reports/*_report.md 2>/dev/null | sed 's/reports\//- /' || echo "- None")
-          SUMMARY_EOF
+          ## Reports
+          $(ls reports/*_report.md 2>/dev/null | wc -l) domain reports generated
+          EOF
 
       - name: Upload Results
         if: always()
@@ -890,7 +414,6 @@ jobs:
           path: |
             reports/
             stats/
-            tmp/*.json
           retention-days: 30
 
       - name: Email Report
@@ -902,13 +425,11 @@ jobs:
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' || env.HAS_FINDINGS == 'true' && '⚠️ FINDINGS' || '✅ CLEAN' }} | Scan #${{ github.run_number }}"
+          subject: "${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' || env.HAS_FINDINGS == 'true' && '⚠️ FINDINGS' || '✅ CLEAN' }} | ${{ env.DOMAINS_SCANNED }} Domains | Scan #${{ github.run_number }}"
           to: ${{ secrets.EMAIL_USERNAME }}
           from: JS Scanner <scan@security.local>
           body: |
             🧠 JS SECURITY SCAN
-            
-            📅 $(date '+%Y-%m-%d %H:%M UTC')
             
             📊 RESULTS
             • Domains:   ${{ env.DOMAINS_SCANNED }}
@@ -917,7 +438,7 @@ jobs:
             • Critical:  ${{ env.CRITICAL_FINDINGS }}
             • High:      ${{ env.HIGH_FINDINGS }}
             
-            ${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL - IMMEDIATE ACTION' || env.HAS_FINDINGS == 'true' && '⚠️ REVIEW REQUIRED' || '✅ ALL CLEAR' }}
+            ${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' || env.HAS_FINDINGS == 'true' && '⚠️ REVIEW' || '✅ CLEAN' }}
             
             🔗 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           attachments: reports/*
@@ -925,6 +446,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: |
-          rm -rf tmp/*.txt tmp/*.js tmp/*_raw.txt 2>/dev/null || true
-          echo "✅ Cleanup done"
+        run: rm -rf tmp/*.txt tmp/*.js 2>/dev/null || true

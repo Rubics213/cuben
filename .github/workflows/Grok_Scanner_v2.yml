@@ -675,8 +675,7 @@ jobs:
                 | grep -iv '\.json' \
                 | grep -i "${base_domain}" \
                 | grep -ivE '(%[0-9a-f]{2}){2,}' \
-                | grep -ivE '(matomo|piwik|gtag|analytics|hotjar|clarity|segment|
-intercom|zendesk|hubspot|cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare)' \
+                | grep -ivE '(matomo|piwik|gtag|analytics|hotjar|clarity|segment|intercom|zendesk|hubspot|cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare)' \
                 > tmp/js_${domain}_raw.txt 2>/dev/null || true
 
               # Deduplicate by basename so matomo.js x17 becomes matomo.js x1,

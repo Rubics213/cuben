@@ -196,6 +196,8 @@ jobs:
               "webpack", "vendor", "polyfill", "chunk", "runtime",
               "analytics", "gtag", "recaptcha", "turnstile", "captcha",
               "sentry", "datadog", "newrelic", "rollbar",
+              "matomo", "piwik", "onetrust", "otSDK", "cookiebot",
+              "intercom", "freshchat", "drift", "crisp",
           ]
 
           # ── Context patterns that indicate a match is NOT a real secret ──────────
@@ -258,44 +260,44 @@ jobs:
 
           # ── Downloader ────────────────────────────────────────────────────────────
 
-          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 12) -> Optional[str]:
-              """Async JS downloader with semaphore-based concurrency control."""
-              async with sem:
-                  try:
-                      proc = await asyncio.create_subprocess_exec(
-                          "curl", "-sL",
-                          "-A", "Mozilla/5.0 (compatible; SecurityScanner/2.0)",
-                          "--max-time", str(timeout),
-                          "--max-filesize", "4000000",
-                          "-H", "Accept: application/javascript, text/javascript, */*",
-                          url,
-                          stdout=asyncio.subprocess.PIPE,
-                          stderr=asyncio.subprocess.DEVNULL,
-                      )
-                      try:
-                          stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 3)
-                      except asyncio.TimeoutError:
-                          proc.kill()
-                          return None
+          import concurrent.futures
+          _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=12)
 
-                      if proc.returncode != 0:
-                          return None
-
-                      content = stdout.decode("utf-8", errors="ignore")
-                      if len(content) < 200:
-                          return None
-
-                      # Reject HTML (error pages, redirects, login walls)
-                      stripped = content.lstrip()
-                      if (stripped.startswith("<!") or
-                              stripped.lower().startswith("<html") or
-                              re.match(r'<\s*!DOCTYPE', stripped, re.IGNORECASE)):
-                          return None
-
-                      return content
-
-                  except Exception:
+          def _curl_fetch(url: str, timeout: int) -> Optional[str]:
+              """Blocking curl fetch — run in thread pool for concurrency."""
+              try:
+                  import subprocess as _sp
+                  result = _sp.run(
+                      ["curl", "-sL",
+                       "-A", "Mozilla/5.0 (compatible; SecurityScanner/2.0)",
+                       "--max-time", str(timeout),
+                       "--max-filesize", "4000000",
+                       "--retry", "1",
+                       "-H", "Accept: application/javascript, text/javascript, */*",
+                       url],
+                      capture_output=True,
+                      timeout=timeout + 5,
+                  )
+                  if result.returncode != 0:
                       return None
+                  content = result.stdout.decode("utf-8", errors="ignore")
+                  if len(content) < 200:
+                      return None
+                  # Reject HTML responses (error pages / redirects)
+                  stripped = content.lstrip()
+                  if (stripped.startswith("<!") or
+                          stripped.lower().startswith("<html") or
+                          re.match(r'<\s*!DOCTYPE', stripped, re.IGNORECASE)):
+                      return None
+                  return content
+              except Exception:
+                  return None
+
+          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15) -> Optional[str]:
+              """Async wrapper: runs blocking curl in a thread pool."""
+              async with sem:
+                  loop = asyncio.get_event_loop()
+                  return await loop.run_in_executor(_thread_pool, _curl_fetch, url, timeout)
 
 
           # ── Analyzer ─────────────────────────────────────────────────────────────
@@ -666,25 +668,26 @@ jobs:
             if [[ -s tmp/urls_${domain}.txt ]]; then
 
               # ── Domain-scoped JS filtering ─────────────────────────────────
-              # Step 1: grab .js URLs, drop .json, drop obvious third-party CDNs.
-              # We keep ANY URL that contains the base domain string — subdomains
-              # like assets.twitch.tv, cdn.grafana.com etc. are intentionally kept.
-              # Fine-grained third-party rejection is handled by the Python scanner.
-              # Write to temp file first to avoid broken-pipe under set -euo pipefail.
               base_domain="${domain#www.}"   # strip leading www. if present
+              total_urls=$(wc -l < tmp/urls_${domain}.txt 2>/dev/null || echo "0")
 
               grep -iE '\.js(\?[^[:space:]]*)?$' tmp/urls_${domain}.txt \
                 | grep -iv '\.json' \
                 | grep -i "${base_domain}" \
+                | grep -ivE '(%[0-9a-f]{2}){2,}' \
+                | grep -ivE '(matomo|piwik|gtag|analytics|hotjar|clarity|segment|
+intercom|zendesk|hubspot|cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare)' \
                 > tmp/js_${domain}_raw.txt 2>/dev/null || true
 
-              sort -u tmp/js_${domain}_raw.txt > tmp/js_${domain}_sorted.txt 2>/dev/null || true
-              head -n 20 tmp/js_${domain}_sorted.txt > tmp/js_${domain}.txt 2>/dev/null || true
+              # Deduplicate by basename so matomo.js x17 becomes matomo.js x1,
+              # then take the 25 URLs with the most unique filenames.
+              # Strategy: sort unique full URLs, then pick one per unique basename.
+              sort -u tmp/js_${domain}_raw.txt | awk -F/ '!seen[$NF]++' \
+                > tmp/js_${domain}_sorted.txt 2>/dev/null || true
+              head -n 25 tmp/js_${domain}_sorted.txt > tmp/js_${domain}.txt 2>/dev/null || true
               rm -f tmp/js_${domain}_raw.txt tmp/js_${domain}_sorted.txt
 
-              # Debug: show what was found before and after filter
-              total_urls=$(wc -l < tmp/urls_${domain}.txt 2>/dev/null || echo "0")
-              echo "   📋 katana found $total_urls URLs total, filtered to $(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo "0") same-domain JS files"
+              echo "   📋 katana: $total_urls URLs → $(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo 0) unique JS files queued"
               # ──────────────────────────────────────────────────────────────────
 
               js_count=$(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo "0")

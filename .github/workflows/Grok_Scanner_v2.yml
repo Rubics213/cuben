@@ -431,8 +431,20 @@ jobs:
               # ── URL filters ───────────────────────────────────────────────────
 
               def is_same_domain(self, url: str) -> bool:
+                  """
+                  Accept URLs from the target domain, its subdomains, OR CDN domains
+                  that contain the company stem (e.g. shopifycloud.com for shopify.com,
+                  twimg.com for twitter.com, canvacdn.net for canva.com).
+                  """
                   host = urlparse(url).netloc.lower().lstrip("www.")
-                  return host == self.target_domain or host.endswith("." + self.target_domain)
+                  # Exact match or subdomain
+                  if host == self.target_domain or host.endswith("." + self.target_domain):
+                      return True
+                  # CDN variant: host contains the stem (e.g. "shopify" in "shopifycloud.com")
+                  stem = self.target_domain.split(".")[0]
+                  if len(stem) >= 4 and stem in host:
+                      return True
+                  return False
 
               def is_known_third_party(self, url: str) -> bool:
                   host = urlparse(url).netloc.lower()
@@ -826,25 +838,34 @@ jobs:
             if [[ -s tmp/urls_${domain}.txt ]]; then
 
               # ── Domain-scoped JS filtering ─────────────────────────────────
-              base_domain="${domain#www.}"   # strip leading www. if present
+              base_domain="${domain#www.}"      # strip leading www. if present
+              base_stem="${base_domain%%.*}"    # canva.com -> canva, 1password.com -> 1password
               total_urls=$(wc -l < tmp/urls_${domain}.txt 2>/dev/null || echo "0")
 
+              # Filter strategy:
+              # 1. Must end in .js (with optional query string)
+              # 2. Must NOT be a .json file
+              # 3. Must contain the domain STEM anywhere in the URL
+              #    (catches canva.com, static.canva.com, canvacdn.net, shopifycloud.com etc.)
+              #    This is broader than matching full domain but the Python scanner
+              #    handles fine-grained third-party rejection after download.
+              # 4. Drop obviously garbage/encoded URLs
+              # 5. Drop known pure-analytics / consent scripts at bash level
               grep -iE '\.js(\?[^[:space:]]*)?$' tmp/urls_${domain}.txt \
                 | grep -iv '\.json' \
-                | grep -i "${base_domain}" \
+                | grep -i "${base_stem}" \
                 | grep -ivE '(%[0-9a-f]{2}){2,}' \
                 | grep -ivE '(matomo|piwik|gtag|analytics|hotjar|clarity|segment|intercom|zendesk|hubspot|cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare)' \
                 > tmp/js_${domain}_raw.txt 2>/dev/null || true
 
-              # Deduplicate by basename so matomo.js x17 becomes matomo.js x1,
-              # then take the 25 URLs with the most unique filenames.
-              # Strategy: sort unique full URLs, then pick one per unique basename.
+              # Deduplicate by basename — collapses e.g. matomo.js x17 to x1
+              # freeing slots for real app JS. Then cap at 25.
               sort -u tmp/js_${domain}_raw.txt | awk -F/ '!seen[$NF]++' \
                 > tmp/js_${domain}_sorted.txt 2>/dev/null || true
               head -n 25 tmp/js_${domain}_sorted.txt > tmp/js_${domain}.txt 2>/dev/null || true
               rm -f tmp/js_${domain}_raw.txt tmp/js_${domain}_sorted.txt
 
-              echo "   📋 katana: $total_urls URLs → $(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo 0) unique JS files queued"
+              echo "   📋 katana: $total_urls URLs → $(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo 0) unique JS files queued (stem: ${base_stem})"
               # ──────────────────────────────────────────────────────────────────
 
               js_count=$(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo "0")

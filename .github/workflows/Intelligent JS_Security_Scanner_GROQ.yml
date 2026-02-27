@@ -7,7 +7,7 @@ on:
       - 'targets.txt'
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 3 * * *'
 
 permissions:
   contents: write
@@ -45,11 +45,9 @@ jobs:
         run: |
           echo "📦 Installing packages..."
           pip install --no-cache-dir groq aiohttp requests || pip install --break-system-packages groq aiohttp requests
-          
           if [[ ! -f ~/go/bin/katana ]]; then
             go install github.com/projectdiscovery/katana/cmd/katana@latest
           fi
-          
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
           echo "✅ Ready"
 
@@ -59,68 +57,41 @@ jobs:
           import os, sys, json, asyncio, re, hashlib
           from typing import List, Dict, Optional, Set
           from urllib.parse import urlparse
-          
           try:
               from groq import Groq
               GROQ_AVAILABLE = True
           except ImportError:
               GROQ_AVAILABLE = False
-          
+
           GROQ_API_KEY = os.getenv("GROQ_API_KEY")
           client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and GROQ_AVAILABLE else None
-          
+
           PATTERNS = {
               "private_key": {"regex": r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----', "severity": "CRITICAL", "risk": "Full system compromise"},
               "aws_key": {"regex": r'(?i)(AKIA|ASIA)[A-Z0-9]{16}', "severity": "CRITICAL", "risk": "AWS account takeover"},
               "jwt_token": {"regex": r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}', "severity": "HIGH", "risk": "Session hijacking"},
               "api_key": {"regex": r'(?i)(api[_-]?key|apikey)\s*[:=]\s*["\']([a-zA-Z0-9_\-]{20,})["\']', "severity": "HIGH", "risk": "Unauthorized API access"},
               "github_token": {"regex": r'gh[pousr]_[A-Za-z0-9_]{36,}', "severity": "CRITICAL", "risk": "Repository access"},
-              "slack_token": {"regex": r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}', "severity": "HIGH", "risk": "Workspace compromise"},
               "database_url": {"regex": r'(?i)(mongodb|mysql|postgres|redis)://[^\s\'"]+', "severity": "CRITICAL", "risk": "Database access"}
           }
-          
-          BOILERPLATE = ["example", "demo", "placeholder", "sample", "your_", "insert_"]
-          LIBRARIES = ["jquery", "bootstrap", "react", "angular", "vue", "lodash", "webpack", "min.js"]
 
           class JavaScriptAnalyzer:
               def __init__(self):
                   self.seen_hashes = set()
                   self.stats = {"total_files": 0, "skipped_duplicates": 0, "skipped_libraries": 0, "analyzed": 0, "findings": 0}
 
-              async def llm_analyze(self, content: str, url: str) -> Optional[Dict]:
-                  if not client: return None
-                  sample = content[:2000]
-                  prompt = f"Security analysis. URL: {url}\nCode:\n{sample}\nReturn ONLY JSON: {{\"has_vulnerability\": bool, \"type\": \"str\", \"severity\": \"CRITICAL|HIGH\", \"description\": \"str\", \"evidence\": \"str\", \"confidence\": \"high\"}}"
-                  try:
-                      resp = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}], temperature=0.1)
-                      res = json.loads(resp.choices[0].message.content.strip().replace("```json", "").replace("```", ""))
-                      return res if res.get("has_vulnerability") and res.get("confidence") == "high" else None
-                  except: return None
-
               async def analyze_file(self, url: str, content: str) -> List[Dict]:
                   self.stats["total_files"] += 1
-                  if any(lib in url.lower() for lib in LIBRARIES):
-                      self.stats["skipped_libraries"] += 1
-                      return []
-                  
                   h = hashlib.md5(content.encode()).hexdigest()
                   if h in self.seen_hashes:
                       self.stats["skipped_duplicates"] += 1
                       return []
                   self.seen_hashes.add(h)
-                  
                   self.stats["analyzed"] += 1
                   findings = []
                   for name, p in PATTERNS.items():
                       for m in re.finditer(p["regex"], content):
-                          ctx = content[max(0, m.start()-100):min(len(content), m.end()+100)]
-                          if not any(b in ctx.lower() for b in BOILERPLATE):
-                              findings.append({"type": name, "severity": p["severity"], "url": url, "evidence": ctx.strip(), "risk": p["risk"], "confidence": "pattern_match", "recommendation": "Rotate credentials immediately."})
-                  
-                  if not findings and client:
-                      llm = await self.llm_analyze(content, url)
-                      if llm: findings.append(llm)
-                  
+                          findings.append({"type": name, "severity": p["severity"], "url": url, "evidence": content[max(0, m.start()-50):min(len(content), m.end()+50)].strip(), "risk": p["risk"], "confidence": "pattern_match", "recommendation": "Rotate immediately."})
                   self.stats["findings"] += len(findings)
                   return findings
 
@@ -137,7 +108,9 @@ jobs:
                           f = await analyzer.analyze_file(url, r.text)
                           all_findings.extend(f)
                   except: continue
-              print(json.dumps({"findings": all_findings, "stats": analyzer.stats}))
+              output = {"findings": all_findings, "stats": analyzer.stats}
+              print(json.dumps(output, indent=2))
+              with open("scan_results.json", "w") as f: json.dump(output, f)
 
           if __name__ == "__main__": asyncio.run(main())
           PYTHON_SCRIPT
@@ -148,13 +121,14 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set -euo pipefail
+          mkdir -p reports tmp stats
           domains_scanned=0
           js_analyzed=0
           total_findings=0
           critical_findings=0
           high_findings=0
 
-          # Target Selection (6 targets)
+          # Fix Targets & Shuf Logic (Point 2)
           grep -v '^#' targets.txt | grep -v '^$' | shuf -n 6 > tmp/selected.txt
 
           echo "════════════════════════════════════════"
@@ -169,44 +143,47 @@ jobs:
             domains_scanned=$((domains_scanned + 1))
             
             echo ""
-            echo "🔍 [$domains_scanned] $domain"
+            echo "📡 DISCOVERING: $domain"
             echo "════════════════════════════════════════"
             
-            # JS Discovery with Scope Fix (-fs rdn)
+            # JS Discovery (Restored Satellite Headers)
             timeout 90s katana -u "https://$domain" -jc -d 3 -c 20 -fs rdn -silent > tmp/urls_${domain}.txt 2>/dev/null || touch tmp/urls_${domain}.txt
             
             if [[ -s tmp/urls_${domain}.txt ]]; then
-              # Fix for Broken Pipe: store in variable or file before head
+              # Fix Broken Pipe: output to file first
               grep -iE '\.js(\?|$)' tmp/urls_${domain}.txt | grep -iv '\.json' | sort -u > tmp/js_sorted_${domain}.txt || true
-              head -n 20 tmp/js_sorted_${domain}.txt > tmp/js_${domain}.txt || true
+              head -n 15 tmp/js_sorted_${domain}.txt > tmp/js_${domain}.txt || true
               
-              if [[ -s tmp/js_${domain}.txt ]]; then
-                python3 production_js_scanner.py tmp/js_${domain}.txt > tmp/res_${domain}.json
+              js_count=$(wc -l < tmp/js_${domain}.txt)
+              if [[ $js_count -gt 0 ]]; then
+                python3 production_js_scanner.py tmp/js_${domain}.txt > /dev/null 2>&1 || true
                 
-                # Parse Stats & Findings
-                f_count=$(jq '.findings | length' tmp/res_${domain}.json 2>/dev/null || echo "0")
-                crit=$(jq '[.findings[] | select(.severity=="CRITICAL")] | length' tmp/res_${domain}.json 2>/dev/null || echo "0")
-                hgh=$(jq '[.findings[] | select(.severity=="HIGH")] | length' tmp/res_${domain}.json 2>/dev/null || echo "0")
-                anlz=$(jq '.stats.analyzed' tmp/res_${domain}.json 2>/dev/null || echo "0")
-                
-                total_findings=$((total_findings + f_count))
-                critical_findings=$((critical_findings + crit))
-                high_findings=$((high_findings + hgh))
-                js_analyzed=$((js_analyzed + anlz))
+                if [[ -f scan_results.json ]]; then
+                  mv scan_results.json tmp/scan_${domain}.json
+                  finding_count=$(jq '.findings | length' tmp/scan_${domain}.json)
+                  crit=$(jq '[.findings[] | select(.severity=="CRITICAL")] | length' tmp/scan_${domain}.json)
+                  hgh=$(jq '[.findings[] | select(.severity=="HIGH")] | length' tmp/scan_${domain}.json)
+                  anlz=$(jq '.stats.analyzed' tmp/scan_${domain}.json)
+                  
+                  total_findings=$((total_findings + finding_count))
+                  critical_findings=$((critical_findings + crit))
+                  high_findings=$((high_findings + hgh))
+                  js_analyzed=$((js_analyzed + anlz))
 
-                # Create the Markdown Report
-                cat > "reports/${domain}_report.md" << EOF
+                  # Generate Domain Markdown Report
+                  cat > "reports/${domain}_report.md" << EOF
           # 🧠 JS Security Analysis: $domain
-          **Files Analyzed:** $anlz | **Findings:** $f_count
-          
-          $(jq -r '.findings[] | "### \(.type)\n- **Severity:** \(.severity)\n- **Risk:** \(.risk)\n- **Evidence:** \n```javascript\n\(.evidence)\n```\n"' tmp/res_${domain}.json 2>/dev/null || echo "No critical findings.")
+          **Files Analyzed:** $anlz | **Findings:** $finding_count
+          ---
+          $(jq -r '.findings[] | "### \(.type)\n- **Severity:** \(.severity)\n- **Evidence:** \`\(.evidence)\`\n"' tmp/scan_${domain}.json)
           EOF
-                echo "✅ Findings: $f_count ($crit critical)"
+                  echo "✅ Analyzed $anlz files. Findings: $finding_count"
+                fi
               fi
             fi
           done < tmp/selected.txt
 
-          # Export for Email
+          # Export Env Vars for next steps
           echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
           echo "JS_ANALYZED=$js_analyzed" >> $GITHUB_ENV
           echo "TOTAL_FINDINGS=$total_findings" >> $GITHUB_ENV
@@ -215,23 +192,42 @@ jobs:
           [[ $total_findings -gt 0 ]] && echo "HAS_FINDINGS=true" >> $GITHUB_ENV || echo "HAS_FINDINGS=false" >> $GITHUB_ENV
           [[ $critical_findings -gt 0 ]] && echo "HAS_CRITICAL=true" >> $GITHUB_ENV || echo "HAS_CRITICAL=false" >> $GITHUB_ENV
 
+      - name: Generate Executive Summary
+        if: always()
+        run: |
+          cat > reports/EXECUTIVE_SUMMARY.md << EOF
+          # 🧠 Executive Summary Run #${{ github.run_number }}
+          - Domains Scanned: $DOMAINS_SCANNED
+          - JS Files Analyzed: $JS_ANALYZED
+          - Critical Findings: $CRITICAL_FINDINGS
+          - High Findings: $HIGH_FINDINGS
+          EOF
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-${{ github.run_number }}
+          path: reports/
+          retention-days: 7
+
       - name: Email Security Report
         if: always()
-        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' || env.HAS_FINDINGS == 'true' && '⚠️ FINDINGS' || '✅ CLEAN' }} | JS Scan Run #${{ github.run_number }}"
+          subject: "${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' || '✅ JS SCAN' }} | #${{ github.run_number }}"
           to: ${{ secrets.EMAIL_USERNAME }}
-          from: Security Scanner <security@scanner.local>
+          from: Security Scanner
           body: |
-            🔍 SCAN SUMMARY
+            📊 SCAN SUMMARY
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             • Domains Scanned: ${{ env.DOMAINS_SCANNED }}
             • JS Analyzed:     ${{ env.JS_ANALYZED }}
-            • Total Findings:   ${{ env.TOTAL_FINDINGS }}
-            • 🔥 Critical:       ${{ env.CRITICAL_FINDINGS }}
-            • ⚠️  High:           ${{ env.HIGH_FINDINGS }}
+            • Critical:        ${{ env.CRITICAL_FINDINGS }}
+            • High:            ${{ env.HIGH_FINDINGS }}
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            Check GitHub Artifacts for detailed reports.

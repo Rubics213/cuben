@@ -44,7 +44,7 @@ jobs:
       - name: Install Dependencies
         run: |
           echo "📦 Installing packages..."
-          pip install --no-cache-dir groq aiohttp requests || pip install --break-system-packages groq aiohttp requests
+          pip install --no-cache-dir groq aiohttp requests jsbeautifier || pip install --break-system-packages groq aiohttp requests jsbeautifier
 
           if [[ ! -f ~/go/bin/katana ]]; then
             go install github.com/projectdiscovery/katana/cmd/katana@latest
@@ -76,7 +76,13 @@ jobs:
           import math
           import subprocess
           from typing import List, Dict, Optional, Set, Tuple
-          from urllib.parse import urlparse
+          from urllib.parse import urlparse, urljoin
+
+          try:
+              import jsbeautifier
+              BEAUTIFIER_AVAILABLE = True
+          except ImportError:
+              BEAUTIFIER_AVAILABLE = False
 
           try:
               from groq import Groq
@@ -221,7 +227,96 @@ jobs:
               "replace_me", "todo", "fixme", "<your", "xxxxxxxx", "aaaaaaaa",
           ]
 
+          # ── Minification detection threshold ─────────────────────────────────────
+          # If average line length exceeds this, treat file as minified
+          MINIFIED_AVG_LINE_LEN = 300
+
           # ─────────────────────────────────────────────────────────────────────────
+
+          def is_minified(content: str) -> bool:
+              """Detect minified JS by average line length."""
+              lines = [l for l in content.splitlines() if l.strip()]
+              if not lines:
+                  return False
+              avg = sum(len(l) for l in lines) / len(lines)
+              return avg > MINIFIED_AVG_LINE_LEN
+
+          def beautify(content: str) -> str:
+              """Pretty-print minified JS. Falls back to original on any error."""
+              if not BEAUTIFIER_AVAILABLE:
+                  return content
+              try:
+                  opts = jsbeautifier.default_options()
+                  opts.indent_size = 2
+                  opts.max_preserve_newlines = 2
+                  opts.wrap_line_length = 0
+                  return jsbeautifier.beautify(content, opts)
+              except Exception:
+                  return content
+
+          def fetch_sourcemap(js_url: str, js_content: str, timeout: int = 10) -> Optional[str]:
+              """
+              Try to fetch the source map for a JS file.
+              Checks: 1) //# sourceMappingURL= comment in JS body
+                      2) <js_url>.map as a fallback guess
+              Returns the decoded source map JSON string, or None.
+              """
+              import subprocess as _sp
+
+              # 1. Extract explicit sourceMappingURL
+              map_url = None
+              m = re.search(r'//[#@]\s*sourceMappingURL=([^\s]+)', js_content)
+              if m:
+                  ref = m.group(1).strip()
+                  if ref.startswith("data:"):
+                      # Inline base64 source map — decode it
+                      try:
+                          import base64
+                          b64 = ref.split(",", 1)[1]
+                          return base64.b64decode(b64).decode("utf-8", errors="ignore")
+                      except Exception:
+                          return None
+                  # Resolve relative URL against the JS file URL
+                  map_url = urljoin(js_url, ref)
+
+              # 2. Fallback: guess <url>.map
+              if not map_url:
+                  map_url = js_url + ".map"
+
+              try:
+                  parsed = urlparse(js_url)
+                  origin = f"{parsed.scheme}://{parsed.netloc}"
+                  result = _sp.run(
+                      ["curl", "-sL",
+                       "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                       "--max-time", str(timeout),
+                       "--max-filesize", "10000000",
+                       "-H", f"Referer: {origin}/",
+                       map_url],
+                      capture_output=True, timeout=timeout + 3,
+                  )
+                  if result.returncode != 0:
+                      return None
+                  raw = result.stdout.decode("utf-8", errors="ignore")
+                  # Validate it looks like a source map
+                  if '"sources"' in raw and '"mappings"' in raw:
+                      return raw
+              except Exception:
+                  pass
+              return None
+
+          def extract_sourcemap_sources(sourcemap_json: str) -> List[str]:
+              """
+              Pull original source file contents out of a source map.
+              Returns a list of source content strings (sourcesContent field).
+              """
+              try:
+                  sm = json.loads(sourcemap_json)
+                  contents = sm.get("sourcesContent", [])
+                  # Filter None/empty entries
+                  return [c for c in contents if c and len(c) > 50]
+              except Exception:
+                  return []
 
           def shannon_entropy(data: str) -> float:
               if not data:
@@ -319,11 +414,13 @@ jobs:
                   self.llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
                   self.stats: Dict[str, int] = {
                       "total_files": 0,
-                      "skipped_download": 0,   # failed / HTML / too-small at fetch time
+                      "skipped_download": 0,
                       "skipped_third_party": 0,
                       "skipped_library": 0,
                       "skipped_html": 0,
                       "skipped_duplicate": 0,
+                      "minified_beautified": 0,   # files pretty-printed before scan
+                      "sourcemaps_fetched": 0,     # source maps successfully retrieved
                       "analyzed": 0,
                       "findings": 0,
                       "fp_suppressed": 0,
@@ -548,19 +645,63 @@ jobs:
                       return []
 
                   self.stats["analyzed"] += 1
+                  all_findings: List[Dict] = []
 
-                  pattern_findings, suppressed = self.pattern_scan(content, url)
+                  # ── Minification handling ─────────────────────────────────────
+                  file_is_minified = is_minified(content)
+
+                  if file_is_minified:
+                      # Step 1: pretty-print to restore readable context
+                      pretty = beautify(content)
+                      if pretty and pretty != content:
+                          self.stats["minified_beautified"] += 1
+                          print(f"  📐 minified → beautified ({len(content):,} → {len(pretty):,} chars)",
+                                file=sys.stderr)
+                          scan_content = pretty
+                      else:
+                          scan_content = content
+
+                      # Step 2: try to fetch source map for original source
+                      loop = asyncio.get_event_loop()
+                      sm_raw = await loop.run_in_executor(
+                          _thread_pool, fetch_sourcemap, url, content
+                      )
+                      if sm_raw:
+                          sources = extract_sourcemap_sources(sm_raw)
+                          if sources:
+                              self.stats["sourcemaps_fetched"] += 1
+                              print(f"  🗺  source map: {len(sources)} source file(s) found",
+                                    file=sys.stderr)
+                              # Scan each original source file separately
+                              for src_content in sources:
+                                  src_label = url + " [sourcemap]"
+                                  f, s = self.pattern_scan(src_content, src_label)
+                                  all_findings.extend(f)
+                                  self.stats["fp_suppressed"] += s
+                                  # LLM on sourcemap content (higher value — readable code)
+                                  llm = await self.llm_analyze(src_content, src_label)
+                                  if llm and llm["type"] not in {x["type"] for x in all_findings}:
+                                      all_findings.append(llm)
+                  else:
+                      scan_content = content
+
+                  # ── Scan the JS content (beautified if minified, raw if not) ──
+                  pattern_findings, suppressed = self.pattern_scan(scan_content, url)
                   self.stats["fp_suppressed"] += suppressed
+                  all_findings.extend(pattern_findings)
 
-                  # LLM pass only when suspicious keywords exist
-                  llm_finding = await self.llm_analyze(content, url)
-                  if llm_finding:
-                      existing = {f["type"] for f in pattern_findings}
-                      if llm_finding["type"] not in existing:
-                          pattern_findings.append(llm_finding)
+                  # ── LLM pass on the main file ─────────────────────────────────
+                  # For minified files without a source map, skip LLM (too noisy).
+                  # For readable files or beautified files, run it.
+                  if not file_is_minified or self.stats["sourcemaps_fetched"] == 0:
+                      llm_finding = await self.llm_analyze(scan_content, url)
+                      if llm_finding:
+                          existing = {f["type"] for f in all_findings}
+                          if llm_finding["type"] not in existing:
+                              all_findings.append(llm_finding)
 
-                  self.stats["findings"] += len(pattern_findings)
-                  return pattern_findings
+                  self.stats["findings"] += len(all_findings)
+                  return all_findings
 
 
           # ── Main ─────────────────────────────────────────────────────────────────
@@ -586,7 +727,7 @@ jobs:
               analyzer = JavaScriptAnalyzer(target_domain)
               dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
-              print(f"🧠 JS Security Scanner v3", file=sys.stderr)
+              print(f"🧠 JS Security Scanner v4", file=sys.stderr)
               print(f"   Target : {target_domain}", file=sys.stderr)
               print(f"   URLs   : {len(urls)}", file=sys.stderr)
               print(f"   Concur : {DOWNLOAD_CONCURRENCY} downloads / {LLM_CONCURRENCY} LLM", file=sys.stderr)
@@ -726,6 +867,8 @@ jobs:
                   skipped_html=$(jq '.stats.skipped_html' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   skipped_lib=$(jq '.stats.skipped_library' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   skipped_dl=$(jq '.stats.skipped_download' tmp/scan_${domain}.json 2>/dev/null || echo "0")
+                  minified=$(jq '.stats.minified_beautified' tmp/scan_${domain}.json 2>/dev/null || echo "0")
+                  sourcemaps=$(jq '.stats.sourcemaps_fetched' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   fp_suppressed=$(jq '.stats.fp_suppressed' tmp/scan_${domain}.json 2>/dev/null || echo "0")
 
                   total_findings=$((total_findings + finding_count))
@@ -753,6 +896,8 @@ jobs:
           | Skipped (Download fail/HTML) | $skipped_dl |
           | Skipped (Library) | $skipped_lib |
           | Skipped (Analyzer HTML) | $skipped_html |
+          | Minified → Beautified | $minified |
+          | Source Maps Fetched | $sourcemaps |
           | FP Matches Suppressed | $fp_suppressed |
           | Total Findings | **$finding_count** |
           | Critical Issues | **$critical** |

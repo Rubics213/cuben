@@ -843,8 +843,19 @@ jobs:
           echo "CRITICAL_FINDINGS=$critical_findings" >> $GITHUB_ENV
           echo "HIGH_FINDINGS=$high_findings"       >> $GITHUB_ENV
 
-          [[ $total_findings  -gt 0 ]] && echo "HAS_FINDINGS=true"  >> $GITHUB_ENV || echo "HAS_FINDINGS=false"  >> $GITHUB_ENV
-          [[ $critical_findings -gt 0 ]] && echo "HAS_CRITICAL=true" >> $GITHUB_ENV || echo "HAS_CRITICAL=false" >> $GITHUB_ENV
+          if [[ $total_findings -gt 0 ]]; then
+            echo "HAS_FINDINGS=true"  >> $GITHUB_ENV
+          else
+            echo "HAS_FINDINGS=false" >> $GITHUB_ENV
+          fi
+
+          if [[ $critical_findings -gt 0 ]]; then
+            echo "HAS_CRITICAL=true"  >> $GITHUB_ENV
+          else
+            echo "HAS_CRITICAL=false" >> $GITHUB_ENV
+          fi
+
+          exit 0
 
       - name: Generate Executive Summary
         if: always()

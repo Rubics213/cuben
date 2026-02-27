@@ -196,14 +196,16 @@ jobs:
               "branch.io", "app.link",
           ]
 
-          # ── Library filename indicators — skip these JS files entirely ───────────
+          # ── Library filename indicators — matched against BASENAME only ──────────
+          # These are checked against os.path.basename(url.path) so that directory
+          # names like /chunks/ or /runtime/ don't accidentally block app code.
           LIBRARY_INDICATORS = [
               "jquery", "bootstrap", "angular", "lodash", "moment",
-              "webpack", "vendor", "polyfill", "chunk", "runtime",
+              "webpack.bundle", "vendor.", "polyfill",
               "analytics", "gtag", "recaptcha", "turnstile", "captcha",
               "sentry", "datadog", "newrelic", "rollbar",
-              "matomo", "piwik", "onetrust", "otSDK", "cookiebot",
-              "intercom", "freshchat", "drift", "crisp",
+              "matomo", "piwik", "onetrust", "otsdkstub", "cookiebot",
+              "intercom", "freshchat", "drift.", "crisp.",
           ]
 
           # ── Context patterns that indicate a match is NOT a real secret ──────────
@@ -437,8 +439,11 @@ jobs:
                   return any(tp in host for tp in THIRD_PARTY_DOMAINS)
 
               def is_library_file(self, url: str) -> bool:
-                  path = urlparse(url).path.lower()
-                  return any(lib in path for lib in LIBRARY_INDICATORS)
+                  # Check basename only — avoids matching directory names like
+                  # /_next/static/chunks/ or /runtime/ against app JS files
+                  import os as _os
+                  basename = _os.path.basename(urlparse(url).path).lower()
+                  return any(lib in basename for lib in LIBRARY_INDICATORS)
 
               # ── Content filters ───────────────────────────────────────────────
 

@@ -58,12 +58,13 @@ jobs:
           cat > production_js_scanner.py << 'PYTHON_SCRIPT'
           #!/usr/bin/env python3
           """
-          Production-Grade JS Security Scanner with Intelligence
-          Fixes:
-            - Domain scoping: only scan JS from the target domain
-            - HTML response rejection: skip non-JS responses
-            - False positive reduction: entropy checks, value validation,
-              known-safe patterns, third-party key allowlists
+          Production-Grade JS Security Scanner
+          v3 — addresses Gemini critique:
+            1. Parallelized downloads + analysis (asyncio semaphore, configurable concurrency)
+            2. Strict "secret" pattern — requires value to be outside an enum/constant context
+            3. Known public SDK key registry (Branch.io key_live_, etc.)
+            4. Context classifier — rejects enum/constant/route/UI string contexts
+            5. LLM "public by default" stance for frontend JS
           """
 
           import os
@@ -73,7 +74,8 @@ jobs:
           import re
           import hashlib
           import math
-          from typing import List, Dict, Optional, Set
+          import subprocess
+          from typing import List, Dict, Optional, Set, Tuple
           from urllib.parse import urlparse
 
           try:
@@ -82,99 +84,101 @@ jobs:
           except ImportError:
               GROQ_AVAILABLE = False
 
-          # ── Init ────────────────────────────────────────────────────────────────
+          # ── Init ─────────────────────────────────────────────────────────────────
           GROQ_API_KEY = os.getenv("GROQ_API_KEY")
           client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and GROQ_AVAILABLE else None
 
-          # ── Patterns with severity ───────────────────────────────────────────────
+          # Parallelism — 8 concurrent downloads, 4 concurrent LLM calls
+          DOWNLOAD_CONCURRENCY = 8
+          LLM_CONCURRENCY = 4
+
+          # ── Patterns ─────────────────────────────────────────────────────────────
+          # Each pattern requires the VALUE to be meaningfully secret.
+          # "secret" and "api_key" now require stricter surrounding context.
           PATTERNS = {
               "private_key": {
+                  # PEM block — structure is the proof
                   "regex": r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
                   "severity": "CRITICAL",
-                  "risk": "Full system compromise"
+                  "risk": "Full system compromise",
+                  "require_entropy": False,
               },
-              "aws_key": {
-                  "regex": r'(?<![A-Z0-9])(AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])',
+              "aws_access_key": {
+                  # AWS key IDs have a fixed 20-char structure
+                  "regex": r'(?<![A-Z0-9])(AKIA|ASIA|AROA|AIDA|ANPA|ANVA|APKA)[A-Z0-9]{16}(?![A-Z0-9])',
                   "severity": "CRITICAL",
-                  "risk": "AWS account takeover"
-              },
-              "jwt_token": {
-                  "regex": r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}',
-                  "severity": "HIGH",
-                  "risk": "Session hijacking"
-              },
-              "api_key": {
-                  "regex": r'(?i)(api[_-]?key|apikey)\s*[:=]\s*["\']([a-zA-Z0-9_\-]{20,})["\']',
-                  "severity": "HIGH",
-                  "risk": "Unauthorized API access"
+                  "risk": "AWS account takeover",
+                  "require_entropy": False,
               },
               "github_token": {
                   "regex": r'gh[pousr]_[A-Za-z0-9_]{36,}',
                   "severity": "CRITICAL",
-                  "risk": "Repository access"
+                  "risk": "Repository access",
+                  "require_entropy": False,
               },
               "slack_token": {
                   "regex": r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}',
                   "severity": "HIGH",
-                  "risk": "Workspace compromise"
+                  "risk": "Slack workspace compromise",
+                  "require_entropy": False,
               },
-              "secret": {
-                  "regex": r'(?i)(secret|password)\s*[:=]\s*["\']([^"\']{12,})["\']',
+              "jwt_token": {
+                  # Only flag JWTs that look like they could be real session tokens
+                  # (not test/demo JWTs in documentation)
+                  "regex": r'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}',
                   "severity": "HIGH",
-                  "risk": "Authentication bypass"
+                  "risk": "Session hijacking — live token may be reusable",
+                  "require_entropy": False,
               },
               "database_url": {
-                  "regex": r'(?i)(mongodb|mysql|postgres|redis)://[^\s\'"<>]{8,}',
+                  "regex": r'(?i)(mongodb(\+srv)?|mysql|postgresql|postgres|redis|amqp)://[^@\s\'"<>]{3,}@[^\s\'"<>]{4,}',
                   "severity": "CRITICAL",
-                  "risk": "Database access"
+                  "risk": "Direct database access with credentials",
+                  "require_entropy": False,
               },
-              "bearer_token": {
-                  "regex": r'(?i)bearer\s+[a-zA-Z0-9_\-\.]{20,}',
+              "api_key_assignment": {
+                  # Requires: left side is apiKey/api_key, right side is a quoted
+                  # value that is NOT a known public-key prefix and has high entropy.
+                  # Explicitly excludes enum-style assignment like e.AccountSecurity=...
+                  "regex": r'(?i)\b(api[_\-]?key|apikey|access[_\-]?key)\s*[:=]\s*["\']([a-zA-Z0-9_\-\.]{20,})["\']',
                   "severity": "HIGH",
-                  "risk": "Unauthorized access"
-              }
+                  "risk": "Unauthorized API access",
+                  "require_entropy": True,
+                  "value_group": 2,
+              },
+              "secret_assignment": {
+                  # Tighter than before: only match when the VALUE looks like a real
+                  # secret (not a route string, UI label, or code constant).
+                  # Requires high entropy on the value AND excludes lines that look
+                  # like enum/constant assignments (e.g. e.AccountSecuritySuccess=...).
+                  "regex": r'(?i)(?<!\w)(client[_\-]?secret|app[_\-]?secret|oauth[_\-]?secret|signing[_\-]?secret)\s*[:=]\s*["\']([^"\']{16,})["\']',
+                  "severity": "HIGH",
+                  "risk": "Authentication bypass / OAuth compromise",
+                  "require_entropy": True,
+                  "value_group": 2,
+              },
           }
 
-          # ── Boilerplate / placeholder indicators ────────────────────────────────
-          BOILERPLATE_INDICATORS = [
-              "example", "demo", "test", "placeholder", "sample", "your_",
-              "insert_", "replace_", "enter_", "paste_", "add_your",
-              "TODO", "FIXME", "xxx", "yyy", "zzz", "abc123",
-              "config.example", "env.example", ".env.sample",
-              "<your", "your-key", "your_key", "your_token",
-              "changeme", "change_me", "fill_in", "fill-in",
-              "put_your", "put-your", "key_here", "token_here",
-              "secret_here", "api_key_here", "replace_me"
-          ]
-
-          # ── Known low-entropy / obviously fake value patterns ───────────────────
-          FAKE_VALUE_PATTERNS = [
-              r'^[a-zA-Z]{1,3}[0-9]{1,3}$',          # e.g. "ab1", "xyz99"
-              r'^(true|false|null|undefined|none)$',
-              r'^[0-9a-f]{1,8}$',                      # tiny hex strings
-              r'^\$\{',                                  # template literals ${VAR}
-              r'^\<',                                    # HTML tags
-              r'^process\.env\.',                        # Node env refs
-              r'^window\.',                              # browser globals
-              r'^config\.',                              # config object refs
-          ]
-
-          # ── Third-party / public keys that are intentionally client-side ────────
-          # These are PUBLIC keys designed to be embedded in JS — not secrets.
+          # ── Public SDK key prefixes — intentionally embedded in frontend JS ──────
+          # Adding these here means they pass the regex but get dropped before flagging.
           SAFE_KEY_PREFIXES = [
-              "pk_live_", "pk_test_",           # Stripe publishable keys
-              "wg_",                             # Weglot public API keys
-              "G-", "UA-", "GTM-",              # Google Analytics / Tag Manager
-              "AIza",                            # Google API (public maps/analytics)
+              # Mobile / web SDKs (public client keys)
+              "key_live_", "key_test_",          # Branch.io
+              "pk_live_", "pk_test_",            # Stripe publishable
+              "wg_",                             # Weglot
+              "AIza",                            # Google Maps / Firebase (public)
+              "G-", "UA-", "GTM-", "AW-",       # Google Analytics / Ads
               "ca-pub-",                         # Google AdSense
-              "APP_ID", "CLIENT_ID",             # generic public identifiers
+              "BQ",                              # Firebase (public config)
+              # Common placeholder / non-secret patterns
+              "undefined", "null", "false", "true",
           ]
 
-          # These domain patterns host JS that commonly contains public/client keys
+          # ── Third-party domains — always skip ────────────────────────────────────
           THIRD_PARTY_DOMAINS = [
               "googletagmanager.com", "google-analytics.com", "analytics.google.com",
-              "doubleclick.net", "googlesyndication.com",
-              "facebook.net", "connect.facebook.net",
+              "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+              "facebook.net", "connect.facebook.net", "fbcdn.net",
               "cdn.segment.com", "cdn.weglot.com",
               "hotjar.com", "clarity.ms",
               "intercom.io", "intercomcdn.com",
@@ -182,96 +186,156 @@ jobs:
               "hubspot.com", "hs-scripts.com",
               "stripe.com", "js.stripe.com",
               "cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
-              "ads.lyft.com", "ads.twitter.com",
+              "ads.lyft.com", "ads.twitter.com", "static.ads-twitter.com",
+              "branch.io", "app.link",
           ]
 
-          # ── Library file indicators (skip entirely) ──────────────────────────────
+          # ── Library filename indicators — skip these JS files entirely ───────────
           LIBRARY_INDICATORS = [
-              "jquery", "bootstrap", "react", "angular", "vue", "lodash",
-              "moment", "axios", "webpack", "bundle", "vendor", "polyfill",
-              "chunk", "framework", "cdn", "min.js", "analytics", "gtag",
-              "recaptcha", "turnstile", "captcha"
+              "jquery", "bootstrap", "angular", "lodash", "moment",
+              "webpack", "vendor", "polyfill", "chunk", "runtime",
+              "analytics", "gtag", "recaptcha", "turnstile", "captcha",
+              "sentry", "datadog", "newrelic", "rollbar",
           ]
 
-          # ── Helpers ──────────────────────────────────────────────────────────────
+          # ── Context patterns that indicate a match is NOT a real secret ──────────
+          # If surrounding context matches these, it's an enum, route, or UI string.
+          FALSE_POSITIVE_CONTEXT_PATTERNS = [
+              # Enum-style: e.SomethingSecret = "some_event_name"
+              r'\be\.[A-Z][a-zA-Z]+(Secret|Password|Key|Token)[A-Z]',
+              # Route or event name strings like "account_security_change_password"
+              r'"[a-z_]{5,}(secret|password|key|token)[a-z_]{0,}"',
+              # JSDoc / comment context
+              r'(//|/\*|\*)\s.*(secret|password|key)',
+              # Enum value assignment pattern: identifier = "string_constant"
+              r'\.[A-Z][a-zA-Z]{3,}\s*=\s*"[a-z_]{5,}"',
+          ]
+
+          # ── Boilerplate value indicators ─────────────────────────────────────────
+          BOILERPLATE_VALUES = [
+              "your_", "insert_", "replace_", "enter_", "paste_", "add_your",
+              "your-key", "your_key", "your_token", "changeme", "change_me",
+              "fill_in", "key_here", "token_here", "secret_here", "api_key_here",
+              "replace_me", "todo", "fixme", "<your", "xxxxxxxx", "aaaaaaaa",
+          ]
+
+          # ─────────────────────────────────────────────────────────────────────────
 
           def shannon_entropy(data: str) -> float:
-              """Calculate Shannon entropy to detect high-randomness secrets."""
               if not data:
                   return 0.0
-              freq = {}
+              freq: Dict[str, int] = {}
               for ch in data:
                   freq[ch] = freq.get(ch, 0) + 1
-              length = len(data)
-              return -sum((c / length) * math.log2(c / length) for c in freq.values())
+              n = len(data)
+              return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
+          def extract_value(match_text: str, group: int = 0) -> str:
+              """Extract the secret value portion from a regex match."""
+              # Try quoted value after = or :
+              m = re.search(r'[:=]\s*["\']([^"\']{8,})["\']', match_text)
+              return m.group(1) if m else match_text
 
-          def is_high_entropy(value: str, threshold: float = 3.5) -> bool:
-              """Return True only if value looks like a real random secret."""
+          def is_boilerplate_value(value: str) -> bool:
+              v = value.lower()
+              return any(bp in v for bp in BOILERPLATE_VALUES)
+
+          def is_safe_public_key(value: str) -> bool:
+              return any(value.startswith(pfx) for pfx in SAFE_KEY_PREFIXES)
+
+          def is_false_positive_context(context: str) -> bool:
+              """Return True if context looks like an enum, route, or UI constant."""
+              for pattern in FALSE_POSITIVE_CONTEXT_PATTERNS:
+                  if re.search(pattern, context):
+                      return True
+              return False
+
+          def has_sufficient_entropy(value: str, threshold: float = 3.5) -> bool:
+              if len(value) < 16:
+                  return False
               return shannon_entropy(value) >= threshold
 
 
-          def extract_secret_value(match_text: str) -> str:
-              """Pull the raw value out of key=value or key: value patterns."""
-              # Try to grab the quoted value portion
-              m = re.search(r'[:=]\s*["\']([^"\']{8,})["\']', match_text)
-              if m:
-                  return m.group(1)
-              return match_text
+          # ── Downloader ────────────────────────────────────────────────────────────
 
+          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 12) -> Optional[str]:
+              """Async JS downloader with semaphore-based concurrency control."""
+              async with sem:
+                  try:
+                      proc = await asyncio.create_subprocess_exec(
+                          "curl", "-sL",
+                          "-A", "Mozilla/5.0 (compatible; SecurityScanner/2.0)",
+                          "--max-time", str(timeout),
+                          "--max-filesize", "4000000",
+                          "-H", "Accept: application/javascript, text/javascript, */*",
+                          url,
+                          stdout=asyncio.subprocess.PIPE,
+                          stderr=asyncio.subprocess.DEVNULL,
+                      )
+                      try:
+                          stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 3)
+                      except asyncio.TimeoutError:
+                          proc.kill()
+                          return None
+
+                      if proc.returncode != 0:
+                          return None
+
+                      content = stdout.decode("utf-8", errors="ignore")
+                      if len(content) < 200:
+                          return None
+
+                      # Reject HTML (error pages, redirects, login walls)
+                      stripped = content.lstrip()
+                      if (stripped.startswith("<!") or
+                              stripped.lower().startswith("<html") or
+                              re.match(r'<\s*!DOCTYPE', stripped, re.IGNORECASE)):
+                          return None
+
+                      return content
+
+                  except Exception:
+                      return None
+
+
+          # ── Analyzer ─────────────────────────────────────────────────────────────
 
           class JavaScriptAnalyzer:
               def __init__(self, target_domain: str):
-                  self.target_domain = target_domain
+                  self.target_domain = target_domain.lower().lstrip("www.")
                   self.seen_hashes: Set[str] = set()
-                  self.stats = {
+                  self.llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
+                  self.stats: Dict[str, int] = {
                       "total_files": 0,
-                      "skipped_duplicates": 0,
-                      "skipped_libraries": 0,
                       "skipped_third_party": 0,
+                      "skipped_library": 0,
                       "skipped_html": 0,
+                      "skipped_duplicate": 0,
                       "analyzed": 0,
-                      "findings": 0
+                      "findings": 0,
+                      "fp_suppressed": 0,
                   }
 
-              # ── URL-level filters ──────────────────────────────────────────────
+              # ── URL filters ───────────────────────────────────────────────────
 
               def is_same_domain(self, url: str) -> bool:
-                  """
-                  FIX 1: Ensure the JS file is from the target domain (or a direct
-                  subdomain). Rejects third-party scripts like ads.lyft.com when
-                  scanning grafana.com.
-                  """
-                  try:
-                      host = urlparse(url).netloc.lower().lstrip("www.")
-                      base = self.target_domain.lower().lstrip("www.")
-                      # allow exact match or subdomain (e.g. cdn.grafana.com)
-                      return host == base or host.endswith("." + base)
-                  except Exception:
-                      return False
+                  host = urlparse(url).netloc.lower().lstrip("www.")
+                  return host == self.target_domain or host.endswith("." + self.target_domain)
 
               def is_known_third_party(self, url: str) -> bool:
-                  """Reject URLs from known analytics / ad / CDN domains."""
                   host = urlparse(url).netloc.lower()
                   return any(tp in host for tp in THIRD_PARTY_DOMAINS)
 
-              def is_library(self, url: str) -> bool:
-                  url_lower = url.lower()
-                  return any(lib in url_lower for lib in LIBRARY_INDICATORS)
+              def is_library_file(self, url: str) -> bool:
+                  path = urlparse(url).path.lower()
+                  return any(lib in path for lib in LIBRARY_INDICATORS)
 
-              # ── Content-level filters ──────────────────────────────────────────
+              # ── Content filters ───────────────────────────────────────────────
 
-              def is_html_response(self, content: str) -> bool:
-                  """
-                  FIX 2: Reject HTML pages served instead of JS (redirects,
-                  error pages, login walls).
-                  """
-                  stripped = content.lstrip()
-                  return (
-                      stripped.startswith("<!") or
-                      stripped.lower().startswith("<html") or
-                      bool(re.match(r'<\s*!DOCTYPE', stripped, re.IGNORECASE))
-                  )
+              def is_html(self, content: str) -> bool:
+                  s = content.lstrip()
+                  return (s.startswith("<!") or s.lower().startswith("<html") or
+                          bool(re.match(r'<\s*!DOCTYPE', s, re.IGNORECASE)))
 
               def is_duplicate(self, content: str) -> bool:
                   h = hashlib.md5(content.encode()).hexdigest()
@@ -280,350 +344,273 @@ jobs:
                   self.seen_hashes.add(h)
                   return False
 
-              # ── Finding-level filters ──────────────────────────────────────────
+              # ── Context extractor ─────────────────────────────────────────────
 
-              def is_boilerplate(self, text: str) -> bool:
-                  text_lower = text.lower()
-                  if any(bp in text_lower for bp in BOILERPLATE_INDICATORS):
-                      return True
-                  if re.search(r'(x{5,}|y{5,}|z{5,}|\*{5,})', text_lower):
-                      return True
-                  if re.search(r'\b(12345|abcde|qwerty|foobar|bazqux)\b', text_lower):
-                      return True
-                  return False
+              def get_context(self, content: str, pos: int, size: int = 200) -> str:
+                  start = max(0, pos - size)
+                  end = min(len(content), pos + size)
+                  return re.sub(r'\s+', ' ', content[start:end]).strip()
 
-              def is_safe_public_key(self, match_text: str) -> bool:
-                  """
-                  FIX 3: Skip keys that are intentionally public / client-side.
-                  e.g. Stripe pk_live_, Weglot wg_, Google G-/UA- IDs.
-                  """
-                  value = extract_secret_value(match_text)
-                  return any(value.startswith(pfx) for pfx in SAFE_KEY_PREFIXES)
+              # ── Pattern scan ──────────────────────────────────────────────────
 
-              def is_fake_value(self, match_text: str) -> bool:
-                  """
-                  FIX 4: Reject values that match obviously-fake / template patterns.
-                  """
-                  value = extract_secret_value(match_text).strip()
-                  for pattern in FAKE_VALUE_PATTERNS:
-                      if re.match(pattern, value, re.IGNORECASE):
-                          return True
-                  return False
+              def pattern_scan(self, content: str, url: str) -> Tuple[List[Dict], int]:
+                  findings: List[Dict] = []
+                  suppressed = 0
 
-              def has_real_entropy(self, match_text: str, pattern_name: str) -> bool:
-                  """
-                  FIX 5: Entropy gate — only flag values with sufficient randomness.
-                  Passwords / secrets often have low entropy if they're placeholders.
-                  Skip entropy check for patterns where structure matters more (e.g. AWS keys).
-                  """
-                  # These patterns have structure-based validity — entropy not needed
-                  structure_patterns = {"private_key", "aws_key", "github_token",
-                                        "slack_token", "jwt_token", "database_url"}
-                  if pattern_name in structure_patterns:
-                      return True
-
-                  value = extract_secret_value(match_text)
-                  # Short values are almost always false positives
-                  if len(value) < 16:
-                      return False
-                  return is_high_entropy(value, threshold=3.2)
-
-              # ── Core logic ────────────────────────────────────────────────────
-
-              def extract_context(self, content: str, match_pos: int, size: int = 150) -> str:
-                  start = max(0, match_pos - size)
-                  end = min(len(content), match_pos + size)
-                  context = content[start:end]
-                  context = re.sub(r'\s+', ' ', context)
-                  return context.strip()
-
-              def get_recommendation(self, vuln_type: str) -> str:
-                  recommendations = {
-                      "private_key": "URGENT: Rotate key immediately. Never commit keys to code.",
-                      "aws_key": "URGENT: Deactivate key in AWS Console. Enable CloudTrail to check for unauthorized access.",
-                      "api_key": "Rotate key immediately. Move to environment variables or secrets manager.",
-                      "github_token": "Revoke token on GitHub. Check audit log for unauthorized access.",
-                      "slack_token": "Revoke token in Slack workspace. Review channel access logs.",
-                      "database_url": "URGENT: Rotate credentials. Restrict database access by IP.",
-                      "jwt_token": "If valid, invalidate all sessions. Implement proper token storage.",
-                      "secret": "Rotate credential immediately. Move to secure secrets manager.",
-                      "bearer_token": "Invalidate token. Implement proper authentication flow."
-                  }
-                  return recommendations.get(vuln_type, "Review and rotate if necessary.")
-
-              def pattern_scan(self, content: str, url: str) -> List[Dict]:
-                  findings = []
-
-                  for pattern_name, pattern_info in PATTERNS.items():
+                  for name, info in PATTERNS.items():
                       try:
-                          for match in re.finditer(pattern_info["regex"], content):
-                              match_text = match.group(0)
-                              context = self.extract_context(content, match.start())
+                          for m in re.finditer(info["regex"], content):
+                              raw_match = m.group(0)
+                              # Extract the actual secret value
+                              vg = info.get("value_group", 0)
+                              value = m.group(vg) if vg and vg <= len(m.groups()) else extract_value(raw_match)
+                              context = self.get_context(content, m.start())
 
-                              # ── False positive gates ──────────────────────────
-                              if self.is_boilerplate(context):
+                              # ── FP gates (ordered cheapest first) ────────────
+                              # 1. Boilerplate placeholder value
+                              if is_boilerplate_value(value):
+                                  suppressed += 1
                                   continue
-                              if self.is_boilerplate(match_text):
+
+                              # 2. Known public SDK key
+                              if is_safe_public_key(value):
+                                  suppressed += 1
                                   continue
-                              if self.is_safe_public_key(match_text):
+
+                              # 3. Context looks like enum / route / UI constant
+                              if is_false_positive_context(context):
+                                  suppressed += 1
                                   continue
-                              if self.is_fake_value(match_text):
-                                  continue
-                              if not self.has_real_entropy(match_text, pattern_name):
+
+                              # 4. Entropy gate (only for patterns that need it)
+                              if info.get("require_entropy", False):
+                                  if not has_sufficient_entropy(value, threshold=3.5):
+                                      suppressed += 1
+                                      continue
+
+                              # 5. Value is suspiciously short
+                              if len(value) < 12:
+                                  suppressed += 1
                                   continue
                               # ─────────────────────────────────────────────────
 
                               findings.append({
-                                  "type": pattern_name,
-                                  "severity": pattern_info["severity"],
-                                  "risk": pattern_info["risk"],
+                                  "type": name,
+                                  "severity": info["severity"],
+                                  "risk": info["risk"],
                                   "url": url,
                                   "source_domain": urlparse(url).netloc,
-                                  "context": context[:250],
-                                  "match": match_text[:100],
-                                  "line": content[:match.start()].count('\n') + 1,
+                                  "context": context[:300],
+                                  "match_preview": raw_match[:80],
+                                  "line": content[:m.start()].count("\n") + 1,
                                   "confidence": "pattern_match",
-                                  "recommendation": self.get_recommendation(pattern_name)
+                                  "entropy": round(shannon_entropy(value), 2),
+                                  "recommendation": self._recommendation(name),
                               })
                       except Exception:
                           continue
 
-                  return findings
+                  return findings, suppressed
+
+              def _recommendation(self, vuln_type: str) -> str:
+                  return {
+                      "private_key":        "URGENT: Rotate immediately. Audit all systems that used this key.",
+                      "aws_access_key":     "URGENT: Deactivate in AWS IAM. Enable CloudTrail audit immediately.",
+                      "github_token":       "Revoke on GitHub. Check audit log for unauthorised access.",
+                      "slack_token":        "Revoke in Slack workspace settings. Review channel audit log.",
+                      "jwt_token":          "Invalidate all sessions using this signing key.",
+                      "database_url":       "URGENT: Rotate DB credentials. Restrict access by IP/VPC.",
+                      "api_key_assignment": "Rotate key. Move to server-side env vars or secrets manager.",
+                      "secret_assignment":  "Rotate secret. Move to server-side env vars or secrets manager.",
+                  }.get(vuln_type, "Review and rotate if this is a real credential.")
+
+              # ── LLM analysis ──────────────────────────────────────────────────
 
               async def llm_analyze(self, content: str, url: str) -> Optional[Dict]:
-                  """LLM deep analysis for subtle issues — only on suspicious files."""
+                  """
+                  LLM pass — 'public by default' stance.
+                  Only called on files that already have suspicious lines.
+                  Gemini critique: LLM needs stricter rubric.
+                  """
                   if not client:
                       return None
 
-                  keywords = ["key", "secret", "token", "password", "auth",
-                              "credential", "private", "bearer", "AKIA"]
-                  suspicious_lines = [
-                      line for line in content.split('\n')
-                      if any(kw in line.lower() for kw in keywords)
-                  ]
+                  # Only pull lines that contain credential-like keywords
+                  keywords = ["AKIA", "private_key", "client_secret", "oauth_secret",
+                              "signing_secret", "access_token", "refresh_token",
+                              "mongodb://", "redis://", "postgres://"]
+                  suspicious = [l for l in content.split("\n")
+                                if any(kw.lower() in l.lower() for kw in keywords)]
 
-                  if len(suspicious_lines) < 2:
+                  if len(suspicious) < 1:
                       return None
 
-                  sample = '\n'.join(suspicious_lines[:30])
+                  sample = "\n".join(suspicious[:25])
 
-                  prompt = f"""You are a strict security analyst. Analyze this JavaScript for REAL exposed secrets.
+                  prompt = f"""You are a senior AppSec engineer doing a bug bounty review.
+          Analyze this JavaScript snippet for REAL exposed backend secrets.
 
+          Target: {urlparse(url).netloc}
           File: {os.path.basename(url)}
-          Domain: {urlparse(url).netloc}
 
           ```javascript
-          {sample[:2000]}
+          {sample[:1800]}
           ```
 
-          IMPORTANT RULES:
-          - Only flag credentials with REAL values (high entropy, not placeholders).
-          - SKIP: empty strings, template vars like ${VAR} or process.env.X, "YOUR_KEY_HERE".
-          - SKIP: public/client-side keys (Stripe pk_live_, Google G-/UA-, Weglot wg_).
-          - SKIP: anything that looks like documentation or example code.
-          - SKIP: variable declarations with no assigned value.
+          GROUND RULES — assume "public by default" for frontend JS:
+          - Client-side SDK keys (Branch key_live_, Stripe pk_live_, Google AIza*, G-*,
+            Firebase, Segment write key, Mixpanel token) are PUBLIC. Do NOT flag these.
+          - UI state constants, event name enums, route strings are NOT secrets.
+          - Empty strings, process.env references, template variables are NOT secrets.
+          - Only flag if you see a value that: (a) is a backend secret/private key,
+            (b) has high randomness (entropy), AND (c) should NOT be in frontend code.
 
-          If you find a REAL secret, return ONLY this JSON:
+          Examples of TRUE positives: AWS secret access key, GitHub PAT, Slack bot token,
+          database connection string with real credentials, OAuth client_secret.
+
+          Examples of FALSE positives (do NOT flag): Google Analytics G-XXXXX,
+          Branch.io key_live_XXXXX, Stripe pk_live_XXXXX, any enum like
+          e.AccountSecuritySuccess, any route string, any UI label.
+
+          If you find a REAL backend secret:
           {{
             "has_vulnerability": true,
-            "type": "specific_type",
-            "severity": "CRITICAL|HIGH|MEDIUM",
-            "description": "What was found",
-            "evidence": "Exact line with issue (redact middle of value)",
-            "confidence": "high|medium",
-            "recommendation": "Specific action"
+            "type": "aws_secret_key|github_token|database_url|oauth_client_secret|other",
+            "severity": "CRITICAL|HIGH",
+            "evidence": "the specific line (partially redact the value)",
+            "reasoning": "why this is definitely a real secret",
+            "confidence": "high"
           }}
 
-          If no real issues exist: {{"has_vulnerability": false}}
+          If nothing real: {{"has_vulnerability": false}}
 
-          Return ONLY valid JSON. No markdown, no explanation."""
+          Return ONLY valid JSON. No markdown."""
 
-                  try:
-                      response = client.chat.completions.create(
-                          model="llama-3.3-70b-versatile",
-                          messages=[{"role": "user", "content": prompt}],
-                          max_tokens=600,
-                          temperature=0.1
-                      )
+                  async with self.llm_sem:
+                      try:
+                          resp = client.chat.completions.create(
+                              model="llama-3.3-70b-versatile",
+                              messages=[{"role": "user", "content": prompt}],
+                              max_tokens=500,
+                              temperature=0.05,
+                          )
+                          raw = resp.choices[0].message.content.strip()
+                          raw = raw.replace("```json", "").replace("```", "").strip()
+                          result = json.loads(raw)
 
-                      raw = response.choices[0].message.content.strip()
-                      raw = raw.replace("```json", "").replace("```", "").strip()
-                      result = json.loads(raw)
-
-                      if result.get("has_vulnerability") and result.get("confidence") == "high":
-                          return {
-                              "type": result.get("type", "unknown"),
-                              "severity": result.get("severity", "MEDIUM"),
-                              "risk": "Detected by LLM analysis",
-                              "url": url,
-                              "source_domain": urlparse(url).netloc,
-                              "description": result.get("description", "")[:300],
-                              "evidence": result.get("evidence", "")[:300],
-                              "confidence": "llm_verified",
-                              "recommendation": result.get("recommendation", "Review and remediate")
-                          }
-
-                  except Exception as e:
-                      print(f"  LLM error: {e}", file=sys.stderr)
+                          if (result.get("has_vulnerability") and
+                                  result.get("confidence") == "high"):
+                              return {
+                                  "type": result.get("type", "unknown"),
+                                  "severity": result.get("severity", "HIGH"),
+                                  "risk": "Backend secret in frontend JS",
+                                  "url": url,
+                                  "source_domain": urlparse(url).netloc,
+                                  "context": result.get("evidence", "")[:300],
+                                  "reasoning": result.get("reasoning", "")[:200],
+                                  "confidence": "llm_verified",
+                                  "recommendation": "Rotate immediately. Investigate how this reached frontend code.",
+                              }
+                      except Exception as e:
+                          print(f"  LLM error: {e}", file=sys.stderr)
 
                   return None
+
+              # ── Main per-file entry ───────────────────────────────────────────
 
               async def analyze_file(self, url: str, content: str) -> List[Dict]:
                   self.stats["total_files"] += 1
 
-                  # ── URL-level rejections ───────────────────────────────────────
-                  if not self.is_same_domain(url):
+                  if not self.is_same_domain(url) or self.is_known_third_party(url):
                       self.stats["skipped_third_party"] += 1
                       return []
-
-                  if self.is_known_third_party(url):
-                      self.stats["skipped_third_party"] += 1
+                  if self.is_library_file(url):
+                      self.stats["skipped_library"] += 1
                       return []
-
-                  if self.is_library(url):
-                      self.stats["skipped_libraries"] += 1
-                      return []
-
-                  # ── Content-level rejections ───────────────────────────────────
-                  if self.is_html_response(content):
+                  if self.is_html(content):
                       self.stats["skipped_html"] += 1
                       return []
-
                   if self.is_duplicate(content):
-                      self.stats["skipped_duplicates"] += 1
+                      self.stats["skipped_duplicate"] += 1
                       return []
 
                   self.stats["analyzed"] += 1
-                  findings = []
 
-                  # Pattern scan (fast)
-                  pattern_findings = self.pattern_scan(content, url)
-                  findings.extend(pattern_findings)
+                  pattern_findings, suppressed = self.pattern_scan(content, url)
+                  self.stats["fp_suppressed"] += suppressed
 
-                  # LLM analysis (deeper, slower)
-                  if client and len(content) > 500:
-                      llm_finding = await self.llm_analyze(content, url)
-                      if llm_finding:
-                          # Avoid duplicate if LLM finds same thing as pattern
-                          existing_types = {f["type"] for f in findings}
-                          if llm_finding["type"] not in existing_types:
-                              findings.append(llm_finding)
+                  # LLM pass only when suspicious keywords exist
+                  llm_finding = await self.llm_analyze(content, url)
+                  if llm_finding:
+                      existing = {f["type"] for f in pattern_findings}
+                      if llm_finding["type"] not in existing:
+                          pattern_findings.append(llm_finding)
 
-                  self.stats["findings"] += len(findings)
-                  return findings
-
-
-          # ── Downloader ────────────────────────────────────────────────────────────
-
-          async def download_js(url: str, timeout: int = 15) -> Optional[str]:
-              """
-              Download JS with content-type validation.
-              FIX 2 (enforcement): Use -D to capture headers and reject HTML responses.
-              """
-              import subprocess
-              try:
-                  result = subprocess.run(
-                      ["curl", "-sL", "-A", "Mozilla/5.0 (compatible; SecurityScanner/1.0)",
-                       "--max-time", str(timeout),
-                       "--max-filesize", "5000000",   # 5 MB cap
-                       "-H", "Accept: application/javascript, text/javascript, */*",
-                       url],
-                      capture_output=True,
-                      timeout=timeout + 2
-                  )
-
-                  if result.returncode != 0:
-                      return None
-
-                  content = result.stdout.decode('utf-8', errors='ignore')
-
-                  # Reject empty or tiny responses
-                  if len(content) < 200:
-                      return None
-
-                  # Reject HTML responses (FIX 2)
-                  stripped = content.lstrip()
-                  if (stripped.startswith("<!") or
-                          stripped.lower().startswith("<html") or
-                          re.match(r'<\s*!DOCTYPE', stripped, re.IGNORECASE)):
-                      return None
-
-                  return content
-
-              except Exception:
-                  return None
+                  self.stats["findings"] += len(pattern_findings)
+                  return pattern_findings
 
 
           # ── Main ─────────────────────────────────────────────────────────────────
 
-          async def main():
+          async def main() -> None:
               if len(sys.argv) < 3:
-                  print("Usage: python production_js_scanner.py <js_urls.txt> <target_domain>",
-                        file=sys.stderr)
+                  print("Usage: scanner.py <js_urls.txt> <target_domain>", file=sys.stderr)
                   sys.exit(1)
 
-              js_list = sys.argv[1]
-              target_domain = sys.argv[2]
+              js_list, target_domain = sys.argv[1], sys.argv[2]
 
               if not os.path.exists(js_list):
-                  print(f"❌ Not found: {js_list}", file=sys.stderr)
+                  print(f"❌ File not found: {js_list}", file=sys.stderr)
                   sys.exit(1)
 
-              with open(js_list, 'r') as f:
-                  urls = [line.strip() for line in f if line.strip()]
+              with open(js_list) as f:
+                  urls = [l.strip() for l in f if l.strip()]
 
               if not urls:
                   print(json.dumps({"findings": [], "stats": {}}))
                   return
 
-              analyzer = JavaScriptAnalyzer(target_domain=target_domain)
+              analyzer = JavaScriptAnalyzer(target_domain)
+              dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
-              print(f"🧠 Production Scanner", file=sys.stderr)
-              print(f"   Target domain: {target_domain}", file=sys.stderr)
-              print(f"   URLs: {len(urls)}", file=sys.stderr)
-              print(f"   LLM: {'✅ Active' if client else '⚠️  Pattern-only'}", file=sys.stderr)
+              print(f"🧠 JS Security Scanner v3", file=sys.stderr)
+              print(f"   Target : {target_domain}", file=sys.stderr)
+              print(f"   URLs   : {len(urls)}", file=sys.stderr)
+              print(f"   Concur : {DOWNLOAD_CONCURRENCY} downloads / {LLM_CONCURRENCY} LLM", file=sys.stderr)
+              print(f"   LLM    : {'✅ Active' if client else '⚠️  Pattern-only'}", file=sys.stderr)
               print("", file=sys.stderr)
 
-              all_findings = []
-
-              for i, url in enumerate(urls, 1):
-                  filename = os.path.basename(urlparse(url).path) or "unknown.js"
-                  print(f"[{i}/{len(urls)}] {filename[:50]}", file=sys.stderr)
-
-                  content = await download_js(url)
-
+              # ── Parallel download ─────────────────────────────────────────────
+              async def fetch_and_analyze(i: int, url: str) -> List[Dict]:
+                  fname = os.path.basename(urlparse(url).path) or "unknown.js"
+                  print(f"[{i:02d}/{len(urls)}] ↓ {fname[:50]}", file=sys.stderr)
+                  content = await download_js(url, dl_sem)
                   if not content:
-                      print(f"  ⚠️  Download failed / HTML response", file=sys.stderr)
-                      continue
-
+                      print(f"[{i:02d}]    ⚠️  skip (no content / HTML)", file=sys.stderr)
+                      return []
                   findings = await analyzer.analyze_file(url, content)
+                  status = f"🔥 {len(findings)} finding(s)" if findings else "✓ clean"
+                  print(f"[{i:02d}]    {status}", file=sys.stderr)
+                  return findings
 
-                  if findings:
-                      print(f"  🔥 {len(findings)} finding(s)", file=sys.stderr)
-                      all_findings.extend(findings)
-                  else:
-                      print(f"  ✓  Clean", file=sys.stderr)
+              tasks = [fetch_and_analyze(i, url) for i, url in enumerate(urls, 1)]
+              results = await asyncio.gather(*tasks)
+              all_findings = [f for batch in results for f in batch]
 
-                  await asyncio.sleep(0.5)
+              # Sort: CRITICAL first
+              sev = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+              all_findings.sort(key=lambda x: sev.get(x.get("severity", "LOW"), 4))
 
-              # Sort by severity
-              severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-              all_findings.sort(key=lambda x: severity_order.get(x.get("severity", "LOW"), 4))
+              output = {"findings": all_findings, "stats": analyzer.stats}
 
-              output = {
-                  "findings": all_findings,
-                  "stats": analyzer.stats
-              }
-
-              print(json.dumps(output, indent=2))
-
+              # Write JSON to file (bash wrapper reads this file)
               with open("scan_results.json", "w") as f:
                   json.dump(output, f, indent=2)
 
               print("", file=sys.stderr)
-              print("📊 Statistics:", file=sys.stderr)
+              print("📊 Stats:", file=sys.stderr)
               for k, v in analyzer.stats.items():
-                  print(f"   {k}: {v}", file=sys.stderr)
+                  print(f"   {k:25s}: {v}", file=sys.stderr)
 
           if __name__ == "__main__":
               asyncio.run(main())
@@ -714,6 +701,8 @@ jobs:
                   analyzed=$(jq '.stats.analyzed' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   skipped_tp=$(jq '.stats.skipped_third_party' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   skipped_html=$(jq '.stats.skipped_html' tmp/scan_${domain}.json 2>/dev/null || echo "0")
+                  skipped_lib=$(jq '.stats.skipped_library' tmp/scan_${domain}.json 2>/dev/null || echo "0")
+                  fp_suppressed=$(jq '.stats.fp_suppressed' tmp/scan_${domain}.json 2>/dev/null || echo "0")
 
                   total_findings=$((total_findings + finding_count))
                   critical_findings=$((critical_findings + critical))
@@ -725,7 +714,8 @@ jobs:
 
           **Scan Date:** $(date '+%Y-%m-%d %H:%M UTC')
           **Run:** #${{ github.run_number }}
-          **Intelligence:** ${GROQ_API_KEY:+Groq LLM Active}${GROQ_API_KEY:-Pattern-Only Mode}
+          **Scanner:** v3 (parallel + FP-hardened)
+          **Intelligence:** ${GROQ_API_KEY:+Groq LLM Active (public-by-default stance)}${GROQ_API_KEY:-Pattern-Only Mode}
 
           ---
 
@@ -736,7 +726,9 @@ jobs:
           | JS Files Discovered | $js_count |
           | Files Analyzed | $analyzed |
           | Skipped (Third-Party) | $skipped_tp |
+          | Skipped (Library) | $skipped_lib |
           | Skipped (HTML Response) | $skipped_html |
+          | FP Matches Suppressed | $fp_suppressed |
           | Total Findings | **$finding_count** |
           | Critical Issues | **$critical** |
           | High Severity | **$high** |
@@ -761,12 +753,12 @@ jobs:
           **Risk:** \(.risk)
           **File:** \`\(.url)\`
           **Source Domain:** \`\(.source_domain // \"unknown\")\`
-          \(if .line then \"**Line:** ~\(.line)\" else \"\" end)
-          **Confidence:** \(.confidence)
-
+          \(if .line then \"**Line:** ~\(.line)\" else \"\"\ end)
+          **Confidence:** \(.confidence)\(if .entropy then \" | Entropy: \(.entropy)\" else \"\"\ end)
+          \(if .reasoning then \"**LLM Reasoning:** \(.reasoning)\n\" else \"\"\ end)
           **Evidence:**
           \`\`\`javascript
-          \(.evidence // .context)
+          \(.context // .evidence // \"(see file)\")
           \`\`\`
 
           **⚡ Action Required:**
@@ -783,7 +775,7 @@ jobs:
                     echo "All analyzed JavaScript files passed security checks." >> "$report"
                   fi
 
-                  echo "✅ Findings: $finding_count ($critical critical, $high high) | Skipped HTML: $skipped_html | Skipped 3rd-party: $skipped_tp"
+                  echo "✅ Findings: $finding_count ($critical critical, $high high) | FP suppressed: $fp_suppressed | Skipped HTML: $skipped_html | Skipped 3rd-party: $skipped_tp | Skipped lib: $skipped_lib"
                 else
                   echo "⚠️ Scanner failed"
                 fi

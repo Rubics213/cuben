@@ -7,7 +7,7 @@ on:
       - 'targets.txt'
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'  # Daily at 3 AM
+    - cron: '0 3 * * *'
 
 permissions:
   contents: write
@@ -30,6 +30,11 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Setup Directories
+        run: |
+          mkdir -p final_reports screenshots tmp
+          echo "✅ Directories created"
+
       - name: Cache Tools
         id: cache-tools
         uses: actions/cache@v4
@@ -43,18 +48,31 @@ jobs:
 
       - name: Install Tools
         run: |
-          # Install Python packages
-          pip install --break-system-packages groq aiohttp beautifulsoup4
+          set -e
           
-          # Install Go tools (only if not cached)
+          echo "📦 Installing Python packages..."
+          pip install --break-system-packages groq aiohttp beautifulsoup4 || {
+            echo "⚠️ Pip install failed, trying without cache"
+            pip install --no-cache-dir --break-system-packages groq aiohttp beautifulsoup4
+          }
+          
+          echo "📦 Installing Go tools..."
           if [[ ! -f ~/go/bin/katana ]]; then
-            go install github.com/projectdiscovery/katana/cmd/katana@latest
+            go install github.com/projectdiscovery/katana/cmd/katana@latest || {
+              echo "⚠️ Katana install failed"
+              exit 1
+            }
           fi
           
           if [[ ! -f /usr/local/bin/gowitness ]]; then
-            curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness
-            chmod +x /usr/local/bin/gowitness
+            sudo curl -fsSL "https://github.com/sensepost/gowitness/releases/download/2.5.1/gowitness-2.5.1-linux-amd64" -o /usr/local/bin/gowitness || {
+              echo "⚠️ Gowitness download failed"
+              exit 1
+            }
+            sudo chmod +x /usr/local/bin/gowitness
           fi
+          
+          echo "✅ All tools installed"
 
       - name: Add Tools to PATH
         run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
@@ -74,17 +92,28 @@ jobs:
           import asyncio
           import re
           from typing import List, Dict, Optional
-          from groq import Groq
+          
+          try:
+              from groq import Groq
+              GROQ_AVAILABLE = True
+          except ImportError:
+              GROQ_AVAILABLE = False
+              print("⚠️ Groq not installed - using pattern-only mode", file=sys.stderr)
           
           # Initialize Groq
           GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-          if not GROQ_API_KEY:
-              print("⚠️  GROQ_API_KEY not set - using basic patterns only")
+          if not GROQ_API_KEY or not GROQ_AVAILABLE:
+              print("⚠️ GROQ_API_KEY not set or groq not installed - using basic patterns only", file=sys.stderr)
               client = None
           else:
-              client = Groq(api_key=GROQ_API_KEY)
+              try:
+                  client = Groq(api_key=GROQ_API_KEY)
+                  print("✅ Groq client initialized", file=sys.stderr)
+              except Exception as e:
+                  print(f"⚠️ Groq init failed: {e}", file=sys.stderr)
+                  client = None
           
-          # High-confidence patterns (no LLM needed)
+          # High-confidence patterns
           CRITICAL_PATTERNS = {
               "api_key": r'(?i)(api[_-]?key|apikey)\s*[:=]\s*["\']([a-zA-Z0-9_\-]{20,})["\']',
               "secret": r'(?i)(secret|password|passwd)\s*[:=]\s*["\']([^"\']{8,})["\']',
@@ -96,58 +125,61 @@ jobs:
               "github_token": r'gh[pousr]_[A-Za-z0-9_]{36,}',
           }
           
-          # Exclude common false positives
+          # Exclude false positives
           BOILERPLATE = [
               "example", "demo", "test", "placeholder", "sample",
               "username", "password", "config", "type", "scheme",
-              "datetime-local", "next/image", "react", "angular", "vue"
+              "datetime-local", "next/image", "react", "angular", "vue",
+              "your_api_key", "your_secret", "insert_", "replace_"
           ]
           
           
           def is_boilerplate(text: str) -> bool:
-              """Check if text contains common boilerplate"""
+              """Check if text contains boilerplate"""
               text_lower = text.lower()
               return any(bp in text_lower for bp in BOILERPLATE)
           
           
           def extract_context(js_content: str, match_pos: int, context_size: int = 100) -> str:
-              """Extract surrounding context for a match"""
+              """Extract surrounding context"""
               start = max(0, match_pos - context_size)
               end = min(len(js_content), match_pos + context_size)
               return js_content[start:end]
           
           
           def basic_pattern_scan(js_content: str, js_url: str) -> List[Dict]:
-              """Scan using regex patterns (no LLM)"""
+              """Scan using regex patterns"""
               findings = []
               
               for pattern_name, pattern in CRITICAL_PATTERNS.items():
-                  matches = re.finditer(pattern, js_content)
-                  for match in matches:
-                      context = extract_context(js_content, match.start())
-                      
-                      # Skip boilerplate
-                      if is_boilerplate(context):
-                          continue
-                      
-                      findings.append({
-                          "type": pattern_name,
-                          "severity": "HIGH",
-                          "url": js_url,
-                          "context": context.strip(),
-                          "match": match.group(0)[:100],
-                          "confidence": "high_pattern"
-                      })
+                  try:
+                      matches = re.finditer(pattern, js_content)
+                      for match in matches:
+                          context = extract_context(js_content, match.start())
+                          
+                          if is_boilerplate(context):
+                              continue
+                          
+                          findings.append({
+                              "type": pattern_name,
+                              "severity": "HIGH",
+                              "url": js_url,
+                              "context": context.strip()[:200],
+                              "match": match.group(0)[:100],
+                              "confidence": "high_pattern"
+                          })
+                  except Exception as e:
+                      print(f"Pattern error ({pattern_name}): {e}", file=sys.stderr)
+                      continue
               
               return findings
           
           
           async def llm_analyze_js(js_content: str, js_url: str) -> Optional[Dict]:
-              """Use Groq to analyze JS for security issues"""
+              """Use Groq to analyze JS"""
               if not client:
                   return None
               
-              # Only analyze suspicious chunks (save API calls)
               suspicious_keywords = ["key", "secret", "token", "password", "api", "auth", "credential"]
               chunks = []
               
@@ -158,37 +190,36 @@ jobs:
               if not chunks:
                   return None
               
-              # Limit to first 20 suspicious lines
               sample = '\n'.join(chunks[:20])
               
-              prompt = f"""Analyze this JavaScript code for REAL security vulnerabilities.
+              prompt = f"""Analyze this JavaScript for REAL security vulnerabilities.
 
-          JavaScript from: {js_url}
+          From: {os.path.basename(js_url)}
 
           Code:
           ```javascript
           {sample[:1500]}
           ```
 
-          ONLY flag REAL issues:
-          - Hardcoded API keys, secrets, passwords (with actual values)
-          - Exposed authentication tokens
-          - Database credentials
+          ONLY flag REAL issues with actual values:
+          - Hardcoded API keys (not placeholders)
+          - Real authentication tokens
+          - Database credentials with values
           - Private keys
 
           IGNORE:
-          - Variable names like "apiKey" without values
-          - Comments or documentation
+          - Variable names without values
+          - Placeholders like "YOUR_API_KEY"
+          - Comments
           - Configuration templates
-          - Framework boilerplate
 
           Return JSON (no markdown):
           {{
             "has_vulnerability": true/false,
             "type": "api_key|secret|token|private_key|none",
-            "severity": "CRITICAL|HIGH|MEDIUM|LOW",
-            "description": "Brief description",
-            "evidence": "Specific line of code",
+            "severity": "CRITICAL|HIGH|MEDIUM",
+            "description": "What was found",
+            "evidence": "Specific line",
             "false_positive_risk": "low|medium|high"
           }}"""
               
@@ -197,12 +228,11 @@ jobs:
                       model="llama-3.3-70b-versatile",
                       messages=[{"role": "user", "content": prompt}],
                       max_tokens=500,
-                      temperature=0.3  # Lower temp for more consistent output
+                      temperature=0.3
                   )
                   
                   content = response.choices[0].message.content.strip()
                   
-                  # Clean markdown
                   if "```" in content:
                       for part in content.split("```"):
                           if "{" in part:
@@ -211,32 +241,31 @@ jobs:
                   
                   result = json.loads(content)
                   
-                  # Only return if LLM is confident
                   if result.get("has_vulnerability") and result.get("false_positive_risk") != "high":
                       return {
                           "type": result.get("type", "unknown"),
                           "severity": result.get("severity", "MEDIUM"),
                           "url": js_url,
-                          "description": result.get("description", ""),
+                          "description": result.get("description", "")[:200],
                           "evidence": result.get("evidence", "")[:200],
                           "confidence": "llm_verified"
                       }
               
               except Exception as e:
-                  print(f"  ⚠️  LLM error: {e}", file=sys.stderr)
+                  print(f"LLM error: {e}", file=sys.stderr)
               
               return None
           
           
           async def analyze_js_file(js_url: str, js_content: str) -> List[Dict]:
-              """Analyze single JS file with both patterns and LLM"""
+              """Analyze single JS file"""
               findings = []
               
-              # 1. Basic pattern matching (fast, high confidence)
+              # Pattern matching
               pattern_findings = basic_pattern_scan(js_content, js_url)
               findings.extend(pattern_findings)
               
-              # 2. LLM analysis (slower, catches subtle issues)
+              # LLM analysis
               if client:
                   llm_finding = await llm_analyze_js(js_content, js_url)
                   if llm_finding:
@@ -247,34 +276,32 @@ jobs:
           
           async def main():
               if len(sys.argv) < 2:
-                  print("Usage: python intelligent_js_scanner.py <js_files.txt>")
+                  print("Usage: python intelligent_js_scanner.py <js_files.txt>", file=sys.stderr)
                   sys.exit(1)
               
               js_files_list = sys.argv[1]
               
               if not os.path.exists(js_files_list):
-                  print(f"❌ File not found: {js_files_list}")
+                  print(f"❌ File not found: {js_files_list}", file=sys.stderr)
                   sys.exit(1)
               
-              # Read JS URLs
               with open(js_files_list, 'r') as f:
                   js_urls = [line.strip() for line in f if line.strip()]
               
               if not js_urls:
-                  print("No JS files to analyze")
+                  print("No JS files to analyze", file=sys.stderr)
+                  print(json.dumps([]))
                   return
               
-              print(f"🧠 Intelligent JS Scanner")
-              print(f"   Files to analyze: {len(js_urls)}")
-              print(f"   LLM: {'✅ Groq enabled' if client else '❌ Pattern-only mode'}")
-              print()
+              print(f"🧠 Intelligent JS Scanner", file=sys.stderr)
+              print(f"   Files: {len(js_urls)}", file=sys.stderr)
+              print(f"   LLM: {'✅ Groq' if client else '❌ Pattern-only'}", file=sys.stderr)
               
               all_findings = []
               
               for i, js_url in enumerate(js_urls, 1):
-                  print(f"[{i}/{len(js_urls)}] {os.path.basename(js_url)}")
+                  print(f"[{i}/{len(js_urls)}] {os.path.basename(js_url)}", file=sys.stderr)
                   
-                  # Download JS file
                   js_file = f"tmp/js_{i}.js"
                   try:
                       import subprocess
@@ -285,41 +312,38 @@ jobs:
                       )
                       
                       if result.returncode != 0:
-                          print(f"  ⚠️  Download failed")
+                          print(f"  ⚠️ Download failed", file=sys.stderr)
                           continue
                       
                       with open(js_file, 'r', errors='ignore') as f:
                           js_content = f.read()
                       
                       if len(js_content) < 100:
-                          print(f"  ⚠️  File too small")
+                          print(f"  ⚠️ File too small", file=sys.stderr)
                           continue
                       
-                      # Analyze
                       findings = await analyze_js_file(js_url, js_content)
                       
                       if findings:
-                          print(f"  🔥 {len(findings)} finding(s)")
+                          print(f"  🔥 {len(findings)} finding(s)", file=sys.stderr)
                           all_findings.extend(findings)
                       else:
-                          print(f"  ✓ Clean")
+                          print(f"  ✓ Clean", file=sys.stderr)
                   
                   except Exception as e:
-                      print(f"  ⚠️  Error: {e}")
+                      print(f"  ⚠️ Error: {e}", file=sys.stderr)
               
-              # Output results as JSON
-              print()
+              # Output JSON to stdout
               print(json.dumps(all_findings, indent=2))
               
               # Save to file
               with open("js_findings.json", "w") as f:
                   json.dump(all_findings, f, indent=2)
               
-              print()
-              print(f"📊 Total findings: {len(all_findings)}")
-              print(f"   Pattern-based: {sum(1 for f in all_findings if f.get('confidence') == 'high_pattern')}")
+              print(f"\n📊 Total: {len(all_findings)}", file=sys.stderr)
+              print(f"   Pattern: {sum(1 for f in all_findings if f.get('confidence') == 'high_pattern')}", file=sys.stderr)
               if client:
-                  print(f"   LLM-verified: {sum(1 for f in all_findings if f.get('confidence') == 'llm_verified')}")
+                  print(f"   LLM: {sum(1 for f in all_findings if f.get('confidence') == 'llm_verified')}", file=sys.stderr)
           
           
           if __name__ == "__main__":
@@ -327,51 +351,57 @@ jobs:
           PYTHON_SCRIPT
           
           chmod +x intelligent_js_scanner.py
+          echo "✅ Scanner created"
 
       - name: Run Intelligent Reconnaissance
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set -euo pipefail
+          
+          # Ensure directories exist
           mkdir -p final_reports screenshots tmp
           
-          # Stats
+          # Initialize stats
           domains_scanned=0
           screenshots_taken=0
           js_files_analyzed=0
           findings_found=0
           
           # Validate targets
-          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
-            echo "❌ targets.txt is missing or empty"
-            exit 0
+          if [[ ! -f targets.txt ]]; then
+            echo "❌ targets.txt not found"
+            echo "Creating default targets.txt"
+            echo "example.com" > targets.txt
           fi
           
-          # Select 4 targets (optimized for 30min)
-          grep -v '^#' targets.txt | grep -v '^$' | shuf -n 4 > tmp/selected.txt
-          
-          if [[ ! -s tmp/selected.txt ]]; then
-            echo "❌ No valid targets"
-            exit 0
+          if [[ ! -s targets.txt ]]; then
+            echo "❌ targets.txt is empty"
+            echo "example.com" > targets.txt
           fi
+          
+          # Select targets
+          grep -v '^#' targets.txt | grep -v '^$' | shuf -n 4 > tmp/selected.txt || {
+            echo "⚠️ No valid targets, using defaults"
+            echo "example.com" > tmp/selected.txt
+          }
           
           echo "════════════════════════════════════════"
           echo "🧠 INTELLIGENT JS SECURITY SCANNER"
           echo "════════════════════════════════════════"
-          cat tmp/selected.txt | nl
+          cat tmp/selected.txt | nl || echo "No targets"
           echo "════════════════════════════════════════"
           echo ""
           
           # Check Groq
           if [[ -n "${GROQ_API_KEY:-}" ]]; then
-            echo "✅ Groq LLM enabled (intelligent mode)"
+            echo "✅ Groq LLM enabled"
           else
-            echo "⚠️  Groq not configured (pattern-only mode)"
-            echo "   Add GROQ_API_KEY secret for AI analysis"
+            echo "⚠️ Groq not configured (pattern-only mode)"
           fi
           echo ""
           
-          # Process each domain
+          # Process domains
           while read -r domain; do
             [[ -z "$domain" ]] && continue
             
@@ -387,19 +417,22 @@ jobs:
             
             report="final_reports/REPORT_${domain}.md"
             
-            # Report header
-            cat > "$report" << EOF
-          # 🧠 Intelligent JS Security Scan: $domain
-          **Scan Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')  
-          **Domain:** $domains_scanned of 4  
-          **Run:** #${{ github.run_number }}
-          **Intelligence:** ${GROQ_API_KEY:+Groq LLM}${GROQ_API_KEY:-Pattern-only}
-          
-          ---
-          
-          EOF
+            # Create report
+            {
+              echo "# 🧠 Intelligent JS Security Scan: $domain"
+              echo "**Scan Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')"
+              echo "**Domain:** $domains_scanned of 4"
+              echo "**Run:** #${{ github.run_number }}"
+              echo "**Intelligence:** ${GROQ_API_KEY:+Groq LLM}${GROQ_API_KEY:-Pattern-only}"
+              echo ""
+              echo "---"
+              echo ""
+            } > "$report" || {
+              echo "⚠️ Failed to create report"
+              continue
+            }
             
-            # 1. Screenshot
+            # Screenshot
             echo "📸 Screenshot..."
             if timeout 25s /usr/local/bin/gowitness single "https://$domain" -P screenshots/ --disable-db 2>/dev/null; then
               sleep 2
@@ -407,10 +440,10 @@ jobs:
               if [[ -n "$latest" ]]; then
                 mv "$latest" "screenshots/${domain}.png" 2>/dev/null && \
                   screenshots_taken=$((screenshots_taken + 1)) && \
-                  echo "✓ Captured"
+                  echo "✓ Captured" || echo "⚠️ Move failed"
               fi
             else
-              echo "⚠️ Timeout"
+              echo "⚠️ Timeout or failed"
             fi
             
             if [[ -f "screenshots/${domain}.png" ]]; then
@@ -419,8 +452,8 @@ jobs:
               echo "" >> "$report"
             fi
             
-            # 2. JS Discovery & Analysis
-            echo "🧠 Intelligent JS Analysis..."
+            # JS Analysis
+            echo "🧠 JS Analysis..."
             echo "## 🧠 JavaScript Security Analysis" >> "$report"
             
             if timeout 70s katana -u "https://$domain" -jc -d 2 -silent > tmp/urls_raw_${domain}.txt 2>/dev/null; then
@@ -431,7 +464,7 @@ jobs:
             fi
             
             if [[ -s tmp/urls_raw_${domain}.txt ]]; then
-              # Filter JS files (exclude frameworks)
+              # Filter JS
               grep -iE '\.js(\?|$)' tmp/urls_raw_${domain}.txt | \
                 grep -iv '\.json' | \
                 grep -vEi '(webpack|jquery|bootstrap|react|angular|vue|framework|polyfill|chunk|bundle|vendor|node_modules)' | \
@@ -440,14 +473,14 @@ jobs:
               js_count=$(wc -l < tmp/js_filtered_${domain}.txt 2>/dev/null || echo "0")
               
               if [[ $js_count -gt 0 ]]; then
-                echo "**Analyzing $js_count JavaScript files with AI...**" >> "$report"
+                echo "**Analyzing $js_count files...**" >> "$report"
                 echo "" >> "$report"
                 
-                # Run intelligent scanner
-                if python3 intelligent_js_scanner.py tmp/js_filtered_${domain}.txt > tmp/scanner_output_${domain}.txt 2>&1; then
-                  # Parse results
-                  if [[ -f js_findings.json ]]; then
-                    finding_count=$(jq '. | length' js_findings.json 2>/dev/null || echo "0")
+                # Run scanner
+                if python3 intelligent_js_scanner.py tmp/js_filtered_${domain}.txt > tmp/scanner_output_${domain}.json 2> tmp/scanner_log_${domain}.txt; then
+                  
+                  if [[ -f tmp/scanner_output_${domain}.json ]] && [[ -s tmp/scanner_output_${domain}.json ]]; then
+                    finding_count=$(jq '. | length' tmp/scanner_output_${domain}.json 2>/dev/null || echo "0")
                     
                     if [[ $finding_count -gt 0 ]]; then
                       findings_found=$((findings_found + finding_count))
@@ -456,23 +489,27 @@ jobs:
                       echo "" >> "$report"
                       
                       # Format findings
-                      jq -r '.[] | "#### \(.severity): \(.type)\n**URL:** `\(.url)`\n**Confidence:** \(.confidence)\n\n```javascript\n\(.evidence // .context)\n```\n"' js_findings.json >> "$report" 2>/dev/null || \
-                        cat js_findings.json >> "$report"
+                      jq -r '.[] | "#### \(.severity): \(.type)\n**URL:** `\(.url)`\n**Confidence:** \(.confidence)\n\n```javascript\n\(if .evidence then .evidence else .context end)\n```\n"' tmp/scanner_output_${domain}.json >> "$report" 2>/dev/null || {
+                        echo "**Raw findings:**" >> "$report"
+                        cat tmp/scanner_output_${domain}.json >> "$report"
+                      }
                       
                       echo "" >> "$report"
-                      
-                      # Copy to domain-specific file for email
-                      cp js_findings.json "tmp/findings_${domain}.json"
+                      cp tmp/scanner_output_${domain}.json "tmp/findings_${domain}.json"
                     else
                       echo "*✅ No security issues detected*" >> "$report"
                       echo "" >> "$report"
                     fi
                     
                     js_files_analyzed=$((js_files_analyzed + js_count))
+                  else
+                    echo "*No findings output*" >> "$report"
+                    echo "" >> "$report"
                   fi
                 else
-                  echo "*Analysis error - see logs*" >> "$report"
+                  echo "*Analysis error (see logs)*" >> "$report"
                   echo "" >> "$report"
+                  cat tmp/scanner_log_${domain}.txt 2>/dev/null || true
                 fi
               else
                 echo "*No relevant JavaScript found*" >> "$report"
@@ -498,7 +535,7 @@ jobs:
           echo "Findings: $findings_found"
           echo "════════════════════════════════════════"
           
-          # Export stats
+          # Export to env
           echo "DOMAINS_SCANNED=$domains_scanned" >> $GITHUB_ENV
           echo "SCREENSHOTS_TAKEN=$screenshots_taken" >> $GITHUB_ENV
           echo "JS_FILES_ANALYZED=$js_files_analyzed" >> $GITHUB_ENV
@@ -513,11 +550,15 @@ jobs:
       - name: Generate Summary
         if: always()
         run: |
-          cat > final_reports/SUMMARY.md << 'EOF'
+          # Ensure directory exists
+          mkdir -p final_reports
+          
+          # Create summary
+          cat > final_reports/SUMMARY.md << SUMMARY_EOF
           # 🧠 Intelligent JS Security Scanner - Summary
           
-          **Scan Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')  
-          **Run:** #${{ github.run_number }}  
+          **Scan Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')
+          **Run:** #${{ github.run_number }}
           **Intelligence:** ${GROQ_API_KEY:+✅ Groq LLM}${GROQ_API_KEY:-⚠️ Pattern-only}
           
           ---
@@ -539,12 +580,8 @@ jobs:
           
           $(if [[ "${FINDINGS_FOUND:-0}" -gt 0 ]]; then
             echo "🚨 **${FINDINGS_FOUND} security issue(s) detected**"
-            echo ""
-            echo "Issues found in JavaScript files - review reports for details."
           else
             echo "✅ **No security issues detected**"
-            echo ""
-            echo "All JavaScript files passed security analysis."
           fi)
           
           ## 📝 Reports
@@ -553,9 +590,11 @@ jobs:
           
           ---
           
-          **Repo:** ${{ github.repository }}  
+          **Repo:** ${{ github.repository }}
           **Commit:** ${GITHUB_SHA:0:7}
-          EOF
+          SUMMARY_EOF
+          
+          echo "✅ Summary created"
 
       - name: Upload Results
         if: always()
@@ -570,10 +609,11 @@ jobs:
           compression-level: 9
 
       - name: Commit History
-        if: always()
+        if: always() && env.DOMAINS_SCANNED != '0'
+        continue-on-error: true
         run: |
           if [[ ! -d final_reports ]] || [[ -z "$(ls -A final_reports 2>/dev/null)" ]]; then
-            echo "No results"
+            echo "No results to commit"
             exit 0
           fi
           
@@ -600,20 +640,20 @@ jobs:
           git add scans/
           if ! git diff --staged --quiet; then
             git commit -m "Scan: $TIMESTAMP" \
-              -m "Domains: ${DOMAINS_SCANNED:-0} | Findings: ${FINDINGS_FOUND:-0}" \
-              -m "Run: #${{ github.run_number }}"
-            git push origin js-scan-history || echo "Push failed (first run OK)"
+              -m "Domains: ${DOMAINS_SCANNED:-0} | Findings: ${FINDINGS_FOUND:-0}"
+            git push origin js-scan-history || echo "⚠️ Push failed"
           fi
 
       - name: Email Report
-        if: always()
+        if: always() && env.DOMAINS_SCANNED != '0'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "${{ env.HAS_FINDINGS == 'true' && '🚨' || '✅' }} JS Security Scan $(date +%Y-%m-%d) | ${{ env.FINDINGS_FOUND }} Finding(s)"
+          subject: "${{ env.HAS_FINDINGS == 'true' && '🚨' || '✅' }} JS Scan $(date +%Y-%m-%d) | ${{ env.FINDINGS_FOUND }} Finding(s)"
           to: ${{ secrets.EMAIL_USERNAME }}
           from: JS Security <js-scanner@security.local>
           body: |
@@ -630,22 +670,15 @@ jobs:
             • Screenshots:  ${{ env.SCREENSHOTS_TAKEN }}
             • 🔥 FINDINGS:  ${{ env.FINDINGS_FOUND }}
             
-            ${{ env.HAS_FINDINGS == 'true' && '🚨 SECURITY ISSUES FOUND - REVIEW REQUIRED' || '✅ NO ISSUES DETECTED' }}
+            ${{ env.HAS_FINDINGS == 'true' && '🚨 SECURITY ISSUES FOUND' || '✅ NO ISSUES' }}
             
-            📎 ATTACHMENTS
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            • SUMMARY.md - Scan overview
-            • REPORT_*.md - Detailed findings
-            ${{ env.HAS_FINDINGS == 'true' && '• findings_*.json - Raw results' || '' }}
-            
-            🔗 Full results: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            
-            Powered by Groq LLM + Pattern Analysis
-          attachments: final_reports/*${{ env.HAS_FINDINGS == 'true' && ',tmp/findings_*.json' || '' }}
+            📎 Full results: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          attachments: final_reports/*
           priority: ${{ env.HAS_FINDINGS == 'true' && 'high' || 'normal' }}
 
       - name: Critical Alert
         if: always() && env.HAS_FINDINGS == 'true' && env.FINDINGS_FOUND != '0'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -660,25 +693,16 @@ jobs:
             
             ${{ env.FINDINGS_FOUND }} SECURITY ISSUE(S) IN JAVASCRIPT
             
-            Potential exposed credentials, API keys, or secrets detected
-            in JavaScript files. Immediate review required.
+            Potential exposed credentials detected.
+            Immediate review required.
             
-            ⚡ ACTION REQUIRED
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            1. Review attached reports
-            2. Verify if credentials are real
-            3. Rotate any exposed keys immediately
-            4. Remove secrets from client-side code
-            
-            📎 Detailed findings attached
+            📎 Reports attached
             🔗 ${{ github.repository }}/actions/runs/${{ github.run_id }}
-            
-            Scanned: $(date '+%Y-%m-%d %H:%M UTC')
           attachments: final_reports/REPORT_*.md
           priority: high
 
       - name: Cleanup
         if: always()
         run: |
-          rm -rf tmp/ history/ *.js
+          rm -rf tmp/*.js history/ 2>/dev/null || true
           echo "✅ Cleanup done"

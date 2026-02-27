@@ -665,17 +665,26 @@ jobs:
 
             if [[ -s tmp/urls_${domain}.txt ]]; then
 
-              # ── FIX 1: Filter to same domain only ──────────────────────────────
-              # Write to temp file first — avoids broken pipe error from sort|head
-              # under set -euo pipefail
-              grep -iE '\.js(\?|$)' tmp/urls_${domain}.txt \
+              # ── Domain-scoped JS filtering ─────────────────────────────────
+              # Step 1: grab .js URLs, drop .json, drop obvious third-party CDNs.
+              # We keep ANY URL that contains the base domain string — subdomains
+              # like assets.twitch.tv, cdn.grafana.com etc. are intentionally kept.
+              # Fine-grained third-party rejection is handled by the Python scanner.
+              # Write to temp file first to avoid broken-pipe under set -euo pipefail.
+              base_domain="${domain#www.}"   # strip leading www. if present
+
+              grep -iE '\.js(\?[^[:space:]]*)?$' tmp/urls_${domain}.txt \
                 | grep -iv '\.json' \
-                | grep -iE "(^https?://(www\.)?${domain}/|^https?://[a-z0-9-]+\.${domain}/)" \
+                | grep -i "${base_domain}" \
                 > tmp/js_${domain}_raw.txt 2>/dev/null || true
 
               sort -u tmp/js_${domain}_raw.txt > tmp/js_${domain}_sorted.txt 2>/dev/null || true
               head -n 20 tmp/js_${domain}_sorted.txt > tmp/js_${domain}.txt 2>/dev/null || true
               rm -f tmp/js_${domain}_raw.txt tmp/js_${domain}_sorted.txt
+
+              # Debug: show what was found before and after filter
+              total_urls=$(wc -l < tmp/urls_${domain}.txt 2>/dev/null || echo "0")
+              echo "   📋 katana found $total_urls URLs total, filtered to $(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo "0") same-domain JS files"
               # ──────────────────────────────────────────────────────────────────
 
               js_count=$(wc -l < tmp/js_${domain}.txt 2>/dev/null || echo "0")

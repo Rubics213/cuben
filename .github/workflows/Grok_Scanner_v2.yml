@@ -263,37 +263,47 @@ jobs:
           import concurrent.futures
           _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=12)
 
-          def _curl_fetch(url: str, timeout: int) -> Optional[str]:
-              """Blocking curl fetch — run in thread pool for concurrency."""
+          def _curl_fetch(url: str, timeout: int) -> Tuple[Optional[str], str]:
+              """
+              Blocking curl fetch. Returns (content, skip_reason).
+              skip_reason is empty string on success.
+              Adds Referer/Origin so CDN-gated Next.js chunks don't 403.
+              """
               try:
                   import subprocess as _sp
+                  parsed = urlparse(url)
+                  origin = f"{parsed.scheme}://{parsed.netloc}"
                   result = _sp.run(
                       ["curl", "-sL",
-                       "-A", "Mozilla/5.0 (compatible; SecurityScanner/2.0)",
+                       "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                        "--max-time", str(timeout),
                        "--max-filesize", "4000000",
                        "--retry", "1",
-                       "-H", "Accept: application/javascript, text/javascript, */*",
+                       "--compressed",
+                       "-H", "Accept: application/javascript, text/javascript, */*;q=0.9",
+                       "-H", f"Referer: {origin}/",
+                       "-H", f"Origin: {origin}",
+                       "-H", "Accept-Language: en-US,en;q=0.9",
                        url],
                       capture_output=True,
                       timeout=timeout + 5,
                   )
                   if result.returncode != 0:
-                      return None
+                      return None, f"curl exit {result.returncode}"
                   content = result.stdout.decode("utf-8", errors="ignore")
                   if len(content) < 200:
-                      return None
-                  # Reject HTML responses (error pages / redirects)
+                      return None, "too small"
+                  # Reject HTML responses (403/404 error pages, login walls)
                   stripped = content.lstrip()
                   if (stripped.startswith("<!") or
                           stripped.lower().startswith("<html") or
                           re.match(r'<\s*!DOCTYPE', stripped, re.IGNORECASE)):
-                      return None
-                  return content
-              except Exception:
-                  return None
+                      return None, "html_response"
+                  return content, ""
+              except Exception as e:
+                  return None, str(e)[:60]
 
-          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15) -> Optional[str]:
+          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15) -> Tuple[Optional[str], str]:
               """Async wrapper: runs blocking curl in a thread pool."""
               async with sem:
                   loop = asyncio.get_event_loop()
@@ -309,6 +319,7 @@ jobs:
                   self.llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
                   self.stats: Dict[str, int] = {
                       "total_files": 0,
+                      "skipped_download": 0,   # failed / HTML / too-small at fetch time
                       "skipped_third_party": 0,
                       "skipped_library": 0,
                       "skipped_html": 0,
@@ -586,9 +597,10 @@ jobs:
               async def fetch_and_analyze(i: int, url: str) -> List[Dict]:
                   fname = os.path.basename(urlparse(url).path) or "unknown.js"
                   print(f"[{i:02d}/{len(urls)}] ↓ {fname[:50]}", file=sys.stderr)
-                  content = await download_js(url, dl_sem)
+                  content, skip_reason = await download_js(url, dl_sem)
                   if not content:
-                      print(f"[{i:02d}]    ⚠️  skip (no content / HTML)", file=sys.stderr)
+                      analyzer.stats["skipped_download"] += 1
+                      print(f"[{i:02d}]    ⚠️  skip ({skip_reason})", file=sys.stderr)
                       return []
                   findings = await analyzer.analyze_file(url, content)
                   status = f"🔥 {len(findings)} finding(s)" if findings else "✓ clean"
@@ -713,6 +725,7 @@ jobs:
                   skipped_tp=$(jq '.stats.skipped_third_party' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   skipped_html=$(jq '.stats.skipped_html' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   skipped_lib=$(jq '.stats.skipped_library' tmp/scan_${domain}.json 2>/dev/null || echo "0")
+                  skipped_dl=$(jq '.stats.skipped_download' tmp/scan_${domain}.json 2>/dev/null || echo "0")
                   fp_suppressed=$(jq '.stats.fp_suppressed' tmp/scan_${domain}.json 2>/dev/null || echo "0")
 
                   total_findings=$((total_findings + finding_count))
@@ -737,8 +750,9 @@ jobs:
           | JS Files Discovered | $js_count |
           | Files Analyzed | $analyzed |
           | Skipped (Third-Party) | $skipped_tp |
+          | Skipped (Download fail/HTML) | $skipped_dl |
           | Skipped (Library) | $skipped_lib |
-          | Skipped (HTML Response) | $skipped_html |
+          | Skipped (Analyzer HTML) | $skipped_html |
           | FP Matches Suppressed | $fp_suppressed |
           | Total Findings | **$finding_count** |
           | Critical Issues | **$critical** |
@@ -786,7 +800,7 @@ jobs:
                     echo "All analyzed JavaScript files passed security checks." >> "$report"
                   fi
 
-                  echo "✅ Findings: $finding_count ($critical critical, $high high) | FP suppressed: $fp_suppressed | Skipped HTML: $skipped_html | Skipped 3rd-party: $skipped_tp | Skipped lib: $skipped_lib"
+                  echo "✅ Findings: $finding_count ($critical critical, $high high) | FP suppressed: $fp_suppressed | Skipped dl: $skipped_dl | Skipped lib: $skipped_lib | Skipped 3rd-party: $skipped_tp"
                 else
                   echo "⚠️ Scanner failed"
                 fi

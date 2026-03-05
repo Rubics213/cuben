@@ -1,0 +1,931 @@
+name: Production JS Security Scanner v2.3
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  intelligent-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Directories
+        run: |
+          mkdir -p reports tmp stats
+          echo "✅ Workspace ready"
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-tools-v5
+
+      - name: Install Dependencies
+        run: |
+          set -e
+          echo "📦 Installing packages..."
+          pip install --no-cache-dir groq aiohttp requests jsbeautifier || \
+            pip install --break-system-packages groq aiohttp requests jsbeautifier
+
+          if [[ ! -f ~/go/bin/katana ]]; then
+            echo "Installing katana..."
+            go install github.com/projectdiscovery/katana/cmd/katana@latest
+          fi
+
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "✅ Dependencies ready"
+
+      - name: Create Production Scanner
+        run: |
+          cat > production_js_scanner.py << 'PYTHON_SCRIPT'
+          #!/usr/bin/env python3
+          """Production JS Security Scanner v6 - PII Detection + Enhanced FP Reduction"""
+
+          import os, sys, json, asyncio, re, hashlib, math, subprocess
+          from typing import List, Dict, Optional, Set, Tuple
+          from urllib.parse import urlparse
+          import concurrent.futures
+
+          # ── Luhn algorithm (credit card validation) ───────────────────────────────
+          def luhn_check(number: str) -> bool:
+              digits = [int(d) for d in re.sub(r'[\s\-]', '', number) if d.isdigit()]
+              if len(digits) < 13:
+                  return False
+              digits.reverse()
+              total = sum(
+                  d if i % 2 == 0 else (d * 2 - 9 if d * 2 > 9 else d * 2)
+                  for i, d in enumerate(digits)
+              )
+              return total % 10 == 0
+
+          # ── Groq AI client ──────────────────────────────────────────────────────────
+          try:
+              from groq import Groq
+              GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+              client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+              if client:
+                  print("✅ Groq AI triage active", file=sys.stderr)
+              else:
+                  print("⚠️ Groq unavailable – skipping AI triage", file=sys.stderr)
+          except Exception:
+              client = None
+              print("⚠️ Groq import failed", file=sys.stderr)
+
+          # ── Secret patterns ──────────────────────────────────────────────────────────
+          # Each pattern has:
+          #   regex       – what to match (group 1 = the secret value itself)
+          #   severity    – CRITICAL / HIGH / MEDIUM
+          #   min_entropy – Shannon entropy floor; genuine secrets are high-entropy
+          #   context_kw  – nearby keywords that raise confidence (optional)
+
+          PATTERNS = {
+              # ══════════════════════════════════════════════════════════════
+              # SECRETS / CREDENTIALS
+              # ══════════════════════════════════════════════════════════════
+              "private_key": {
+                  # Non-capturing group — always uses full match (group 0) so we never
+                  # get a 3-char "EC " or 4-char "RSA " as the extracted value.
+                  "regex": r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',
+                  "severity": "CRITICAL",
+                  "min_entropy": 0,
+                  "category": "secret",
+              },
+              "aws_access_key": {
+                  "regex": r'\b((?:AKIA|ASIA)[A-Z0-9]{16})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 3.5,
+                  "category": "secret",
+              },
+              "aws_secret_key": {
+                  "regex": r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})["\']',
+                  "severity": "CRITICAL",
+                  "min_entropy": 4.5,
+                  "category": "secret",
+              },
+              "github_token": {
+                  "regex": r'\b(gh[pousr]_[A-Za-z0-9_]{36,})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 4.0,
+                  "category": "secret",
+              },
+              "slack_token": {
+                  "regex": r'\b(xox[baprs]-[0-9A-Za-z\-]{10,})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 3.5,
+                  "category": "secret",
+              },
+              "stripe_secret": {
+                  "regex": r'\b(sk_(?:live|test)_[A-Za-z0-9]{24,})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 4.0,
+                  "category": "secret",
+              },
+              "sendgrid_key": {
+                  "regex": r'\b(SG\.[A-Za-z0-9_\-]{22,}\.[A-Za-z0-9_\-]{43,})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 4.5,
+                  "category": "secret",
+              },
+              "twilio_key": {
+                  "regex": r'\b(SK[0-9a-fA-F]{32})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 3.5,
+                  "category": "secret",
+              },
+              "jwt_secret": {
+                  "regex": r'\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b',
+                  "severity": "HIGH",
+                  "min_entropy": 4.0,
+                  "category": "secret",
+              },
+              "generic_secret": {
+                  "regex": r'(?i)(?:secret|password|passwd|token|auth_key)\s*[:=]\s*["\']([A-Za-z0-9!@#$%^&*_+\-]{20,})["\']',
+                  "severity": "HIGH",
+                  "min_entropy": 4.2,
+                  "category": "secret",
+              },
+              "generic_api_key": {
+                  "regex": r'(?i)api[_\-]?key\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']',
+                  "severity": "HIGH",
+                  "min_entropy": 4.0,
+                  "category": "secret",
+              },
+              "hardcoded_password": {
+                  "regex": r'(?i)(?:password|passwd|pwd)\s*[:=]\s*["\']([^"\']{8,})["\']',
+                  "severity": "CRITICAL",
+                  "min_entropy": 3.5,
+                  "category": "secret",
+              },
+              "heroku_key": {
+                  "regex": r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b',
+                  "severity": "MEDIUM",
+                  "min_entropy": 3.5,
+                  "context_kw": ["heroku", "api", "token"],
+                  "category": "secret",
+              },
+
+              # ══════════════════════════════════════════════════════════════
+              # PII — Personally Identifiable Information
+              # ══════════════════════════════════════════════════════════════
+              "email_address": {
+                  # Exclude common noreply/test addresses via BOILERPLATE_SUBSTRINGS
+                  "regex": r'\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b',
+                  "severity": "MEDIUM",
+                  "min_entropy": 2.5,
+                  "category": "pii",
+              },
+              "phone_number": {
+                  # Requires nearby keyword to avoid matching version numbers / timestamps
+                  "regex": r'\b(\+?1?\s?[\(\-\.]?\d{3}[\)\-\.\s]?\d{3}[\-\.\s]?\d{4})\b',
+                  "severity": "MEDIUM",
+                  "min_entropy": 1.0,
+                  "context_kw": ["phone", "mobile", "cell", "tel", "contact", "sms", "whatsapp"],
+                  "category": "pii",
+              },
+              "social_security_number": {
+                  "regex": r'\b(\d{3}-\d{2}-\d{4})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 0,
+                  "category": "pii",
+              },
+              "credit_card": {
+                  # Luhn-validated in scan() — regex alone is not sufficient
+                  "regex": r'\b(4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b',
+                  "severity": "CRITICAL",
+                  "min_entropy": 0,
+                  "luhn": True,   # flag: post-process with Luhn check
+                  "category": "pii",
+              },
+              "uk_national_insurance": {
+                  "regex": r'\b([A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D])\b',
+                  "severity": "HIGH",
+                  "min_entropy": 0,
+                  "category": "pii",
+              },
+              "passport_number": {
+                  # Generic passport-like pattern (requires context keyword)
+                  "regex": r'\b([A-Z]{1,2}[0-9]{6,9})\b',
+                  "severity": "HIGH",
+                  "min_entropy": 0,
+                  "context_kw": ["passport", "travel", "document", "id_number", "id number"],
+                  "category": "pii",
+              },
+              "date_of_birth": {
+                  # Requires context keyword to avoid matching random dates
+                  "regex": r'\b(\d{4}-\d{2}-\d{2}|\d{2}[\/\-]\d{2}[\/\-]\d{4})\b',
+                  "severity": "MEDIUM",
+                  "min_entropy": 0,
+                  "context_kw": ["dob", "date_of_birth", "dateofbirth", "birthday", "birth_date"],
+                  "category": "pii",
+              },
+
+              # ══════════════════════════════════════════════════════════════
+              # INFRASTRUCTURE EXPOSURE
+              # ══════════════════════════════════════════════════════════════
+              "internal_ip": {
+                  # Private RFC-1918 addresses leaking into JS
+                  "regex": r'\b((?:10|127|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3})\b',
+                  "severity": "LOW",
+                  "min_entropy": 0,
+                  "category": "infra",
+              },
+              "s3_bucket": {
+                  "regex": r'\b((?:[a-z0-9\-]+)\.s3(?:[\.\-][a-z0-9\-]+)?\.amazonaws\.com)\b',
+                  "severity": "MEDIUM",
+                  "min_entropy": 0,
+                  "category": "infra",
+              },
+              "internal_hostname": {
+                  "regex": r'https?://((?:internal|staging|dev|admin|corp|intranet|uat|preprod)[a-z0-9\-\.]*\.[a-z]{2,})',
+                  "severity": "MEDIUM",
+                  "min_entropy": 0,
+                  "category": "infra",
+              },
+          }
+
+          # ── False-positive suppression ────────────────────────────────────────────
+          # Values that START with these are intentionally public — skip immediately.
+          PUBLIC_KEY_PREFIXES = [
+              "pk_live_", "pk_test_",   # Stripe public keys
+              "client-",                 # public client identifiers
+              "AIza",                    # Google API (browser-safe)
+              "G-", "UA-",              # Google Analytics
+              "AAAA",                    # Firebase / FCM (public VAPID-style)
+          ]
+
+          # Boilerplate / documentation values — skip these.
+          BOILERPLATE_SUBSTRINGS = [
+              "your_", "yourkey", "example", "demo_", "test_", "placeholder",
+              "xxxx", "0000", "1234", "abcd", "insert", "changeme",
+              # Email-specific boilerplate
+              "noreply", "no-reply", "@example.", "@test.", "@localhost",
+              "user@", "email@", "admin@example", "support@example",
+              "someone@", "name@", "info@example",
+          ]
+
+          # Values that look like hex hashes (MD5/SHA) are almost never real secrets.
+          HEX_HASH_RE = re.compile(r'^[0-9a-f]{32}$', re.I)
+
+          # ── Shannon entropy ───────────────────────────────────────────────────────
+          def entropy(s: str) -> float:
+              if not s:
+                  return 0.0
+              freq = {c: s.count(c) / len(s) for c in set(s)}
+              return -sum(p * math.log2(p) for p in freq.values())
+
+          # ── Groq AI triage ────────────────────────────────────────────────────────
+          # Groq model fallback list — tried in order until one succeeds.
+          # Update the first entry when Groq releases newer models.
+          GROQ_MODELS = [
+              "llama-3.3-70b-versatile",   # current (Dec 2024+)
+              "llama-3.1-70b-versatile",   # previous generation
+              "llama3-70b-8192",           # legacy name — keep as last resort
+          ]
+
+          def ai_triage(findings: List[Dict], context_snippets: Dict[str, str]) -> List[Dict]:
+              """Ask Groq to validate a batch of findings and mark likely FPs.
+              Batches are capped at 20 findings to avoid token limit truncation."""
+              if not client or not findings:
+                  return findings
+
+              def call_groq(prompt: str) -> list:
+                  """Try each model in GROQ_MODELS until one succeeds."""
+                  last_err = None
+                  for model in GROQ_MODELS:
+                      try:
+                          resp = client.chat.completions.create(
+                              model=model,
+                              messages=[{"role": "user", "content": prompt}],
+                              temperature=0,
+                              max_tokens=4096,
+                          )
+                          raw = resp.choices[0].message.content.strip()
+                          raw = re.sub(r"^```json|```$", "", raw, flags=re.M).strip()
+                          result = json.loads(raw)
+                          print(f"✅ AI triage used model: {model}", file=sys.stderr)
+                          return result
+                      except json.JSONDecodeError as e:
+                          print(f"⚠️ AI triage JSON parse error (model={model}): {e}", file=sys.stderr)
+                          # JSON error — model responded but badly formatted; no point retrying
+                          break
+                      except Exception as e:
+                          last_err = e
+                          print(f"⚠️ AI triage error (model={model}): {e}", file=sys.stderr)
+                          continue
+                  if last_err:
+                      print(f"⚠️ All Groq models failed. Triage skipped for this batch.", file=sys.stderr)
+                  return []
+
+              def triage_batch(batch_findings: List[Dict]) -> None:
+                  batch = []
+                  for i, f in enumerate(batch_findings):
+                      snippet = context_snippets.get(f["match"], "")
+                      batch.append(
+                          f"[{i}] category={f.get('category','secret')} type={f['type']} "
+                          f"value={f['match']!r} context={snippet[:200]!r}"
+                      )
+
+                  prompt = (
+                      "You are a security triage expert reviewing findings from a JS scanner. "
+                      "Each finding is one of: 'secret' (credential/API key), 'pii' (personal data), or 'infra' (infrastructure exposure). "
+                      "For SECRETS: verdict REAL if it looks like a live credential, FP if intentionally public or boilerplate. "
+                      "For PII: verdict REAL if it looks like genuine personal data hardcoded/exposed, FP if it's a template/placeholder/test value. "
+                      "For INFRA: verdict REAL if it's a live internal endpoint, FP if it's a public URL or example. "
+                      "Reply ONLY with a JSON array: [{\"index\": 0, \"verdict\": \"REAL\", \"reason\": \"...\"}, ...]\n\n"
+                      + "\n".join(batch)
+                  )
+
+                  verdicts = call_groq(prompt)
+                  for v in verdicts:
+                      idx = v.get("index")
+                      if idx is not None and idx < len(batch_findings):
+                          batch_findings[idx]["ai_verdict"] = v.get("verdict", "UNKNOWN")
+                          batch_findings[idx]["ai_reason"] = v.get("reason", "")
+                          if v.get("verdict") == "FP":
+                              batch_findings[idx]["severity"] = "INFO"
+
+              # Process in chunks of 20 to stay well within token limits
+              CHUNK = 20
+              for start in range(0, len(findings), CHUNK):
+                  triage_batch(findings[start:start + CHUNK])
+
+              return findings
+
+          # ── Fetcher ───────────────────────────────────────────────────────────────
+          _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+          def _curl_fetch(url: str, timeout: int) -> Tuple[Optional[str], str]:
+              try:
+                  result = subprocess.run(
+                      ["curl", "-sL", "-A", "Mozilla/5.0 (compatible; SecurityScanner/1.0)",
+                       "--max-time", str(timeout), url],
+                      capture_output=True, timeout=timeout + 5
+                  )
+                  if result.returncode != 0:
+                      return None, "curl_failed"
+                  content = result.stdout.decode("utf-8", errors="ignore")
+                  # Skip HTML pages and tiny files
+                  if len(content) < 200 or content.lstrip().startswith("<"):
+                      return None, "html_or_small"
+                  return content, ""
+              except Exception as e:
+                  return None, f"error:{e}"
+
+          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15):
+              async with sem:
+                  loop = asyncio.get_event_loop()
+                  return await loop.run_in_executor(_thread_pool, _curl_fetch, url, timeout)
+
+          # ── Analyzer ──────────────────────────────────────────────────────────────
+          class JSAnalyzer:
+              def __init__(self, domain: str):
+                  self.domain = domain.lower().replace("www.", "")
+                  self.seen_content: Set[str] = set()
+                  self.seen_values: Set[str] = set()   # deduplicate same secret across files
+                  self.stats = {"total": 0, "analyzed": 0, "findings": 0, "skipped": 0, "fp_suppressed": 0, "pii_findings": 0, "infra_findings": 0}
+
+              def is_same_domain(self, url: str) -> bool:
+                  try:
+                      host = urlparse(url).netloc.lower().replace("www.", "")
+                      base = self.domain.split(".")[0]
+                      return (host == self.domain
+                              or host.endswith("." + self.domain)
+                              or base in host)
+                  except Exception:
+                      return False
+
+              def is_duplicate_content(self, content: str) -> bool:
+                  h = hashlib.md5(content.encode()).hexdigest()
+                  if h in self.seen_content:
+                      return True
+                  self.seen_content.add(h)
+                  return False
+
+              def is_false_positive(self, val: str, category: str = "secret") -> bool:
+                  """Return True when the value is almost certainly not a real finding."""
+                  vl = val.lower()
+                  # 1. Publicly-safe prefixes (secrets only — PII/infra don't use these)
+                  if category == "secret" and any(val.startswith(p) for p in PUBLIC_KEY_PREFIXES):
+                      return True
+                  # 2. Boilerplate substrings
+                  if any(bp in vl for bp in BOILERPLATE_SUBSTRINGS):
+                      return True
+                  # 3. Looks like a hex hash (MD5/SHA1 partial) — secrets only
+                  if category == "secret" and HEX_HASH_RE.match(val):
+                      return True
+                  # 4. Minimum length — PII patterns like SSNs (11 chars) and NI numbers
+                  #    (9 chars) are shorter than typical secrets, so use a lower floor.
+                  min_len = 6 if category == "pii" else 12
+                  if len(val) < min_len:
+                      return True
+                  return False
+
+              def extract_context(self, content: str, match_start: int, window: int = 120) -> str:
+                  """Grab surrounding characters for AI context / report."""
+                  start = max(0, match_start - window)
+                  end = min(len(content), match_start + window)
+                  return content[start:end].replace("\n", " ")
+
+              def scan(self, content: str, url: str) -> Tuple[List[Dict], Dict[str, str]]:
+                  findings: List[Dict] = []
+                  context_map: Dict[str, str] = {}
+
+                  for name, info in PATTERNS.items():
+                      min_e = info.get("min_entropy", 3.0)
+                      ctx_kw = info.get("context_kw", [])
+                      needs_luhn = info.get("luhn", False)
+                      category = info.get("category", "secret")
+
+                      try:
+                          for m in re.finditer(info["regex"], content, re.MULTILINE):
+                              val = m.group(1) if m.lastindex else m.group(0)
+                              val = val.strip()
+
+                              # ── Hard filters ──────────────────────────────
+                              if self.is_false_positive(val, category):
+                                  self.stats["fp_suppressed"] += 1
+                                  continue
+
+                              # ── Luhn validation (credit cards only) ───────
+                              if needs_luhn and not luhn_check(val):
+                                  self.stats["fp_suppressed"] += 1
+                                  continue
+
+                              # ── Entropy check ─────────────────────────────
+                              e = entropy(val)
+                              if e < min_e:
+                                  self.stats["fp_suppressed"] += 1
+                                  continue
+
+                              # ── Context keyword check (optional patterns) ──
+                              if ctx_kw:
+                                  ctx = self.extract_context(content, m.start())
+                                  if not any(kw in ctx.lower() for kw in ctx_kw):
+                                      self.stats["fp_suppressed"] += 1
+                                      continue
+
+                              # ── Deduplicate same value across files ────────
+                              val_hash = hashlib.sha256(val.encode()).hexdigest()
+                              duplicate = val_hash in self.seen_values
+                              self.seen_values.add(val_hash)
+
+                              ctx_snippet = self.extract_context(content, m.start())
+                              context_map[val[:60]] = ctx_snippet
+
+                              findings.append({
+                                  "type": name,
+                                  "category": category,
+                                  "severity": info["severity"],
+                                  "url": url,
+                                  "match": val[:60],
+                                  "entropy": round(e, 2),
+                                  "duplicate": duplicate,
+                                  "context": ctx_snippet[:150],
+                              })
+
+                              # Category counters
+                              if category == "pii":
+                                  self.stats["pii_findings"] += 1
+                              elif category == "infra":
+                                  self.stats["infra_findings"] += 1
+
+                      except Exception:
+                          continue
+
+                  return findings, context_map
+
+              async def analyze(self, url: str, content: str) -> Tuple[List[Dict], Dict[str, str]]:
+                  self.stats["total"] += 1
+                  # Note: domain scoping is handled upstream by katana + bash filtering.
+                  # is_same_domain() is intentionally NOT called here because CDN-hosted
+                  # JS bundles (e.g. assets.vercel.sh, cdn.example.com) legitimately
+                  # belong to the target but would fail a hostname check.
+                  if self.is_duplicate_content(content):
+                      self.stats["skipped"] += 1
+                      return [], {}
+                  self.stats["analyzed"] += 1
+                  findings, ctx = self.scan(content, url)
+                  self.stats["findings"] += len(findings)
+                  return findings, ctx
+
+          # ── Main ──────────────────────────────────────────────────────────────────
+          async def main():
+              if len(sys.argv) < 3:
+                  print("Usage: scanner.py <js_list> <domain>", file=sys.stderr)
+                  sys.exit(1)
+
+              js_list, domain = sys.argv[1], sys.argv[2]
+              with open(js_list) as f:
+                  urls = [l.strip() for l in f if l.strip()]
+
+              analyzer = JSAnalyzer(domain)
+              sem = asyncio.Semaphore(6)
+              all_context: Dict[str, str] = {}
+
+              print(f"🧠 Scanner: {len(urls)} files for {domain}", file=sys.stderr)
+
+              async def process(i: int, url: str):
+                  print(f"[{i:02d}] {os.path.basename(url)[:50]}", file=sys.stderr)
+                  content, err = await download_js(url, sem)
+                  if not content:
+                      print(f"[{i:02d}]    ⚠️ {err}", file=sys.stderr)
+                      return [], {}
+                  findings, ctx = await analyzer.analyze(url, content)
+                  label = f"🔥 {len(findings)} finding(s)" if findings else "✓ clean"
+                  print(f"[{i:02d}]    {label}", file=sys.stderr)
+                  return findings, ctx
+
+              results = await asyncio.gather(
+                  *[process(i, u) for i, u in enumerate(urls, 1)],
+                  return_exceptions=True
+              )
+
+              all_findings: List[Dict] = []
+              for r in results:
+                  if isinstance(r, tuple):
+                      findings, ctx = r
+                      all_findings.extend(findings)
+                      all_context.update(ctx)
+
+              # ── AI triage on non-duplicate findings ──────────────────
+              primary = [f for f in all_findings if not f.get("duplicate")]
+              primary = ai_triage(primary, all_context)
+
+              # Merge back — duplicates inherit the verdict of the primary
+              verdict_map = {f["match"]: f.get("ai_verdict") for f in primary}
+              reason_map  = {f["match"]: f.get("ai_reason")  for f in primary}
+              for f in all_findings:
+                  if f.get("duplicate") and f["match"] in verdict_map:
+                      f["ai_verdict"] = verdict_map[f["match"]]
+                      f["ai_reason"]  = reason_map[f["match"]]
+
+              # Sort: CRITICAL → HIGH → MEDIUM → INFO
+              severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "INFO": 3}
+              all_findings.sort(key=lambda x: severity_order.get(x.get("severity"), 4))
+
+              output = {
+                  "findings": all_findings,
+                  "stats": {
+                      **analyzer.stats,
+                      "ai_triaged": sum(1 for f in all_findings if "ai_verdict" in f),
+                      "ai_fp_demoted": sum(1 for f in all_findings if f.get("ai_verdict") == "FP"),
+                      "by_category": {
+                          "secret": sum(1 for f in all_findings if f.get("category") == "secret" and f.get("ai_verdict") != "FP"),
+                          "pii":    sum(1 for f in all_findings if f.get("category") == "pii"    and f.get("ai_verdict") != "FP"),
+                          "infra":  sum(1 for f in all_findings if f.get("category") == "infra"  and f.get("ai_verdict") != "FP"),
+                      }
+                  }
+              }
+
+              with open("scan_results.json", "w") as out:
+                  json.dump(output, out, indent=2)
+
+              s = output["stats"]
+              print(
+                  f"\n📊 analyzed={s['analyzed']} | findings={s['findings']} "
+                  f"| secrets={s['by_category']['secret']} pii={s['by_category']['pii']} infra={s['by_category']['infra']} "
+                  f"| fp_suppressed={s['fp_suppressed']} | ai_fp_demoted={s.get('ai_fp_demoted', 0)}",
+                  file=sys.stderr
+              )
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          PYTHON_SCRIPT
+
+          chmod +x production_js_scanner.py
+
+      - name: Run Production Scan
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          set -uo pipefail
+
+          mkdir -p reports tmp stats
+
+          domains_scanned=0
+          js_analyzed=0
+          total_findings=0
+          critical_findings=0
+          high_findings=0
+          total_fp_suppressed=0
+
+          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
+            echo "example.com" > targets.txt
+          fi
+
+          grep -v '^#' targets.txt 2>/dev/null | grep -v '^$' | shuf -n 6 > tmp/selected.txt || echo "example.com" > tmp/selected.txt
+
+          echo "════════════════════════════════════════"
+          echo "🧠 PRODUCTION JS SCANNER v6 (+ PII)"
+          echo "════════════════════════════════════════"
+          cat tmp/selected.txt | nl
+          total_domains=$(wc -l < tmp/selected.txt)
+          echo "════════════════════════════════════════"
+
+          while read -r domain; do
+            [[ -z "$domain" || "$domain" =~ ^[[:space:]]*# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            [[ -z "$domain" ]] && continue
+
+            domains_scanned=$((domains_scanned + 1))
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "🔍 [$domains_scanned/$total_domains] $domain"
+            echo "════════════════════════════════════════"
+
+            (
+              # Redirect stdin to /dev/null so katana and other commands inside
+              # this subshell cannot consume lines from the parent while-loop's
+              # tmp/selected.txt file descriptor.
+              exec < /dev/null
+              set +e
+              report="reports/${domain}_report.md"
+
+              echo "📡 Discovering JS files..."
+              timeout 90s katana -u "https://$domain" -jc -d 3 -c 20 -silent \
+                > tmp/urls_${domain}.txt 2>/dev/null || touch tmp/urls_${domain}.txt
+
+              if [[ ! -s tmp/urls_${domain}.txt ]]; then
+                echo "⚠️ No URLs discovered"
+                echo "# $domain — No JS Found" > "$report"
+                exit 0
+              fi
+
+              # ── JS filtering ──────────────────────────────────────────────────────
+              # NOTE: We no longer filter by domain stem here so we catch CDN-hosted
+              # bundles (e.g. assets.cdn.com/myapp-abc123.js) that belong to the target.
+              grep -iE '\.js(\?|#|$)' tmp/urls_${domain}.txt 2>/dev/null \
+                | grep -iv '\.json' \
+                | grep -ivE '(google-analytics|gtag|gtm\.js|ads\.js|facebook\.net|twitter\.com)' \
+                | sort -u 2>/dev/null \
+                | head -30 > tmp/js_${domain}.txt || touch tmp/js_${domain}.txt
+
+              js_count=$(wc -l < tmp/js_${domain}.txt)
+
+              if [[ $js_count -eq 0 ]]; then
+                echo "⚠️ No JS after filtering"
+                echo "# $domain — No JS After Filtering" > "$report"
+                exit 0
+              fi
+
+              echo "🧠 Analyzing $js_count JS files..."
+              python3 production_js_scanner.py tmp/js_${domain}.txt "$domain" 2>&1 || {
+                echo "⚠️ Scanner exited with error"
+                exit 0
+              }
+
+              [[ ! -f scan_results.json ]] && { echo "⚠️ No results file"; exit 0; }
+              mv scan_results.json tmp/scan_${domain}.json
+
+              # ── Parse stats ───────────────────────────────────────────────────────
+              finding_count=$(jq '.findings | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              real_count=$(jq '[.findings[] | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo "$finding_count")
+              critical=$(jq '[.findings[] | select(.severity=="CRITICAL") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              high=$(jq '[.findings[] | select(.severity=="HIGH") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              secrets_count=$(jq '.stats.by_category.secret // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              pii_count=$(jq '.stats.by_category.pii // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              infra_count=$(jq '.stats.by_category.infra // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              analyzed=$(jq '.stats.analyzed' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              fp_suppressed=$(jq '.stats.fp_suppressed' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              ai_demoted=$(jq '.stats.ai_fp_demoted' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+
+              # ── Generate report ───────────────────────────────────────────────────
+              cat > "$report" << EOF
+          # 🧠 $domain — Security Scan
+
+          **Date:** $(date '+%Y-%m-%d %H:%M UTC')
+          **Run:** #${{ github.run_number }}
+
+          ## Stats
+          | Metric | Value |
+          |--------|------:|
+          | JS Files Discovered | $js_count |
+          | JS Files Analyzed | $analyzed |
+          | Raw Pattern Matches | $finding_count |
+          | Entropy / Prefix FPs Suppressed | $fp_suppressed |
+          | AI-Demoted FPs | $ai_demoted |
+          | **Confirmed Findings** | **$real_count** |
+          | — Secrets / Credentials | $secrets_count |
+          | — PII Exposed | $pii_count |
+          | — Infrastructure Exposure | $infra_count |
+          | Critical | **$critical** |
+          | High | **$high** |
+
+          EOF
+
+              if [[ $real_count -gt 0 ]]; then
+                # ── Secrets section ──────────────────────────────────────
+                secret_real=$(jq '[.findings[] | select(.category=="secret") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+                if [[ $secret_real -gt 0 ]]; then
+                  echo "## 🔑 Secrets / Credentials" >> "$report"
+                  jq -r '
+                    .findings[]
+                    | select(.category=="secret") | select(.ai_verdict != "FP")
+                    | "### \(.type)\n" +
+                      "**Severity:** \(.severity)  \n" +
+                      "**File:** `\(.url)`  \n" +
+                      "**Match:** `\(.match)`  \n" +
+                      "**Entropy:** \(.entropy)  \n" +
+                      (if .ai_verdict then "**AI Verdict:** \(.ai_verdict) — \(.ai_reason // "")\n" else "" end) +
+                      (if .duplicate then "> ⚠️ Same value seen in multiple files\n" else "" end)
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null
+                fi
+
+                # ── PII section ───────────────────────────────────────────
+                pii_real=$(jq '[.findings[] | select(.category=="pii") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+                if [[ $pii_real -gt 0 ]]; then
+                  echo "## 🧑 PII Exposure" >> "$report"
+                  echo "> ⚠️ **Disclosure note:** PII findings may trigger mandatory reporting obligations under GDPR/CCPA/PCI-DSS. Check your program policy before submitting." >> "$report"
+                  echo "" >> "$report"
+                  jq -r '
+                    .findings[]
+                    | select(.category=="pii") | select(.ai_verdict != "FP")
+                    | "### \(.type)\n" +
+                      "**Severity:** \(.severity)  \n" +
+                      "**File:** `\(.url)`  \n" +
+                      "**Match:** `\(.match)`  \n" +
+                      (if .ai_verdict then "**AI Verdict:** \(.ai_verdict) — \(.ai_reason // "")\n" else "" end) +
+                      (if .duplicate then "> ⚠️ Same value seen in multiple files\n" else "" end)
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null
+                fi
+
+                # ── Infrastructure section ────────────────────────────────
+                infra_real=$(jq '[.findings[] | select(.category=="infra") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+                if [[ $infra_real -gt 0 ]]; then
+                  echo "## 🌐 Infrastructure Exposure" >> "$report"
+                  jq -r '
+                    .findings[]
+                    | select(.category=="infra") | select(.ai_verdict != "FP")
+                    | "### \(.type)\n" +
+                      "**Severity:** \(.severity)  \n" +
+                      "**File:** `\(.url)`  \n" +
+                      "**Match:** `\(.match)`  \n" +
+                      (if .ai_verdict then "**AI Verdict:** \(.ai_verdict) — \(.ai_reason // "")\n" else "" end)
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null
+                fi
+
+                echo "" >> "$report"
+                echo "## ℹ️ AI-Demoted (Likely False Positives)" >> "$report"
+                jq -r '
+                  .findings[]
+                  | select(.ai_verdict == "FP")
+                  | "- [\(.category)] `\(.match)` — \(.ai_reason // "auto-suppressed")"
+                ' tmp/scan_${domain}.json >> "$report" 2>/dev/null || true
+              else
+                echo "## ✅ No Confirmed Issues" >> "$report"
+              fi
+
+              echo "✅ Done: $real_count confirmed ($secrets_count secrets, $pii_count PII, $infra_count infra | $fp_suppressed FPs suppressed, $ai_demoted AI-demoted)"
+
+              echo "$real_count"   > tmp/${domain}_findings.txt
+              echo "$critical"     > tmp/${domain}_critical.txt
+              echo "$high"         > tmp/${domain}_high.txt
+              echo "$analyzed"     > tmp/${domain}_analyzed.txt
+              echo "$fp_suppressed" > tmp/${domain}_fp.txt
+
+            ) || echo "⚠️ Domain processing failed (continuing)"
+
+            if [[ -f tmp/${domain}_findings.txt ]]; then
+              total_findings=$((total_findings + $(cat tmp/${domain}_findings.txt)))
+              critical_findings=$((critical_findings + $(cat tmp/${domain}_critical.txt)))
+              high_findings=$((high_findings + $(cat tmp/${domain}_high.txt)))
+              js_analyzed=$((js_analyzed + $(cat tmp/${domain}_analyzed.txt)))
+              total_fp_suppressed=$((total_fp_suppressed + $(cat tmp/${domain}_fp.txt 2>/dev/null || echo 0)))
+            fi
+
+            sleep 1
+          done < tmp/selected.txt
+
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "📊 SCAN COMPLETE"
+          echo "════════════════════════════════════════"
+          echo "Domains:        $domains_scanned"
+          echo "JS Files:       $js_analyzed"
+          echo "FPs Suppressed: $total_fp_suppressed"
+          echo "Findings:       $total_findings"
+          echo "  Critical:     $critical_findings"
+          echo "  High:         $high_findings"
+          echo "════════════════════════════════════════"
+
+          cat > stats/scan_${{ github.run_number }}.json << EOF
+          {
+            "run": ${{ github.run_number }},
+            "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "domains": $domains_scanned,
+            "js_files": $js_analyzed,
+            "fp_suppressed": $total_fp_suppressed,
+            "findings": {
+              "total": $total_findings,
+              "critical": $critical_findings,
+              "high": $high_findings
+            }
+          }
+          EOF
+
+          echo "DOMAINS_SCANNED=$domains_scanned"         >> $GITHUB_ENV
+          echo "JS_ANALYZED=$js_analyzed"                 >> $GITHUB_ENV
+          echo "TOTAL_FINDINGS=$total_findings"           >> $GITHUB_ENV
+          echo "CRITICAL_FINDINGS=$critical_findings"     >> $GITHUB_ENV
+          echo "HIGH_FINDINGS=$high_findings"             >> $GITHUB_ENV
+          echo "FP_SUPPRESSED=$total_fp_suppressed"       >> $GITHUB_ENV
+
+          [[ $total_findings -gt 0 ]]    && echo "HAS_FINDINGS=true" >> $GITHUB_ENV || echo "HAS_FINDINGS=false" >> $GITHUB_ENV
+          [[ $critical_findings -gt 0 ]] && echo "HAS_CRITICAL=true" >> $GITHUB_ENV || echo "HAS_CRITICAL=false" >> $GITHUB_ENV
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          mkdir -p reports
+          cat > reports/SUMMARY.md << EOF
+          # 🧠 JS Security Scanner — Summary
+
+          **Date:** $(date '+%Y-%m-%d %H:%M UTC')
+          **Run:** #${{ github.run_number }}
+
+          ## Metrics
+          | Metric | Value |
+          |--------|------:|
+          | Domains | ${DOMAINS_SCANNED:-0} |
+          | JS Files | ${JS_ANALYZED:-0} |
+          | FPs Suppressed | ${FP_SUPPRESSED:-0} |
+          | **Confirmed Findings** | **${TOTAL_FINDINGS:-0}** |
+          | Critical | ${CRITICAL_FINDINGS:-0} |
+          | High | ${HIGH_FINDINGS:-0} |
+
+          ## Domain Reports
+          $(ls reports/*_report.md 2>/dev/null | wc -l) domain reports generated.
+          EOF
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ github.run_number }}
+          path: |
+            reports/
+            stats/
+          retention-days: 30
+
+      - name: Email Report
+        if: always() && env.DOMAINS_SCANNED != '0'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: >
+            ${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' ||
+                env.HAS_FINDINGS == 'true' && '⚠️ FINDINGS' || '✅ CLEAN' }}
+            | ${{ env.DOMAINS_SCANNED }} Domains
+            | ${{ env.TOTAL_FINDINGS }} Findings (${{ env.FP_SUPPRESSED }} FPs suppressed)
+            | Scan #${{ github.run_number }}
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: JS Scanner <scan@security.local>
+          body: |
+            🧠 JS SECURITY SCAN v6
+
+            📊 RESULTS
+            • Domains:        ${{ env.DOMAINS_SCANNED }}
+            • JS Files:       ${{ env.JS_ANALYZED }}
+            • FPs Suppressed: ${{ env.FP_SUPPRESSED }}
+            • Findings:       ${{ env.TOTAL_FINDINGS }}
+              • Critical:     ${{ env.CRITICAL_FINDINGS }}
+              • High:         ${{ env.HIGH_FINDINGS }}
+
+            ⚠️ PII findings (emails, SSNs, card numbers) may require
+               mandatory disclosure — check your program policy.
+
+            ${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL ISSUES REQUIRE IMMEDIATE REVIEW' ||
+                env.HAS_FINDINGS == 'true' && '⚠️ REVIEW ATTACHED REPORTS' || '✅ ALL CLEAN' }}
+
+            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          attachments: reports/*
+          priority: ${{ env.HAS_CRITICAL == 'true' && 'high' || 'normal' }}
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf tmp/*.txt tmp/*.js 2>/dev/null || true

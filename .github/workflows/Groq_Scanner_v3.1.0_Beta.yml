@@ -1,0 +1,1696 @@
+name: Production JS Security Scanner v3.1.0 Beta
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'targets.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  intelligent-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Directories
+        run: |
+          mkdir -p reports tmp stats
+          echo "✅ Workspace ready"
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-tools-v5
+
+      - name: Install Dependencies
+        run: |
+          set -e
+          echo "📦 Installing packages..."
+          pip install --no-cache-dir groq aiohttp requests jsbeautifier || \
+            pip install --break-system-packages groq aiohttp requests jsbeautifier
+
+          if [[ ! -f ~/go/bin/katana ]]; then
+            echo "Installing katana..."
+            go install github.com/projectdiscovery/katana/cmd/katana@latest
+          fi
+
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "✅ Dependencies ready"
+
+      - name: Create Production Scanner
+        run: |
+          cat > production_js_scanner.py << 'PYTHON_SCRIPT'
+          #!/usr/bin/env python3
+          """Production JS Security Scanner v3.1
+
+          KEY IMPROVEMENTS OVER v2.5:
+          ─────────────────────────────────────────────────────────────────────────
+          1. KNOWN LIBRARY FILTER      — findings in vendor/node_modules/pagefind/etc.
+                                         are auto-demoted to INFO (not suppressed, just
+                                         labelled so you can ignore the noise).
+          2. PUBLIC EMAIL FILTER       — info@, support@, sales@, press@ and ~30 other
+                                         role-based prefixes are skipped entirely.
+          3. ACTIVE HOSTNAME PROBE     — internal hostnames are curl-probed before
+                                         severity is assigned. Not reachable → LOW.
+          4. EXPLOITABILITY TRIAGE     — AI prompt asks "Would a program pay for this?"
+                                         not "Is this value real?".
+          5. SEVERITY CALIBRATION      — severity gates per category; infra must be
+                                         reachable before it exceeds MEDIUM.
+          6. S3 BUCKET ACTIVE PROBE    — s3_bucket findings are probed with a real
+                                         ListObjects request. Publicly listable → CRITICAL.
+                                         403 Forbidden (private) → INFO. No false alarms
+                                         for properly locked buckets.
+          7. THIRD-PARTY VENDOR FILTER — hostnames belonging to Google, Facebook,
+                                         Typeform, Stripe, Twilio, etc. are excluded
+                                         from infra findings. Their SDKs appear in
+                                         every JS bundle and are not your target's infra.
+          ─────────────────────────────────────────────────────────────────────────
+          """
+
+          import os, sys, json, asyncio, re, hashlib, math, subprocess, time
+          from typing import List, Dict, Optional, Set, Tuple
+          from urllib.parse import urlparse
+          import concurrent.futures
+
+          # ─────────────────────────────────────────────────────────────────────────
+          # FIX 1: KNOWN LIBRARY FILTER
+          # Files matching these path patterns are almost always third-party code.
+          # Findings inside them are demoted to INFO rather than suppressed entirely
+          # so the data is still in the report, but they won't inflate your severity
+          # counts or get emailed as critical findings.
+          # ─────────────────────────────────────────────────────────────────────────
+          LIBRARY_PATH_PATTERNS = [
+              r'/node_modules/',
+              r'[/\-_]vendors?[.\-_/]',        # vendor.js, vendors.min.js, /vendor/
+              r'[/\-_]vendor\b',
+              r'/bower_components/',
+              r'pagefind',                       # Pagefind search library
+              r'[/\-_]polyfills?[.\-_]',
+              r'[/\-_]jquery[.\-_]',
+              r'[/\-_]bootstrap[.\-_]',
+              r'[/\-_]lodash[.\-_]',
+              r'[/\-_]moment[.\-_]',
+              r'[/\-_]react[.\-_]',
+              r'[/\-_]angular[.\-_]',
+              r'[/\-_]vue[.\-_]',
+              r'[/\-_]d3[.\-_]',
+              r'[/\-_]three[.\-_]',
+              r'[/\-_]webpack[.\-_]',
+              r'[/\-_]rollup[.\-_]',
+              r'[/\-_]babel[.\-_]',
+              r'[/\-_]core-js[.\-_]',
+              r'[/\-_]regenerator[.\-_]',
+              r'[/\-_]axios[.\-_]',
+              r'[/\-_]socket\.io[.\-_]',
+              r'[/\-_]highlight[.\-_]',         # Prism, Highlight.js
+              r'[/\-_]prism[.\-_]',
+              r'/cdn-cgi/',                      # Cloudflare edge scripts
+              r'cdn\.jsdelivr\.net',
+              r'cdnjs\.cloudflare\.com',
+              r'unpkg\.com',
+              r'cdn\.skypack\.dev',
+              # Webpack chunk hashes: app.a1b2c3d4.js — likely built output but not
+              # your app's logic; low signal-to-noise for PII/secrets. Keep as INFO.
+              r'\.[a-f0-9]{8,}\.(chunk|bundle)\.js',
+          ]
+
+          def is_library_file(url: str) -> bool:
+              """Return True if URL strongly suggests a third-party library."""
+              url_lower = url.lower()
+              return any(re.search(p, url_lower) for p in LIBRARY_PATH_PATTERNS)
+
+          # ─────────────────────────────────────────────────────────────────────────
+          # FIX 7: THIRD-PARTY VENDOR DOMAIN FILTER
+          # The internal_hostname regex catches anything prefixed staging/dev/admin/etc.
+          # But staging.googleapis.com or dev.facebook.com appearing in a JS bundle
+          # is NOT the target's infrastructure — it's a vendor SDK endpoint.
+          # Any hostname whose root domain is in this set is silently dropped from
+          # infra findings.  Add to the list freely; it never touches secret/PII logic.
+          # ─────────────────────────────────────────────────────────────────────────
+          THIRD_PARTY_VENDOR_DOMAINS = {
+              # Analytics & ads
+              "google.com", "googleapis.com", "googletagmanager.com",
+              "googleadservices.com", "googlesyndication.com", "doubleclick.net",
+              "google-analytics.com", "googleoptimize.com",
+              # Meta / Facebook
+              "facebook.com", "facebook.net", "fbcdn.net", "instagram.com",
+              # Microsoft / LinkedIn
+              "microsoft.com", "microsoftonline.com", "live.com", "linkedin.com",
+              "azure.com", "azurewebsites.net", "azurefd.net",
+              # Amazon / AWS (vendor-side, not target S3 buckets)
+              "amazonaws.com", "cloudfront.net", "awsstatic.com",
+              # Payments
+              "stripe.com", "stripe.network", "paypal.com", "braintreegateway.com",
+              "checkout.com",
+              # Communications
+              "twilio.com", "sendgrid.net", "mailchimp.com", "mailgun.org",
+              "postmarkapp.com",
+              # Auth
+              "auth0.com", "okta.com", "onelogin.com", "cognito-idp.amazonaws.com",
+              # Forms / surveys
+              "typeform.com", "surveymonkey.com",
+              # CDN / infra
+              "cloudflare.com", "fastly.net", "akamaized.net", "akamai.net",
+              "jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
+              # Monitoring / error tracking
+              "sentry.io", "bugsnag.com", "datadog.com", "newrelic.com",
+              "rollbar.com", "logrocket.com", "fullstory.com", "hotjar.com",
+              "heap.io",
+              # Social / comms
+              "twitter.com", "x.com", "t.co", "tiktok.com", "snapchat.com",
+              "discord.com", "slack.com", "intercom.io", "zendesk.com",
+              # Maps
+              "mapbox.com", "here.com",
+              # Video
+              "youtube.com", "vimeo.com", "wistia.com",
+              # Apple
+              "apple.com", "icloud.com",
+          }
+
+          def is_third_party_hostname(hostname: str) -> bool:
+              """
+              Return True if hostname belongs to a known third-party vendor.
+              Checks exact match and all parent domains up to the public suffix
+              so that staging.googleapis.com is caught by 'googleapis.com'.
+              """
+              hostname = hostname.lower().lstrip("http://").lstrip("https://")
+              # Strip path/port if present
+              hostname = hostname.split("/")[0].split(":")[0]
+              parts = hostname.split(".")
+              # Walk from most-specific to least-specific: a.b.c → b.c → c
+              for i in range(len(parts) - 1):
+                  candidate = ".".join(parts[i:])
+                  if candidate in THIRD_PARTY_VENDOR_DOMAINS:
+                      return True
+              return False
+
+          # ─────────────────────────────────────────────────────────────────────────
+          # FIX 2: PUBLIC / ROLE-BASED EMAIL FILTER
+          # These prefixes denote intentionally-public role mailboxes. They appear
+          # in JS for legitimate reasons (contact forms, footer rendering, etc.) and
+          # are never reportable as PII exposure in a bug bounty context.
+          # ─────────────────────────────────────────────────────────────────────────
+          PUBLIC_EMAIL_PREFIXES = [
+              "info@", "support@", "sales@", "press@", "contact@", "hello@",
+              "help@", "team@", "admin@", "webmaster@", "feedback@",
+              "enquiries@", "enquiry@", "marketing@", "billing@", "accounts@",
+              "legal@", "privacy@", "security@", "abuse@", "postmaster@",
+              "noreply@", "no-reply@", "newsletter@", "unsubscribe@",
+              "media@", "partnerships@", "partners@", "careers@", "jobs@",
+              "hr@", "finance@", "compliance@", "operations@", "ops@",
+              "dev@", "api@", "developer@", "developers@", "opensource@",
+              "notifications@", "alerts@", "bot@", "system@", "automated@",
+              "donotreply@", "do-not-reply@", "reply@",
+          ]
+
+          def is_public_email(address: str) -> bool:
+              """Return True if this is a role-based / publicly intended email."""
+              low = address.lower()
+              return any(low.startswith(prefix) for prefix in PUBLIC_EMAIL_PREFIXES)
+
+          # ─────────────────────────────────────────────────────────────────────────
+          # FIX 3: ACTIVE HOSTNAME VERIFICATION
+          # Before calling an internal hostname HIGH, we try to actually reach it.
+          # Severity mapping based on what we find:
+          #   • Resolves + returns 2xx/3xx  → KEEP severity (genuinely exposed)
+          #   • Resolves + returns 401/403  → MEDIUM (exists but access-controlled)
+          #   • Resolves + returns 4xx/5xx  → LOW (exists, broken or gated)
+          #   • Does not resolve / timeout  → LOW (not reachable from internet)
+          # ─────────────────────────────────────────────────────────────────────────
+          def verify_hostname(hostname: str) -> Dict:
+              """
+              Curl the hostname (HTTPS first, then HTTP) and return a dict:
+                reachable : bool
+                http_code : str   ("000" = no response)
+                severity  : str   recommended severity after probe
+                note      : str   human-readable reason
+              """
+              result = {"reachable": False, "http_code": "000",
+                        "severity": "LOW", "note": "probe_not_run"}
+
+              def _probe(scheme: str) -> str:
+                  """Return the HTTP status code string, or '000' on failure."""
+                  try:
+                      r = subprocess.run(
+                          ["curl", "-sS", "--max-time", "7",
+                           "-o", "/dev/null", "-w", "%{http_code}",
+                           "--insecure",          # accept self-signed certs on internal hosts
+                           "-A", "Mozilla/5.0 (compatible; SecurityScanner/1.0)",
+                           f"{scheme}://{hostname}"],
+                          capture_output=True, timeout=12
+                      )
+                      return r.stdout.decode("utf-8", errors="ignore").strip() or "000"
+                  except Exception:
+                      return "000"
+
+              code = _probe("https")
+              if code == "000":
+                  code = _probe("http")    # fall back to plain HTTP
+
+              result["http_code"] = code
+
+              if code == "000":
+                  result.update({"reachable": False, "severity": "LOW",
+                                 "note": "hostname_not_reachable_from_internet"})
+              elif code in ("401", "403"):
+                  result.update({"reachable": True, "severity": "MEDIUM",
+                                 "note": f"reachable_but_access_controlled_{code}"})
+              elif code in ("404", "410"):
+                  result.update({"reachable": True, "severity": "LOW",
+                                 "note": f"reachable_but_not_found_{code}"})
+              elif code.startswith("5"):
+                  result.update({"reachable": True, "severity": "MEDIUM",
+                                 "note": f"reachable_server_error_{code}"})
+              elif code.startswith("2") or code.startswith("3"):
+                  # Actually open — keep or escalate original severity
+                  result.update({"reachable": True, "severity": "HIGH",
+                                 "note": f"open_and_reachable_{code}"})
+              else:
+                  result.update({"reachable": True, "severity": "LOW",
+                                 "note": f"unexpected_status_{code}"})
+
+              return result
+
+          # ─────────────────────────────────────────────────────────────────────────
+          # FIX 6: S3 BUCKET ACTIVE PROBE
+          # A bucket name in JS is not a finding by itself — the bucket could be
+          # completely private. We issue a real ListObjects request (no auth) and
+          # interpret the response:
+          #
+          #   2xx + <ListBucketResult>  → CRITICAL  publicly listable, contents exposed
+          #   2xx without XML body      → HIGH       open but unclear exposure
+          #   403 Forbidden             → INFO       bucket exists but is private (not reportable)
+          #   404 / NoSuchBucket        → INFO       bucket doesn't exist (dangling ref)
+          #   timeout / DNS failure     → LOW        not reachable from internet
+          #
+          # This eliminates the entire category of "every S3 mention = MEDIUM" noise.
+          # ─────────────────────────────────────────────────────────────────────────
+          def probe_s3_bucket(bucket_hostname: str) -> Dict:
+              """
+              Probe an S3 bucket with an unauthenticated ListObjects request.
+              bucket_hostname is the full hostname, e.g. my-bucket.s3.amazonaws.com
+              Returns dict: {severity, note, http_code, listable}
+              """
+              result = {"severity": "LOW", "note": "probe_not_run",
+                        "http_code": "000", "listable": False}
+              try:
+                  r = subprocess.run(
+                      ["curl", "-sS", "--max-time", "8",
+                       "-o", "-",                          # capture body
+                       "-w", "\n__STATUS__%{http_code}",  # append status at end
+                       f"https://{bucket_hostname}/?list-type=2&max-keys=5"],
+                      capture_output=True, timeout=13
+                  )
+                  raw = r.stdout.decode("utf-8", errors="ignore")
+                  # Parse the appended status code marker
+                  if "__STATUS__" in raw:
+                      body, code = raw.rsplit("__STATUS__", 1)
+                      code = code.strip()
+                  else:
+                      body, code = raw, "000"
+
+                  result["http_code"] = code
+
+                  if code.startswith("2"):
+                      if "<ListBucketResult" in body or "<Contents>" in body:
+                          result.update({
+                              "severity": "CRITICAL",
+                              "note": "bucket_publicly_listable_contents_exposed",
+                              "listable": True,
+                          })
+                      else:
+                          result.update({
+                              "severity": "HIGH",
+                              "note": "bucket_open_response_but_no_listing",
+                              "listable": False,
+                          })
+                  elif code == "403":
+                      result.update({
+                          "severity": "INFO",
+                          "note": "bucket_private_403_forbidden",
+                          "listable": False,
+                      })
+                  elif code == "404" or "NoSuchBucket" in body:
+                      result.update({
+                          "severity": "INFO",
+                          "note": "bucket_does_not_exist_404",
+                          "listable": False,
+                      })
+                  elif code == "000":
+                      result.update({
+                          "severity": "LOW",
+                          "note": "bucket_not_reachable_dns_or_timeout",
+                          "listable": False,
+                      })
+                  else:
+                      result.update({
+                          "severity": "LOW",
+                          "note": f"bucket_unexpected_status_{code}",
+                          "listable": False,
+                      })
+
+              except Exception as e:
+                  result.update({"severity": "LOW", "note": f"probe_error:{e}"})
+
+              return result
+
+          # ── Luhn algorithm (credit card validation) ───────────────────────────────
+          def luhn_check(number: str) -> bool:
+              digits = [int(d) for d in re.sub(r'[\s\-]', '', number) if d.isdigit()]
+              if len(digits) < 13:
+                  return False
+              digits.reverse()
+              total = sum(
+                  d if i % 2 == 0 else (d * 2 - 9 if d * 2 > 9 else d * 2)
+                  for i, d in enumerate(digits)
+              )
+              return total % 10 == 0
+
+          # ── Passive credential validator ──────────────────────────────────────────
+          def validate_credential(finding_type: str, value: str) -> Dict:
+              """Single read-only API call to check if a credential is live.
+              Returns {"live": bool, "note": str}. Never modifies the credential."""
+              result = {"live": False, "note": "not_validated"}
+              try:
+                  if finding_type == "aws_access_key":
+                      r = subprocess.run(
+                          ["curl", "-sf", "--max-time", "8",
+                           "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15"],
+                          capture_output=True
+                      )
+                      body = r.stdout.decode("utf-8", errors="ignore")
+                      if "InvalidClientTokenId" in body:
+                          result = {"live": False, "note": "aws_key_invalid"}
+                      elif "AuthFailure" in body or "SignatureDoesNotMatch" in body:
+                          result = {"live": True, "note": "aws_key_format_valid_needs_secret"}
+                      else:
+                          result = {"live": False, "note": "aws_probe_inconclusive"}
+
+                  elif finding_type == "stripe_secret":
+                      r = subprocess.run(
+                          ["curl", "-sf", "--max-time", "8",
+                           "-u", f"{value}:", "https://api.stripe.com/v1/balance"],
+                          capture_output=True
+                      )
+                      body = r.stdout.decode("utf-8", errors="ignore")
+                      if r.returncode == 0 and '"object": "balance"' in body:
+                          result = {"live": True, "note": "stripe_key_active_balance_readable"}
+                      elif "No such API key" in body or "Invalid API Key" in body:
+                          result = {"live": False, "note": "stripe_key_invalid"}
+                      else:
+                          result = {"live": False, "note": "stripe_probe_inconclusive"}
+
+                  elif finding_type == "github_token":
+                      r = subprocess.run(
+                          ["curl", "-sf", "--max-time", "8",
+                           "-H", f"Authorization: token {value}",
+                           "https://api.github.com/user"],
+                          capture_output=True
+                      )
+                      if r.returncode == 0:
+                          body = r.stdout.decode("utf-8", errors="ignore")
+                          if '"login"' in body:
+                              result = {"live": True, "note": "github_token_active"}
+                          else:
+                              result = {"live": False, "note": "github_probe_inconclusive"}
+                      else:
+                          result = {"live": False, "note": "github_token_invalid"}
+
+                  elif finding_type == "slack_token":
+                      r = subprocess.run(
+                          ["curl", "-sf", "--max-time", "8",
+                           "-H", f"Authorization: Bearer {value}",
+                           "https://slack.com/api/auth.test"],
+                          capture_output=True
+                      )
+                      body = r.stdout.decode("utf-8", errors="ignore")
+                      if '"ok":true' in body.replace(" ", ""):
+                          result = {"live": True, "note": "slack_token_active"}
+                      else:
+                          result = {"live": False, "note": "slack_token_invalid_or_revoked"}
+
+              except Exception as e:
+                  result = {"live": False, "note": f"validation_error:{e}"}
+
+              return result
+
+          # ── Content-Length HEAD fetcher ────────────────────────────────────────────
+          def _head_size(url: str) -> int:
+              try:
+                  r = subprocess.run(
+                      ["curl", "-sI", "--max-time", "5",
+                       "-A", "Mozilla/5.0 (compatible; SecurityScanner/1.0)", url],
+                      capture_output=True, timeout=8
+                  )
+                  for line in r.stdout.decode("utf-8", errors="ignore").splitlines():
+                      if line.lower().startswith("content-length:"):
+                          return int(line.split(":", 1)[1].strip())
+              except Exception:
+                  pass
+              return 0
+
+          try:
+              from groq import Groq
+              GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+              client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+              if client:
+                  print("✅ Groq AI triage active", file=sys.stderr)
+              else:
+                  print("⚠️ Groq unavailable – skipping AI triage", file=sys.stderr)
+          except Exception:
+              client = None
+              print("⚠️ Groq import failed", file=sys.stderr)
+
+          # ── Secret patterns ──────────────────────────────────────────────────────
+          PATTERNS = {
+              "private_key": {
+                  "regex": r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',
+                  "severity": "CRITICAL", "min_entropy": 0, "category": "secret",
+              },
+              "aws_access_key": {
+                  "regex": r'\b((?:AKIA|ASIA)[A-Z0-9]{16})\b',
+                  "severity": "CRITICAL", "min_entropy": 3.5, "category": "secret",
+              },
+              "aws_secret_key": {
+                  "regex": r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})["\']',
+                  "severity": "CRITICAL", "min_entropy": 4.5, "category": "secret",
+              },
+              "github_token": {
+                  "regex": r'\b(gh[pousr]_[A-Za-z0-9_]{36,})\b',
+                  "severity": "CRITICAL", "min_entropy": 4.0, "category": "secret",
+              },
+              "slack_token": {
+                  "regex": r'\b(xox[baprs]-[0-9A-Za-z\-]{10,})\b',
+                  "severity": "CRITICAL", "min_entropy": 3.5, "category": "secret",
+              },
+              "stripe_secret": {
+                  "regex": r'\b(sk_(?:live|test)_[A-Za-z0-9]{24,})\b',
+                  "severity": "CRITICAL", "min_entropy": 4.0, "category": "secret",
+              },
+              "sendgrid_key": {
+                  "regex": r'\b(SG\.[A-Za-z0-9_\-]{22,}\.[A-Za-z0-9_\-]{43,})\b',
+                  "severity": "CRITICAL", "min_entropy": 4.5, "category": "secret",
+              },
+              "twilio_key": {
+                  "regex": r'\b(SK[0-9a-fA-F]{32})\b',
+                  "severity": "CRITICAL", "min_entropy": 3.5, "category": "secret",
+              },
+              "jwt_secret": {
+                  "regex": r'\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b',
+                  "severity": "HIGH", "min_entropy": 4.0, "category": "secret",
+              },
+              "generic_secret": {
+                  "regex": r'(?i)(?:secret|password|passwd|token|auth_key)\s*[:=]\s*["\']([A-Za-z0-9!@#$%^&*_+\-]{20,})["\']',
+                  "severity": "HIGH", "min_entropy": 4.2, "category": "secret",
+              },
+              "generic_api_key": {
+                  "regex": r'(?i)api[_\-]?key\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']',
+                  "severity": "HIGH", "min_entropy": 4.0, "category": "secret",
+              },
+              "hardcoded_password": {
+                  "regex": r'(?i)(?:password|passwd|pwd)\s*[:=]\s*["\']([^"\']{8,})["\']',
+                  "severity": "CRITICAL", "min_entropy": 3.5, "category": "secret",
+              },
+              "heroku_key": {
+                  "regex": r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b',
+                  "severity": "MEDIUM", "min_entropy": 3.5,
+                  "context_kw": ["heroku"], "category": "secret",
+              },
+              # ── PII ────────────────────────────────────────────────────────────────
+              # NOTE on email_address: public-role emails are filtered in scan() via
+              # is_public_email(). Only non-role addresses that are not in a license
+              # header and are not boilerplate reach the findings list.
+              "email_address": {
+                  "regex": r'\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b',
+                  "severity": "MEDIUM", "min_entropy": 2.5, "category": "pii",
+                  "suppress_in_license": True,
+              },
+              "phone_number": {
+                  "regex": r'\b(\+?1?[\s\.]?[\(]?\d{3}[\)\-\.\s]\d{3}[\-\.\s]\d{4})\b',
+                  "severity": "MEDIUM", "min_entropy": 1.0,
+                  "context_kw": ["phone", "mobile", "cell", "tel", "contact", "sms", "whatsapp"],
+                  "category": "pii",
+              },
+              "social_security_number": {
+                  "regex": r'\b(\d{3}-\d{2}-\d{4})\b',
+                  "severity": "CRITICAL", "min_entropy": 0, "category": "pii",
+              },
+              "credit_card": {
+                  "regex": r'\b(4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b',
+                  "severity": "CRITICAL", "min_entropy": 0, "luhn": True, "category": "pii",
+              },
+              "uk_national_insurance": {
+                  "regex": r'\b([A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D])\b',
+                  "severity": "HIGH", "min_entropy": 0, "category": "pii",
+              },
+              "passport_number": {
+                  "regex": r'\b([A-Z]{1,2}[0-9]{6,9})\b',
+                  "severity": "HIGH", "min_entropy": 0,
+                  "context_kw": ["passport", "travel", "document", "id_number", "id number"],
+                  "category": "pii",
+              },
+              "date_of_birth": {
+                  "regex": r'\b(\d{4}-\d{2}-\d{2}|\d{2}[\/\-]\d{2}[\/\-]\d{4})\b',
+                  "severity": "MEDIUM", "min_entropy": 0,
+                  "context_kw": ["dob", "date_of_birth", "dateofbirth", "birthday", "birth_date"],
+                  "category": "pii",
+              },
+              # ── INFRA ──────────────────────────────────────────────────────────────
+              # NOTE on internal_hostname: severity is set to MEDIUM here as a floor.
+              # verify_hostname() probe in main() can raise it to HIGH (open) or lower
+              # it to LOW (not reachable). Do NOT call verify_hostname() inside scan()
+              # as it would be called per-file rather than once per unique hostname.
+              "internal_ip": {
+                  "regex": r'\b((?:10|127|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3})\b',
+                  "severity": "LOW", "min_entropy": 0, "category": "infra",
+              },
+              "s3_bucket": {
+                  "regex": r'\b((?:[a-z0-9\-]+)\.s3(?:[\.\-][a-z0-9\-]+)?\.amazonaws\.com)\b',
+                  "severity": "MEDIUM", "min_entropy": 0, "category": "infra",
+              },
+              "internal_hostname": {
+                  "regex": r'https?://((?:internal|staging|dev|admin|corp|intranet|uat|preprod)[a-z0-9\-\.]*\.[a-z]{2,})',
+                  "severity": "MEDIUM", "min_entropy": 0, "category": "infra",
+              },
+          }
+
+          INFRA_ESCALATE_KEYWORDS = ["preprod", "staging", "uat", "admin", "internal", "corp", "intranet"]
+
+          LICENSE_CONTEXT_KEYWORDS = [
+              "license", "licence", "copyright", "mit license", "apache license",
+              "bsd license", "isc license", "@license", "permission is hereby granted",
+              "permission to use", "redistributions", "all rights reserved",
+              "contributors", "author:", "authors:", "maintainer",
+          ]
+
+          PUBLIC_KEY_PREFIXES = [
+              "pk_live_", "pk_test_",
+              "client-",
+              "AIza",
+              "G-", "UA-",
+              "AAAA",
+          ]
+
+          BOILERPLATE_SUBSTRINGS = [
+              "your_", "yourkey", "example", "demo_", "test_", "placeholder",
+              "xxxx", "0000", "1234", "abcd", "insert", "changeme",
+              "noreply", "no-reply", "@example.", "@test.", "@localhost",
+              "user@", "email@", "admin@example", "support@example",
+              "someone@", "name@", "info@example",
+              ".ingest.sentry.io",
+              ".ingest.us.sentry.io",
+              "@bugsnag.com",
+              "@o0.ingest.",
+          ]
+
+          HEX_HASH_RE = re.compile(r'^[0-9a-f]{32}$', re.I)
+
+          def entropy(s: str) -> float:
+              if not s:
+                  return 0.0
+              freq = {c: s.count(c) / len(s) for c in set(s)}
+              return -sum(p * math.log2(p) for p in freq.values())
+
+          # ─────────────────────────────────────────────────────────────────────────
+          # FIX 4: EXPLOITABILITY-FOCUSED AI TRIAGE
+          # The old prompt asked "Is this a real credential?" — which caused the AI
+          # to correctly label a public support email as REAL (it exists!) while
+          # missing the actual question: "Is this a submittable vulnerability?"
+          #
+          # The new prompt explicitly frames the question as a bug bounty researcher
+          # would: "Would a program pay for this finding?"
+          # ─────────────────────────────────────────────────────────────────────────
+          GROQ_MODELS = [
+              "llama-3.3-70b-versatile",
+              "llama-3.1-70b-versatile",
+              "llama3-70b-8192",
+          ]
+
+          def ai_triage(findings: List[Dict], context_snippets: Dict[str, str]) -> List[Dict]:
+              """Ask Groq to validate findings through a bug-bounty exploitability lens."""
+              if not client or not findings:
+                  return findings
+
+              def call_groq(prompt: str) -> list:
+                  last_err = None
+                  for model in GROQ_MODELS:
+                      try:
+                          resp = client.chat.completions.create(
+                              model=model,
+                              messages=[{"role": "user", "content": prompt}],
+                              temperature=0,
+                              max_tokens=4096,
+                          )
+                          raw = resp.choices[0].message.content.strip()
+                          raw = re.sub(r"^```json|```$", "", raw, flags=re.M).strip()
+                          result = json.loads(raw)
+                          print(f"✅ AI triage used model: {model}", file=sys.stderr)
+                          return result
+                      except json.JSONDecodeError as e:
+                          print(f"⚠️ AI triage JSON parse error (model={model}): {e}", file=sys.stderr)
+                          break
+                      except Exception as e:
+                          last_err = e
+                          print(f"⚠️ AI triage error (model={model}): {e}", file=sys.stderr)
+                          continue
+                  if last_err:
+                      print(f"⚠️ All Groq models failed. Triage skipped.", file=sys.stderr)
+                  return []
+
+              def triage_batch(batch_findings: List[Dict]) -> None:
+                  batch = []
+                  for i, f in enumerate(batch_findings):
+                      snippet = context_snippets.get(f["match"], "")
+                      lib_note = " [IN LIBRARY FILE]" if f.get("library_file") else ""
+                      batch.append(
+                          f"[{i}] category={f.get('category','secret')} type={f['type']}"
+                          f"{lib_note} value={f['match']!r} context={snippet[:200]!r}"
+                      )
+
+                  # FIX 4: Rewritten prompt — "submittable?" not "real?"
+                  prompt = (
+                      "You are a senior bug bounty security researcher reviewing automated scanner findings.\n"
+                      "Your task is NOT to determine if a value 'exists' — it is to determine whether "
+                      "this finding represents an ACTUAL, SUBMITTABLE security vulnerability with real impact.\n\n"
+                      "CRITICAL RULES (apply these strictly):\n"
+                      "• PUBLIC-ROLE EMAILS (info@, support@, press@, contact@, admin@, sales@, etc.) "
+                      "are INTENTIONALLY public. Finding them in JS is NOT a vulnerability. verdict=FP.\n"
+                      "• OPEN-SOURCE AUTHOR EMAILS found near copyright/license text are attribution, "
+                      "NOT exposed PII. verdict=FP.\n"
+                      "• A CREDENTIAL is REAL only if it looks like a genuine, non-public secret "
+                      "(high entropy, production format, not a placeholder/example).\n"
+                      "• An INTERNAL HOSTNAME is only HIGH severity if it is actually reachable. "
+                      "If it's just present in source code but may be internal-only, verdict=REAL "
+                      "but note it needs verification.\n"
+                      "• Findings in [IN LIBRARY FILE] (third-party code) should almost always be FP "
+                      "unless the value is clearly a secret that should not appear in any codebase.\n"
+                      "• Ask yourself: 'Would a legitimate bug bounty program pay for this?' "
+                      "If no, verdict=FP. If yes, verdict=REAL.\n\n"
+                      "Reply ONLY with a JSON array: "
+                      "[{\"index\": 0, \"verdict\": \"REAL\", \"reason\": \"one sentence\"}, ...]\n\n"
+                      + "\n".join(batch)
+                  )
+
+                  verdicts = call_groq(prompt)
+                  for v in verdicts:
+                      idx = v.get("index")
+                      if idx is not None and idx < len(batch_findings):
+                          batch_findings[idx]["ai_verdict"] = v.get("verdict", "UNKNOWN")
+                          batch_findings[idx]["ai_reason"] = v.get("reason", "")
+                          if v.get("verdict") == "FP":
+                              batch_findings[idx]["severity"] = "INFO"
+
+              CHUNK = 20
+              for start in range(0, len(findings), CHUNK):
+                  triage_batch(findings[start:start + CHUNK])
+
+              return findings
+
+          # ── Fetcher ───────────────────────────────────────────────────────────────
+          _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+          # HTML body signatures that indicate a real WAF challenge page, as opposed
+          # to a normal auth redirect (login form) or 403 error page.
+          # Keep this tight — false positives here cause premature scan abort.
+          WAF_BODY_SIGNATURES = [
+              "cf-browser-verification",       # Cloudflare browser challenge
+              "cloudflare ray id",             # Cloudflare error footer
+              "checking your browser",         # Cloudflare "just a moment"
+              "ddos-guard",                    # DDoS-Guard
+              "request blocked",               # Generic WAF block page
+              "access denied by incapsula",    # Imperva Incapsula
+              "radware appwall",               # Radware
+              "mod_security",                  # ModSecurity
+              "this site is protected by",     # hCaptcha / reCAPTCHA challenge pages
+              "too many requests",             # Rate limit (treat same as WAF for sampling)
+          ]
+
+          def _classify_html_response(body: str, http_code: str) -> str:
+              """
+              Given an HTML response body and its HTTP status code, return a
+              specific failure reason string:
+                waf_challenge   — a real WAF/bot-challenge page (counts toward WAF threshold)
+                auth_redirect   — redirected to a login page (auth wall, not a WAF)
+                auth_required   — 401/403 directly (access controlled, not a WAF)
+                html_or_small   — any other HTML or tiny response (skip, not a WAF signal)
+              """
+              body_lower = body.lower()
+
+              # 1. Check for known WAF challenge signatures first
+              if any(sig in body_lower for sig in WAF_BODY_SIGNATURES):
+                  return "waf_challenge"
+
+              # 2. 401 / 403 directly — the server knows who we are and said no
+              if http_code in ("401", "403"):
+                  return "auth_required"
+
+              # 3. Login / auth redirect: common patterns in the HTML body or URL
+              #    (curl -L follows the redirect, so we see the final login page HTML)
+              auth_indicators = [
+                  "login", "sign in", "signin", "log in",
+                  "authentication required", "please authenticate",
+                  "username", "password", "sso", "oauth",
+              ]
+              if any(ind in body_lower for ind in auth_indicators):
+                  return "auth_redirect"
+
+              # 4. Fallback — HTML page we don't recognise, or just too small
+              return "html_or_small"
+
+          def _curl_fetch(url: str, timeout: int) -> Tuple[Optional[str], str]:
+              """
+              Fetch a URL with curl.  Returns (content, "") on success or
+              (None, reason) on failure where reason is one of:
+                curl_failed     — curl exited non-zero (network error, SSL, etc.)
+                waf_challenge   — WAF/bot-protection challenge page detected
+                auth_redirect   — redirected to a login page
+                auth_required   — 401/403 direct response
+                html_or_small   — HTML or < 200 bytes (not a JS file)
+                error:<msg>     — unexpected exception
+              """
+              try:
+                  result = subprocess.run(
+                      ["curl", "-sL",
+                       "-A", "Mozilla/5.0 (compatible; SecurityScanner/1.0)",
+                       "--max-time", str(timeout),
+                       "-w", "\n__STATUS__%{http_code}",   # append status at end of body
+                       url],
+                      capture_output=True, timeout=timeout + 5
+                  )
+                  if result.returncode != 0:
+                      return None, "curl_failed"
+
+                  raw = result.stdout.decode("utf-8", errors="ignore")
+
+                  # Parse appended status marker
+                  if "__STATUS__" in raw:
+                      body, http_code = raw.rsplit("__STATUS__", 1)
+                      http_code = http_code.strip()
+                  else:
+                      body, http_code = raw, "000"
+
+                  # Too small — not worth scanning regardless of content type
+                  if len(body) < 200:
+                      return None, "html_or_small"
+
+                  # HTML response — classify the failure before discarding
+                  if body.lstrip().startswith("<"):
+                      reason = _classify_html_response(body, http_code)
+                      return None, reason
+
+                  return body, ""
+
+              except Exception as e:
+                  return None, f"error:{e}"
+
+          async def download_js(url: str, sem: asyncio.Semaphore, timeout: int = 15):
+              async with sem:
+                  loop = asyncio.get_event_loop()
+                  return await loop.run_in_executor(_thread_pool, _curl_fetch, url, timeout)
+
+          # ── Analyzer ──────────────────────────────────────────────────────────────
+          class JSAnalyzer:
+              def __init__(self, domain: str):
+                  self.domain = domain.lower().replace("www.", "")
+                  self.seen_content: Set[str] = set()
+                  self.seen_values: Set[str] = set()
+                  self.stats = {
+                      "total": 0, "analyzed": 0, "findings": 0, "skipped": 0,
+                      "fp_suppressed": 0, "pii_findings": 0, "infra_findings": 0,
+                      "download_failed": 0, "library_file_demotions": 0,
+                      "public_email_suppressed": 0, "third_party_suppressed": 0,
+                  }
+
+              def is_same_domain(self, url: str) -> bool:
+                  try:
+                      host = urlparse(url).netloc.lower().replace("www.", "")
+                      base = self.domain.split(".")[0]
+                      return (host == self.domain
+                              or host.endswith("." + self.domain)
+                              or base in host)
+                  except Exception:
+                      return False
+
+              def is_duplicate_content(self, content: str) -> bool:
+                  h = hashlib.md5(content.encode()).hexdigest()
+                  if h in self.seen_content:
+                      return True
+                  self.seen_content.add(h)
+                  return False
+
+              def is_false_positive(self, val: str, category: str = "secret") -> bool:
+                  vl = val.lower()
+                  if category == "secret" and any(val.startswith(p) for p in PUBLIC_KEY_PREFIXES):
+                      return True
+                  if any(bp in vl for bp in BOILERPLATE_SUBSTRINGS):
+                      return True
+                  if category == "secret" and HEX_HASH_RE.match(val):
+                      return True
+                  min_len = 6 if category == "pii" else 12
+                  if len(val) < min_len:
+                      return True
+                  return False
+
+              def extract_context(self, content: str, match_start: int, window: int = 120) -> str:
+                  start = max(0, match_start - window)
+                  end = min(len(content), match_start + window)
+                  return content[start:end].replace("\n", " ")
+
+              def scan(self, content: str, url: str) -> Tuple[List[Dict], Dict[str, str]]:
+                  findings: List[Dict] = []
+                  context_map: Dict[str, str] = {}
+
+                  # FIX 1: Tag library files up front — affects severity assignment below
+                  lib_file = is_library_file(url)
+
+                  for name, info in PATTERNS.items():
+                      min_e = info.get("min_entropy", 3.0)
+                      ctx_kw = info.get("context_kw", [])
+                      needs_luhn = info.get("luhn", False)
+                      category = info.get("category", "secret")
+
+                      try:
+                          for m in re.finditer(info["regex"], content, re.MULTILINE):
+                              val = m.group(1) if m.lastindex else m.group(0)
+                              val = val.strip()
+
+                              # ── Hard filters ─────────────────────────────
+                              if self.is_false_positive(val, category):
+                                  self.stats["fp_suppressed"] += 1
+                                  continue
+
+                              # FIX 2: Public role-based email filter
+                              if name == "email_address" and is_public_email(val):
+                                  self.stats["public_email_suppressed"] += 1
+                                  continue
+
+                              # ── Luhn validation ──────────────────────────
+                              if needs_luhn and not luhn_check(val):
+                                  self.stats["fp_suppressed"] += 1
+                                  continue
+
+                              # ── Entropy check ────────────────────────────
+                              e = entropy(val)
+                              if e < min_e:
+                                  self.stats["fp_suppressed"] += 1
+                                  continue
+
+                              # ── Context keyword check ────────────────────
+                              if ctx_kw:
+                                  ctx = self.extract_context(content, m.start())
+                                  if not any(kw in ctx.lower() for kw in ctx_kw):
+                                      self.stats["fp_suppressed"] += 1
+                                      continue
+
+                              # ── License header suppression (emails) ──────
+                              if info.get("suppress_in_license"):
+                                  ctx_wide = self.extract_context(content, m.start(), window=300)
+                                  if any(kw in ctx_wide.lower() for kw in LICENSE_CONTEXT_KEYWORDS):
+                                      self.stats["fp_suppressed"] += 1
+                                      continue
+
+                              # ── Deduplicate same value across files ───────
+                              val_hash = hashlib.sha256(val.encode()).hexdigest()
+                              duplicate = val_hash in self.seen_values
+                              self.seen_values.add(val_hash)
+
+                              ctx_snippet = self.extract_context(content, m.start())
+                              context_map[val[:60]] = ctx_snippet
+
+                              # FIX 1: Library files → findings kept but demoted to INFO
+                              # (they still appear in the report under a separate section
+                              #  so you can audit them, but they don't inflate severity counts)
+                              assigned_severity = info["severity"]
+                              if lib_file and category != "secret":
+                                  # Secrets in library files are still flagged (could be
+                                  # a bundled .env or hard-coded key) but PII and infra
+                                  # in third-party code are almost never reportable.
+                                  assigned_severity = "INFO"
+                                  self.stats["library_file_demotions"] += 1
+
+                              finding = {
+                                  "type": name,
+                                  "category": category,
+                                  "severity": assigned_severity,
+                                  "url": url,
+                                  "match": val[:60],
+                                  "entropy": round(e, 2),
+                                  "duplicate": duplicate,
+                                  "context": ctx_snippet[:150],
+                                  "library_file": lib_file,
+                              }
+
+                              # ── Infra escalation (pre-probe) ─────────────
+                              # Actual severity is set later in main() after
+                              # verify_hostname() runs. Here we just tag the keyword.
+                              if category == "infra" and name == "internal_hostname":
+                                  vl = val.lower()
+                                  # FIX 7: Drop findings whose hostname belongs to a
+                                  # known third-party vendor SDK/service — these are
+                                  # not the target's infrastructure.
+                                  if is_third_party_hostname(val):
+                                      self.stats["third_party_suppressed"] += 1
+                                      findings.pop()   # remove the just-appended finding
+                                      continue
+                                  if any(kw in vl for kw in INFRA_ESCALATE_KEYWORDS):
+                                      finding["needs_probe"] = True
+                                      finding["probe_hostname"] = val
+
+                              # FIX 6: Tag s3_bucket findings for active probing.
+                              # Do NOT assign final severity here — probe runs in main()
+                              # once per unique bucket so we don't hammer S3.
+                              if category == "infra" and name == "s3_bucket":
+                                  finding["needs_s3_probe"] = True
+                                  finding["probe_hostname"] = val
+
+                              findings.append(finding)
+
+                              if category == "pii":
+                                  self.stats["pii_findings"] += 1
+                              elif category == "infra":
+                                  self.stats["infra_findings"] += 1
+
+                      except Exception:
+                          continue
+
+                  return findings, context_map
+
+              async def analyze(self, url: str, content: str) -> Tuple[List[Dict], Dict[str, str]]:
+                  self.stats["total"] += 1
+                  if self.is_duplicate_content(content):
+                      self.stats["skipped"] += 1
+                      return [], {}
+                  self.stats["analyzed"] += 1
+                  findings, ctx = self.scan(content, url)
+                  self.stats["findings"] += len(findings)
+                  return findings, ctx
+
+          # ── Main ──────────────────────────────────────────────────────────────────
+          async def main():
+              if len(sys.argv) < 3:
+                  print("Usage: scanner.py <js_list> <domain> [scope_file]", file=sys.stderr)
+                  sys.exit(1)
+
+              js_list, domain = sys.argv[1], sys.argv[2]
+              scope_file = sys.argv[3] if len(sys.argv) > 3 else None
+
+              in_scope_patterns: List[str] = []
+              if scope_file and os.path.exists(scope_file):
+                  with open(scope_file) as sf:
+                      in_scope_patterns = [l.strip() for l in sf if l.strip() and not l.startswith("#")]
+                  print(f"🎯 Scope: {len(in_scope_patterns)} rules loaded", file=sys.stderr)
+              else:
+                  print("⚠️  No scope file — all findings will be marked in-scope", file=sys.stderr)
+
+              def check_scope(url: str) -> bool:
+                  if not in_scope_patterns:
+                      return True
+                  host = urlparse(url).netloc.lower()
+                  return any(
+                      host == p or host.endswith("." + p) or
+                      (p.startswith("*") and host.endswith(p[1:]))
+                      for p in in_scope_patterns
+                  )
+
+              with open(js_list) as f:
+                  raw_urls = [l.strip() for l in f if l.strip()]
+
+              MAX_FILES = 150
+              print(f"📏 Sizing {len(raw_urls)} URLs...", file=sys.stderr)
+              with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+                  sizes = list(pool.map(_head_size, raw_urls))
+              sized = sorted(zip(raw_urls, sizes), key=lambda x: x[1], reverse=True)
+              urls = [u for u, _ in sized[:MAX_FILES]]
+              print(f"🧠 Scanner: top {len(urls)} files by size for {domain}", file=sys.stderr)
+
+              analyzer = JSAnalyzer(domain)
+              sem = asyncio.Semaphore(8)
+              all_context: Dict[str, str] = {}
+
+              WAF_SAMPLE = 10
+              WAF_THRESH = 0.6
+              # Track failure reasons separately so auth walls don't trigger WAF abort
+              sample_results: List[bool] = []    # True = JS retrieved successfully
+              sample_waf_hits: List[bool] = []   # True = genuine WAF challenge page
+
+              async def process(i: int, url: str):
+                  print(f"[{i:03d}] {os.path.basename(url)[:50]}", file=sys.stderr)
+                  content, err = await download_js(url, sem)
+                  if not content:
+                      # Print a short but informative label for each failure type
+                      label = {
+                          "waf_challenge":  "🛡️  waf_challenge",
+                          "auth_redirect":  "🔐 auth_redirect (login wall — skipping)",
+                          "auth_required":  "🔐 auth_required (401/403 — skipping)",
+                          "html_or_small":  "⚠️  html_or_small",
+                          "curl_failed":    "⚠️  curl_failed",
+                      }.get(err, f"⚠️  {err}")
+                      print(f"[{i:03d}]    {label}", file=sys.stderr)
+                      analyzer.stats["download_failed"] += 1
+                      if i <= WAF_SAMPLE:
+                          sample_results.append(False)
+                          # Only a genuine WAF challenge counts toward the abort threshold.
+                          # Auth redirects / 403s / login walls are normal for authenticated
+                          # apps (e.g. box.com) and should NOT abort the scan.
+                          sample_waf_hits.append(err == "waf_challenge")
+                      return [], {}
+                  if i <= WAF_SAMPLE:
+                      sample_results.append(True)
+                      sample_waf_hits.append(False)
+                  findings, ctx = await analyzer.analyze(url, content)
+                  label = f"🔥 {len(findings)} finding(s)" if findings else "✓ clean"
+                  print(f"[{i:03d}]    {label}", file=sys.stderr)
+                  return findings, ctx
+
+              first_batch = [process(i, u) for i, u in enumerate(urls[:WAF_SAMPLE], 1)]
+              first_results = await asyncio.gather(*first_batch, return_exceptions=True)
+
+              # WAF abort only triggers on confirmed challenge-page hits, not auth walls
+              waf_rate = sum(sample_waf_hits) / max(len(sample_waf_hits), 1)
+              auth_skipped = sum(
+                  1 for _ in sample_results
+              ) - sum(sample_results)   # total failures in sample
+
+              if waf_rate >= WAF_THRESH:
+                  print(
+                      f"\n🚫 WAF DETECTED: {waf_rate*100:.0f}% of sample returned WAF challenge pages "
+                      f"(threshold {WAF_THRESH*100:.0f}%). Aborting scan for {domain}.\n"
+                      f"   Tip: auth_redirect/auth_required failures do NOT count toward this threshold.",
+                      file=sys.stderr
+                  )
+                  output = {
+                      "findings": [], "waf_blocked": True,
+                      "stats": {**analyzer.stats, "ai_triaged": 0, "ai_fp_demoted": 0,
+                                "by_category": {"secret": 0, "pii": 0, "infra": 0}}
+                  }
+                  with open("scan_results.json", "w") as out:
+                      json.dump(output, out, indent=2)
+                  return
+
+              if auth_skipped > 0:
+                  auth_count = sum(1 for h in sample_waf_hits if not h) - sum(sample_results)
+                  if auth_count > 0:
+                      print(
+                          f"ℹ️  {auth_count} file(s) in sample skipped due to auth walls "
+                          f"(login redirects / 401/403). Continuing with accessible files.",
+                          file=sys.stderr
+                      )
+
+              rest_results = await asyncio.gather(
+                  *[process(i, u) for i, u in enumerate(urls[WAF_SAMPLE:], WAF_SAMPLE + 1)],
+                  return_exceptions=True
+              )
+
+              all_findings: List[Dict] = []
+              for r in list(first_results) + list(rest_results):
+                  if isinstance(r, tuple):
+                      findings, ctx = r
+                      all_findings.extend(findings)
+                      all_context.update(ctx)
+
+              # ── Scope tagging ─────────────────────────────────────────────────────
+              for f in all_findings:
+                  f["in_scope"] = check_scope(f["url"])
+
+              # ── FIX 3: Active hostname verification ───────────────────────────────
+              # Collect unique hostnames that need probing, probe each once (not per
+              # finding — a hostname appears many times if it's in multiple JS files).
+              probed_hostnames: Dict[str, Dict] = {}
+              hostnames_to_probe = set(
+                  f["probe_hostname"]
+                  for f in all_findings
+                  if f.get("needs_probe") and not f.get("duplicate")
+              )
+
+              if hostnames_to_probe:
+                  print(f"\n🌐 Probing {len(hostnames_to_probe)} hostname(s)...", file=sys.stderr)
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                      for hostname, probe_result in zip(
+                          hostnames_to_probe,
+                          pool.map(verify_hostname, hostnames_to_probe)
+                      ):
+                          probed_hostnames[hostname] = probe_result
+                          print(
+                              f"   {hostname} → {probe_result['note']} "
+                              f"(HTTP {probe_result['http_code']}) → {probe_result['severity']}",
+                              file=sys.stderr
+                          )
+
+              # Apply probe results back to findings
+              for f in all_findings:
+                  if f.get("needs_probe"):
+                      hostname = f.get("probe_hostname", "")
+                      probe = probed_hostnames.get(hostname)
+                      if probe:
+                          old_sev = f["severity"]
+                          f["severity"] = probe["severity"]
+                          f["probe_result"] = probe
+                          if old_sev != probe["severity"]:
+                              f["severity_reason"] = (
+                                  f"adjusted by active probe: {probe['note']} "
+                                  f"(HTTP {probe['http_code']})"
+                              )
+
+              # ── FIX 6: S3 bucket active probing ──────────────────────────────────
+              # Collect unique bucket hostnames, probe each once, apply results.
+              probed_s3: Dict[str, Dict] = {}
+              buckets_to_probe = set(
+                  f["probe_hostname"]
+                  for f in all_findings
+                  if f.get("needs_s3_probe") and not f.get("duplicate")
+              )
+
+              if buckets_to_probe:
+                  print(f"\n🪣 Probing {len(buckets_to_probe)} S3 bucket(s)...", file=sys.stderr)
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                      for bucket, probe_result in zip(
+                          buckets_to_probe,
+                          pool.map(probe_s3_bucket, buckets_to_probe)
+                      ):
+                          probed_s3[bucket] = probe_result
+                          icon = "🔴" if probe_result["listable"] else (
+                              "🟡" if probe_result["severity"] not in ("INFO", "LOW") else "⚪"
+                          )
+                          print(
+                              f"   {icon} {bucket} → {probe_result['note']} "
+                              f"(HTTP {probe_result['http_code']}) → {probe_result['severity']}",
+                              file=sys.stderr
+                          )
+
+              # Apply S3 probe results
+              for f in all_findings:
+                  if f.get("needs_s3_probe"):
+                      bucket = f.get("probe_hostname", "")
+                      probe = probed_s3.get(bucket)
+                      if probe:
+                          old_sev = f["severity"]
+                          f["severity"] = probe["severity"]
+                          f["s3_probe"] = probe
+                          if old_sev != probe["severity"]:
+                              f["severity_reason"] = (
+                                  f"s3_probe: {probe['note']} (HTTP {probe['http_code']})"
+                              )
+                          if probe["listable"]:
+                              f["s3_listable"] = True
+
+              # ── Passive credential validation ─────────────────────────────────────
+              VALIDATABLE = {"aws_access_key", "stripe_secret", "github_token", "slack_token"}
+              for f in all_findings:
+                  if f.get("type") in VALIDATABLE and not f.get("duplicate"):
+                      print(f"🔍 Validating {f['type']}...", file=sys.stderr)
+                      v = validate_credential(f["type"], f["match"])
+                      f["validated"] = v["live"]
+                      f["validation_note"] = v["note"]
+                      if v["live"] and f["severity"] != "CRITICAL":
+                          f["severity"] = "CRITICAL"
+                          f["severity_reason"] = "escalated: credential confirmed live"
+                      time.sleep(0.5)
+
+              # ── AI triage ─────────────────────────────────────────────────────────
+              primary = [f for f in all_findings if not f.get("duplicate")]
+              primary = ai_triage(primary, all_context)
+
+              verdict_map = {f["match"]: f.get("ai_verdict") for f in primary}
+              reason_map  = {f["match"]: f.get("ai_reason")  for f in primary}
+              for f in all_findings:
+                  if f.get("duplicate") and f["match"] in verdict_map:
+                      f["ai_verdict"] = verdict_map[f["match"]]
+                      f["ai_reason"]  = reason_map[f["match"]]
+
+              # ── Sort ──────────────────────────────────────────────────────────────
+              severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+              all_findings.sort(key=lambda x: (
+                  0 if x.get("validated") else 1,
+                  severity_order.get(x.get("severity"), 5)
+              ))
+
+              output = {
+                  "findings": all_findings,
+                  "waf_blocked": False,
+                  "stats": {
+                      **analyzer.stats,
+                      "ai_triaged": sum(1 for f in all_findings if "ai_verdict" in f),
+                      "ai_fp_demoted": sum(1 for f in all_findings if f.get("ai_verdict") == "FP"),
+                      "validated_live": sum(1 for f in all_findings if f.get("validated")),
+                      "out_of_scope": sum(1 for f in all_findings if not f.get("in_scope")),
+                      "library_demotions": analyzer.stats["library_file_demotions"],
+                      "public_email_suppressed": analyzer.stats["public_email_suppressed"],
+                      "third_party_suppressed": analyzer.stats["third_party_suppressed"],
+                      "hostnames_probed": len(probed_hostnames),
+                      "s3_buckets_probed": len(probed_s3),
+                      "s3_listable": sum(1 for f in all_findings if f.get("s3_listable")),
+                      "by_category": {
+                          "secret": sum(1 for f in all_findings
+                                        if f.get("category") == "secret"
+                                        and f.get("ai_verdict") != "FP"
+                                        and f.get("severity") != "INFO"),
+                          "pii":    sum(1 for f in all_findings
+                                        if f.get("category") == "pii"
+                                        and f.get("ai_verdict") != "FP"
+                                        and f.get("severity") != "INFO"),
+                          "infra":  sum(1 for f in all_findings
+                                        if f.get("category") == "infra"
+                                        and f.get("ai_verdict") != "FP"
+                                        and f.get("severity") != "INFO"),
+                      }
+                  }
+              }
+
+              with open("scan_results.json", "w") as out:
+                  json.dump(output, out, indent=2)
+
+              s = output["stats"]
+              print(
+                  f"\n📊 analyzed={s['analyzed']} | failed={s['download_failed']} "
+                  f"| skipped_dup={s['skipped']} | findings={s['findings']} "
+                  f"| secrets={s['by_category']['secret']} pii={s['by_category']['pii']} infra={s['by_category']['infra']} "
+                  f"| validated_live={s.get('validated_live',0)} | probed={s.get('hostnames_probed',0)} "
+                  f"| s3_probed={s.get('s3_buckets_probed',0)} s3_listable={s.get('s3_listable',0)} "
+                  f"| fp_suppressed={s['fp_suppressed']} | public_emails_skipped={s['public_email_suppressed']} "
+                  f"| third_party_skipped={s['third_party_suppressed']} "
+                  f"| library_demotions={s['library_demotions']} | ai_fp_demoted={s.get('ai_fp_demoted', 0)}",
+                  file=sys.stderr
+              )
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          PYTHON_SCRIPT
+
+          chmod +x production_js_scanner.py
+
+      - name: Run Production Scan
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          set -uo pipefail
+
+          mkdir -p reports tmp stats
+
+          domains_scanned=0
+          js_analyzed=0
+          total_findings=0
+          critical_findings=0
+          high_findings=0
+          total_fp_suppressed=0
+
+          if [[ ! -f targets.txt ]] || [[ ! -s targets.txt ]]; then
+            echo "example.com" > targets.txt
+          fi
+
+          grep -v '^#' targets.txt 2>/dev/null | grep -v '^$' | shuf -n 6 > tmp/selected.txt || echo "example.com" > tmp/selected.txt
+
+          echo "════════════════════════════════════════"
+          echo "🧠 PRODUCTION JS SCANNER v3.1"
+          echo "   Fixes: Library filter | Public email filter"
+          echo "          Active hostname probe | Exploitability AI"
+          echo "          S3 active probe | Third-party vendor filter"
+          echo "════════════════════════════════════════"
+          cat tmp/selected.txt | nl
+          total_domains=$(wc -l < tmp/selected.txt)
+          echo "════════════════════════════════════════"
+
+          while read -r domain; do
+            [[ -z "$domain" || "$domain" =~ ^[[:space:]]*# ]] && continue
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            [[ -z "$domain" ]] && continue
+
+            domains_scanned=$((domains_scanned + 1))
+            echo ""
+            echo "════════════════════════════════════════"
+            echo "🔍 [$domains_scanned/$total_domains] $domain"
+            echo "════════════════════════════════════════"
+
+            (
+              exec < /dev/null
+              set +e
+              report="reports/${domain}_report.md"
+
+              echo "📡 Discovering JS files..."
+              timeout 90s katana -u "https://$domain" -jc -d 3 -c 20 -silent \
+                > tmp/urls_${domain}.txt 2>/dev/null || touch tmp/urls_${domain}.txt
+
+              if [[ ! -s tmp/urls_${domain}.txt ]]; then
+                echo "⚠️ No URLs discovered"
+                echo "# $domain — No JS Found" > "$report"
+                exit 0
+              fi
+
+              grep -iE '\.js(\?|#|$)' tmp/urls_${domain}.txt 2>/dev/null \
+                | grep -iv '\.json' \
+                | grep -ivE '(google-analytics|gtag|gtm\.js|ads\.js|facebook\.net|twitter\.com)' \
+                | sort -u 2>/dev/null \
+                | head -150 > tmp/js_${domain}.txt || touch tmp/js_${domain}.txt
+
+              js_count=$(wc -l < tmp/js_${domain}.txt)
+
+              if [[ $js_count -eq 0 ]]; then
+                echo "⚠️ No JS after filtering"
+                echo "# $domain — No JS After Filtering" > "$report"
+                exit 0
+              fi
+
+              echo "🧠 Analyzing $js_count JS files..."
+              scope_arg=""
+              [[ -f scope.txt ]] && scope_arg="scope.txt"
+              python3 production_js_scanner.py tmp/js_${domain}.txt "$domain" $scope_arg 2>&1 || {
+                echo "⚠️ Scanner exited with error"
+                exit 0
+              }
+
+              [[ ! -f scan_results.json ]] && { echo "⚠️ No results file"; exit 0; }
+              mv scan_results.json tmp/scan_${domain}.json
+
+              waf_blocked=$(jq '.waf_blocked // false' tmp/scan_${domain}.json 2>/dev/null || echo false)
+              finding_count=$(jq '.findings | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+
+              # "Real" = in-scope, not AI-demoted to FP, not INFO severity (library noise)
+              real_count=$(jq '[.findings[] | select(.ai_verdict != "FP") | select(.in_scope != false) | select(.severity != "INFO")] | length' tmp/scan_${domain}.json 2>/dev/null || echo "$finding_count")
+              info_count=$(jq '[.findings[] | select(.severity == "INFO")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              out_of_scope=$(jq '.stats.out_of_scope // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              validated_live=$(jq '.stats.validated_live // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              probed=$(jq '.stats.hostnames_probed // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              critical=$(jq '[.findings[] | select(.severity=="CRITICAL") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              high=$(jq '[.findings[] | select(.severity=="HIGH") | select(.ai_verdict != "FP")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              secrets_count=$(jq '.stats.by_category.secret // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              pii_count=$(jq '.stats.by_category.pii // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              infra_count=$(jq '.stats.by_category.infra // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              download_failed=$(jq '.stats.download_failed // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              analyzed=$(jq '.stats.analyzed' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              fp_suppressed=$(jq '.stats.fp_suppressed' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              ai_demoted=$(jq '.stats.ai_fp_demoted' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              public_emails_skipped=$(jq '.stats.public_email_suppressed // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              library_demotions=$(jq '.stats.library_demotions // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              third_party_skipped=$(jq '.stats.third_party_suppressed // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              s3_probed=$(jq '.stats.s3_buckets_probed // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+              s3_listable=$(jq '.stats.s3_listable // 0' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+
+              if [[ "$waf_blocked" == "true" ]]; then
+                cat > "$report" << EOF
+          # 🧠 $domain — Security Scan
+
+          **Date:** $(date '+%Y-%m-%d %H:%M UTC')
+          **Run:** #${{ github.run_number }}
+
+          ## 🚫 WAF / CDN Blocked
+          Over 60% of JS file downloads failed — this domain is protected by a WAF or
+          CDN challenge that blocks automated requests. Manual analysis required.
+
+          | Metric | Value |
+          |--------|------:|
+          | JS Files Discovered | $js_count |
+          | Download Failures | $download_failed |
+          EOF
+                echo "🚫 WAF blocked — skipping"
+                echo "0" > tmp/${domain}_findings.txt
+                echo "0" > tmp/${domain}_critical.txt
+                echo "0" > tmp/${domain}_high.txt
+                echo "0" > tmp/${domain}_analyzed.txt
+                echo "0" > tmp/${domain}_fp.txt
+                exit 0
+              fi
+
+              cat > "$report" << EOF
+          # 🧠 $domain — Security Scan
+
+          **Date:** $(date '+%Y-%m-%d %H:%M UTC')
+          **Run:** #${{ github.run_number }}
+
+          ## Stats
+          | Metric | Value |
+          |--------|------:|
+          | JS Files Discovered | $js_count |
+          | JS Files Analyzed | $analyzed |
+          | Download Failures | $download_failed |
+          | Raw Pattern Matches | $finding_count |
+          | Entropy / Prefix FPs Suppressed | $fp_suppressed |
+          | Public Role Emails Skipped | $public_emails_skipped |
+          | Third-Party Vendor Hostnames Skipped | $third_party_skipped |
+          | Library File Demotions → INFO | $library_demotions |
+          | AI-Demoted FPs | $ai_demoted |
+          | Hostnames Actively Probed | $probed |
+          | S3 Buckets Probed | $s3_probed |
+          | 🔴 Publicly Listable S3 Buckets | **$s3_listable** |
+          | Out-of-Scope (excluded) | $out_of_scope |
+          | Informational (noise, not submittable) | $info_count |
+          | **Actionable Findings** | **$real_count** |
+          | — Secrets / Credentials | $secrets_count |
+          | — PII Exposed | $pii_count |
+          | — Infrastructure Exposure | $infra_count |
+          | 🔴 Validated Live Credentials | **$validated_live** |
+          | Critical | **$critical** |
+          | High | **$high** |
+
+          EOF
+
+              if [[ $real_count -gt 0 ]]; then
+                # ── Secrets ───────────────────────────────────────────────
+                secret_real=$(jq '[.findings[] | select(.category=="secret") | select(.ai_verdict != "FP") | select(.severity != "INFO")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+                if [[ $secret_real -gt 0 ]]; then
+                  echo "## 🔑 Secrets / Credentials" >> "$report"
+                  jq -r '
+                    .findings[]
+                    | select(.category=="secret") | select(.ai_verdict != "FP")
+                    | select(.duplicate != true) | select(.in_scope != false)
+                    | select(.severity != "INFO")
+                    | "### \(.type)\n" +
+                      "**Severity:** \(.severity)\(.severity_reason // "" | if . != "" then " _("+.+"_)" else "" end)  \n" +
+                      (if .validated then "**🔴 LIVE VALIDATED**  \n" else "" end) +
+                      (if .validation_note then "**Validation:** \(.validation_note)  \n" else "" end) +
+                      "**File:** `\(.url)`  \n" +
+                      (if .library_file then "**⚠️ Found in third-party library file**  \n" else "" end) +
+                      "**Match:** `\(.match)`  \n" +
+                      "**Entropy:** \(.entropy)  \n" +
+                      (if .ai_verdict then "**AI Verdict:** \(.ai_verdict) — \(.ai_reason // "")\n" else "" end)
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null
+                fi
+
+                # ── PII ───────────────────────────────────────────────────
+                pii_real=$(jq '[.findings[] | select(.category=="pii") | select(.ai_verdict != "FP") | select(.severity != "INFO")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+                if [[ $pii_real -gt 0 ]]; then
+                  echo "## 🧑 PII Exposure" >> "$report"
+                  echo "> ⚠️ **Disclosure note:** PII findings may trigger mandatory reporting under GDPR/CCPA/PCI-DSS." >> "$report"
+                  echo "" >> "$report"
+                  jq -r '
+                    .findings[]
+                    | select(.category=="pii") | select(.ai_verdict != "FP")
+                    | select(.duplicate != true) | select(.in_scope != false)
+                    | select(.severity != "INFO")
+                    | "### \(.type)\n" +
+                      "**Severity:** \(.severity)  \n" +
+                      "**File:** `\(.url)`  \n" +
+                      "**Match:** `\(.match)`  \n" +
+                      (if .ai_verdict then "**AI Verdict:** \(.ai_verdict) — \(.ai_reason // "")\n" else "" end)
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null
+                fi
+
+                # ── Infra ─────────────────────────────────────────────────
+                infra_real=$(jq '[.findings[] | select(.category=="infra") | select(.ai_verdict != "FP") | select(.severity != "INFO") | select(.severity != "LOW")] | length' tmp/scan_${domain}.json 2>/dev/null || echo 0)
+                if [[ $infra_real -gt 0 ]]; then
+                  echo "## 🌐 Infrastructure Exposure" >> "$report"
+                  jq -r '
+                    .findings[]
+                    | select(.category=="infra") | select(.ai_verdict != "FP")
+                    | select(.duplicate != true) | select(.in_scope != false)
+                    | select(.severity != "INFO") | select(.severity != "LOW")
+                    | "### \(.type)\n" +
+                      "**Severity:** \(.severity)\(.severity_reason // "" | if . != "" then " _("+.+"_)" else "" end)  \n" +
+                      (if .s3_listable then "**🔴 S3 BUCKET IS PUBLICLY LISTABLE — files are readable**  \n" else "" end) +
+                      (if .s3_probe then
+                        "**S3 Probe:** HTTP \(.s3_probe.http_code) — \(.s3_probe.note)  \n"
+                      elif .probe_result then
+                        "**Active Probe:** HTTP \(.probe_result.http_code) — \(.probe_result.note)  \n"
+                      else "" end) +
+                      "**File:** `\(.url)`  \n" +
+                      "**Match:** `\(.match)`  \n" +
+                      (if .ai_verdict then "**AI Verdict:** \(.ai_verdict) — \(.ai_reason // "")\n" else "" end)
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null
+                fi
+
+                echo "" >> "$report"
+                echo "## ℹ️ AI-Demoted (Likely False Positives)" >> "$report"
+                jq -r '
+                  [.findings[] | select(.ai_verdict == "FP")]
+                  | unique_by(.match)[]
+                  | "- [\(.category)] `\(.match)` — \(.ai_reason // "auto-suppressed")"
+                ' tmp/scan_${domain}.json >> "$report" 2>/dev/null || true
+
+                echo "" >> "$report"
+                echo "## 📚 Informational (Library Files / Low Confidence)" >> "$report"
+                echo "_These findings were demoted from their base severity because they were found" >> "$report"
+                echo "in third-party library files or failed contextual checks. Review manually if needed._" >> "$report"
+                echo "" >> "$report"
+                jq -r '
+                  [.findings[] | select(.severity == "INFO") | select(.ai_verdict != "FP")]
+                  | unique_by(.match)[]
+                  | "- [\(.category)] \(.type) — `\(.match)` in `\(.url)`"
+                ' tmp/scan_${domain}.json >> "$report" 2>/dev/null || true
+
+                if [[ $out_of_scope -gt 0 ]]; then
+                  echo "" >> "$report"
+                  echo "## 🔲 Out-of-Scope Findings" >> "$report"
+                  jq -r '
+                    [.findings[] | select(.in_scope == false) | select(.ai_verdict != "FP")]
+                    | unique_by(.match)[]
+                    | "- [\(.category)] \(.type) — `\(.match)` in `\(.url)`"
+                  ' tmp/scan_${domain}.json >> "$report" 2>/dev/null || true
+                fi
+              else
+                echo "## ✅ No Actionable Findings" >> "$report"
+                echo "" >> "$report"
+                if [[ $info_count -gt 0 ]]; then
+                  echo "_$info_count informational items were found in library files and suppressed._" >> "$report"
+                fi
+              fi
+
+              echo "✅ Done: $real_count actionable ($secrets_count secrets, $pii_count PII, $infra_count infra | $validated_live live | $probed probed | $s3_probed S3 probed ($s3_listable listable) | $public_emails_skipped pub-emails | $third_party_skipped 3rd-party | $library_demotions lib-demoted)"
+
+              echo "$real_count"   > tmp/${domain}_findings.txt
+              echo "$critical"     > tmp/${domain}_critical.txt
+              echo "$high"         > tmp/${domain}_high.txt
+              echo "$analyzed"     > tmp/${domain}_analyzed.txt
+              echo "$fp_suppressed" > tmp/${domain}_fp.txt
+
+            ) || echo "⚠️ Domain processing failed (continuing)"
+
+            if [[ -f tmp/${domain}_findings.txt ]]; then
+              total_findings=$((total_findings + $(cat tmp/${domain}_findings.txt)))
+              critical_findings=$((critical_findings + $(cat tmp/${domain}_critical.txt)))
+              high_findings=$((high_findings + $(cat tmp/${domain}_high.txt)))
+              js_analyzed=$((js_analyzed + $(cat tmp/${domain}_analyzed.txt)))
+              total_fp_suppressed=$((total_fp_suppressed + $(cat tmp/${domain}_fp.txt 2>/dev/null || echo 0)))
+            fi
+
+            sleep 1
+          done < tmp/selected.txt
+
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "📊 SCAN COMPLETE"
+          echo "════════════════════════════════════════"
+          echo "Domains:             $domains_scanned"
+          echo "JS Files:            $js_analyzed"
+          echo "FPs Suppressed:      $total_fp_suppressed"
+          echo "Actionable Findings: $total_findings"
+          echo "  Critical:          $critical_findings"
+          echo "  High:              $high_findings"
+          echo "════════════════════════════════════════"
+
+          cat > stats/scan_${{ github.run_number }}.json << EOF
+          {
+            "run": ${{ github.run_number }},
+            "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "domains": $domains_scanned,
+            "js_files": $js_analyzed,
+            "fp_suppressed": $total_fp_suppressed,
+            "findings": {
+              "total": $total_findings,
+              "critical": $critical_findings,
+              "high": $high_findings
+            }
+          }
+          EOF
+
+          echo "DOMAINS_SCANNED=$domains_scanned"         >> $GITHUB_ENV
+          echo "JS_ANALYZED=$js_analyzed"                 >> $GITHUB_ENV
+          echo "TOTAL_FINDINGS=$total_findings"           >> $GITHUB_ENV
+          echo "CRITICAL_FINDINGS=$critical_findings"     >> $GITHUB_ENV
+          echo "HIGH_FINDINGS=$high_findings"             >> $GITHUB_ENV
+          echo "FP_SUPPRESSED=$total_fp_suppressed"       >> $GITHUB_ENV
+
+          [[ $total_findings -gt 0 ]]    && echo "HAS_FINDINGS=true" >> $GITHUB_ENV || echo "HAS_FINDINGS=false" >> $GITHUB_ENV
+          [[ $critical_findings -gt 0 ]] && echo "HAS_CRITICAL=true" >> $GITHUB_ENV || echo "HAS_CRITICAL=false" >> $GITHUB_ENV
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          mkdir -p reports
+          cat > reports/SUMMARY.md << EOF
+          # 🧠 JS Security Scanner — Summary
+
+          **Date:** $(date '+%Y-%m-%d %H:%M UTC')
+          **Run:** #${{ github.run_number }}
+
+          ## Metrics
+          | Metric | Value |
+          |--------|------:|
+          | Domains | ${DOMAINS_SCANNED:-0} |
+          | JS Files | ${JS_ANALYZED:-0} |
+          | FPs Suppressed | ${FP_SUPPRESSED:-0} |
+          | **Actionable Findings** | **${TOTAL_FINDINGS:-0}** |
+          | Critical | ${CRITICAL_FINDINGS:-0} |
+          | High | ${HIGH_FINDINGS:-0} |
+
+          ## Domain Reports
+          $(ls reports/*_report.md 2>/dev/null | wc -l) domain reports generated.
+          EOF
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ github.run_number }}
+          path: |
+            reports/
+            stats/
+          retention-days: 30
+
+      - name: Email Report
+        if: always() && env.DOMAINS_SCANNED != '0'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: >
+            ${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL' ||
+                env.HAS_FINDINGS == 'true' && '⚠️ FINDINGS' || '✅ CLEAN' }}
+            | ${{ env.DOMAINS_SCANNED }} Domains
+            | ${{ env.TOTAL_FINDINGS }} Actionable (${{ env.FP_SUPPRESSED }} FPs suppressed)
+            | Scan #${{ github.run_number }}
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: JS Scanner <scan@security.local>
+          body: |
+            🧠 JS SECURITY SCANNER v3.0
+
+            📊 RESULTS
+            • Domains:             ${{ env.DOMAINS_SCANNED }}
+            • JS Files:            ${{ env.JS_ANALYZED }}
+            • FPs Suppressed:      ${{ env.FP_SUPPRESSED }}
+            • Actionable Findings: ${{ env.TOTAL_FINDINGS }}
+              • Critical:          ${{ env.CRITICAL_FINDINGS }}
+              • High:              ${{ env.HIGH_FINDINGS }}
+
+            ℹ️  Add a scope.txt to tag out-of-scope findings.
+            ⚠️  PII findings may require mandatory disclosure under GDPR/CCPA.
+
+            ${{ env.HAS_CRITICAL == 'true' && '🚨 CRITICAL ISSUES REQUIRE IMMEDIATE REVIEW' ||
+                env.HAS_FINDINGS == 'true' && '⚠️ REVIEW ATTACHED REPORTS' || '✅ ALL CLEAN' }}
+
+            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          attachments: reports/*
+          priority: ${{ env.HAS_CRITICAL == 'true' && 'high' || 'normal' }}
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf tmp/*.txt tmp/*.js 2>/dev/null || true

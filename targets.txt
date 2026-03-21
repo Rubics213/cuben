@@ -1,9 +1,4 @@
 payment.backend-capital.com
-*.backend-capital.com
-apps.apple.com/BY/app/id1230088754?mt=8
-*.capital.com
-*.itcapital.io
-*.digitalocean.com
 api.digitalocean.com
 cloud.digitalocean.com
 amd.digitalocean.com

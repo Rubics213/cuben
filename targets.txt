@@ -1,7 +1,10 @@
-payment.backend-capital.com
-api.digitalocean.com
-cloud.digitalocean.com
-amd.digitalocean.com
-marketplace.digitalocean.com
-digitalocean.com
-capital.com
+coveo.com
+delen.bank
+hoplr.com
+torfs.be
+bru.to
+telenet.be
+vismacloud.com
+iciparisxl.be
+srd.sassa.gov.za
+sassa.gov.za

@@ -1,0 +1,20 @@
+# Environments
+env/
+Framework_Env/
+venv/
+.venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Project Specific
+.checkpoints/
+reports/
+*.log
+
+# Sensitive
+.env
+auth_tokens.json

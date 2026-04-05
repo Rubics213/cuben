@@ -2,27 +2,6 @@
 """
 recon.py — Full Automated Recon Pipeline
 =========================================
-Chains all modules in the right order:
-
-  1. Spider      → discover endpoints automatically
-  2. Pipeline    → Ollama triage + Groq deep analysis
-  3. ID Enum     → sequential ID IDOR testing
-  4. GraphQL     → introspection + operation testing
-  5. Active      → auth stripping + two-account IDOR
-
-Usage:
-  # Full recon (auto-harvest credentials):
-  python recon.py --target https://app.example.com
-
-  # With extra scope:
-  python recon.py --target https://example.com --scope api.example.com
-
-  # Skip stages you don't need:
-  python recon.py --target https://example.com --no-spider --no-graphql
-
-  # Manual credentials:
-  python recon.py --target https://example.com \\
-    --token-a "Bearer eyJ..." --cookie-a "session=ABC..."
 """
 
 import asyncio
@@ -32,6 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 from config import BurpConfig, GroqConfig, OllamaConfig
 from pipeline import BurpGroqPipeline
@@ -44,7 +24,7 @@ from credential_harvester import CredentialHarvester
 from models import SessionConfig
 from pipeline import (
     BurpMCPClient, get_request_response_text,
-    parse_request_line, extract_history_items, parse_target
+    parse_request_line, extract_history_items, parse_target, in_scope
 )
 
 
@@ -98,7 +78,7 @@ async def resolve_credentials(args, burp_cfg: BurpConfig
             name="Account A",
             auth_header=args.token_a,
             cookie=args.cookie_a,
-            org_id=args.org_a,
+            org_id=args.org_a
         )
         session_b = None
         if args.token_b or args.cookie_b:
@@ -106,45 +86,44 @@ async def resolve_credentials(args, burp_cfg: BurpConfig
                 name="Account B",
                 auth_header=args.token_b,
                 cookie=args.cookie_b,
-                org_id=args.org_b,
+                org_id=args.org_b
             )
         return session_a, session_b
 
     if args.no_auto_harvest:
-        harvester = CredentialHarvester(burp_cfg, args.scope)
-        return harvester._manual_entry()
+        return None, None
 
-    harvester = CredentialHarvester(burp_cfg, args.scope)
-    return await harvester.harvest(
-        args.target, max_retries=2, debug=args.debug_harvest
-    )
+    # Auto-harvest from Burp history
+    host, _, _ = parse_target(args.target)
+    print(f"\n{'-'*50}")
+    print(f"  Auto-harvesting credentials for {host}...")
+    print(f"{'-'*50}")
+
+    harvester = CredentialHarvester(burp_cfg)
+    try:
+        session_a, session_b = await harvester.get_sessions(host, debug=args.debug_harvest)
+        return session_a, session_b
+    except Exception as e:
+        print(f"  [Harvester] Error: {e}")
+        return None, None
 
 
-def print_stage(n: int, total: int, name: str):
+def print_stage(n, total, name):
     print(f"\n{'━'*60}")
     print(f"  Stage {n}/{total}: {name}")
-    print(f"{'━'*60}")
+    print(f"{'━'*60}\n")
 
 
-async def main():
-    args = parse_args()
-
-    burp_cfg   = BurpConfig()
-    groq_cfg   = GroqConfig()
-    ollama_cfg = OllamaConfig()
-
-    if args.burp_port:
-        burp_cfg.mcp_port = args.burp_port
-    if args.groq_model:
-        groq_cfg.model = args.groq_model
-    if args.ollama_model:
-        ollama_cfg.model = args.ollama_model
+async def run_recon(args):
+    burp_cfg   = BurpConfig(port=args.burp_port)
+    groq_cfg   = GroqConfig(model=args.groq_model)
+    ollama_cfg = OllamaConfig(model=args.ollama_model)
 
     if not groq_cfg.api_key and not args.no_pipeline:
         print("Warning: GROQ_API_KEY not set — pipeline stage will be skipped.")
         args.no_pipeline = True
 
-    # Count active stages
+    # Build stage list
     stages = [
         not args.no_spider,
         not args.no_pipeline,
@@ -205,7 +184,7 @@ async def main():
         stage_n += 1
         print_stage(stage_n, total_stages, "Ollama Triage + Groq Analysis")
 
-        pipeline = BurpGroqPipeline(
+        pipeline_runner = BurpGroqPipeline(
             burp_config=burp_cfg,
             groq_config=groq_cfg,
             ollama_config=ollama_cfg,
@@ -214,7 +193,7 @@ async def main():
             resume=args.resume,
             batch_size=args.batch_size,
         )
-        await pipeline.run(args.target)
+        await pipeline_runner.run(args.target)
 
     # ── Fetch history for enum + graphql + active stages ───────
     all_history = []
@@ -231,7 +210,6 @@ async def main():
 
         patterns = detect_id_patterns(all_history)
         # Filter to in-scope patterns
-        from pipeline import in_scope
         host = urlparse(args.target).hostname or args.target
         patterns = [p for p in patterns
                     if in_scope(p.template, host, args.scope)]
@@ -311,7 +289,6 @@ async def main():
 
 
 def _save_enum_findings(target: str, findings: list):
-    from models import ActiveFinding
     os.makedirs("reports", exist_ok=True)
     slug = target.replace("https://","").replace("http://","").replace("/","_")
     path = f"reports/{slug}_enum.md"
@@ -370,8 +347,5 @@ def _save_graphql_findings(target: str, results: list):
     print(f"[Report] {path}")
 
 
-# needed for import
-from urllib.parse import urlparse
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_recon(parse_args()))
